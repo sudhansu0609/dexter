@@ -1,0 +1,12 @@
+{
+  "name": "user_command_reasoning",
+  "description": "Learned skill for: User Command Reasoning",
+  "triggers": [
+    "user command reasoning"
+  ],
+  "steps": [
+    "Hello Dexter, tell me your core mission.",
+    "[Dexter Local Response]: Hello! I am Dexter. I received your request: 'Hello Dex"
+  ],
+  "learnedAt": "2026-08-07 02:43:06"
+}

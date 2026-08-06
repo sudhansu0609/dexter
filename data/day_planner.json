@@ -1,0 +1,35 @@
+{
+  "date": "2026-08-07",
+  "tasks": [
+    {
+      "id": "t1",
+      "time": "09:00 AM",
+      "title": "Morning Routine & Coffee",
+      "completed": true
+    },
+    {
+      "id": "t2",
+      "time": "10:30 AM",
+      "title": "Review SpilledCoffeeAI overnight videos",
+      "completed": false
+    },
+    {
+      "id": "t3",
+      "time": "02:00 PM",
+      "title": "Content Strategy & Scripting Session",
+      "completed": false
+    },
+    {
+      "id": "t4",
+      "time": "06:00 PM",
+      "title": "Evening Walk & Music Playlist",
+      "completed": false
+    },
+    {
+      "id": "t-1786050765",
+      "time": "03:00 PM",
+      "title": "Test AI Automation Run",
+      "completed": false
+    }
+  ]
+}

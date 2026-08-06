@@ -1,0 +1,17 @@
+{
+  "name": "youtube_playlist_curator",
+  "description": "Searches and plays top trending music or video playlists on YouTube.",
+  "triggers": [
+    "play song",
+    "music playlist",
+    "find music",
+    "play video"
+  ],
+  "steps": [
+    "Extract query keywords from voice command",
+    "Invoke Playwright browser / YouTube API to search query",
+    "Autoplay first high-rank match",
+    "Announce video title to user via TTS speech"
+  ],
+  "learnedAt": "2026-08-06 20:00:00"
+}

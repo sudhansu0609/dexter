@@ -1,0 +1,34 @@
+[
+  {
+    "id": "spilled-coffee-1786050772-1",
+    "timestamp": "2026-08-07 02:42:52",
+    "niche": "AI Tech Trends",
+    "title": "I Built a Self-Learning AI Assistant (And It Replaced My Daily Routine)",
+    "hook": "Meet Dexter — the personal AI that plans my day, plays my music, and curates videos while I sleep.",
+    "scriptOutline": [
+      "Why traditional assistants fail",
+      "Architecture of self-improving AI skills",
+      "Live demo of Playwright & voice automation",
+      "How you can build your own local assistant"
+    ],
+    "targetAudience": "AI Developers & Automation Fans",
+    "ctrScore": "9.5%",
+    "status": "Ready For Review"
+  },
+  {
+    "id": "spilled-coffee-1786050772-0",
+    "timestamp": "2026-08-07 02:42:52",
+    "niche": "AI Tech Trends",
+    "title": "The AI Secret Nobody Is Talking About in AI Tech Trends",
+    "hook": "What if everything you knew about AI productivity changed overnight?",
+    "scriptOutline": [
+      "Introduction to the breakthrough tech",
+      "Step-by-step workflow demonstration",
+      "Real-world application for creators",
+      "Final call to action and future predictions"
+    ],
+    "targetAudience": "Tech Enthusiasts & Content Creators",
+    "ctrScore": "9.8%",
+    "status": "Ready For Review"
+  }
+]
