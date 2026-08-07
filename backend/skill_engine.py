@@ -44,6 +44,16 @@ class DexterSkillEngine:
                     pass
         return skills
 
+    def match_skill(self, user_input: str) -> Optional[Dict[str, Any]]:
+        """Find the first skill whose triggers match the user input."""
+        skills = self.list_skills()
+        user_lower = user_input.lower()
+        for skill in skills:
+            for trigger in skill.get("triggers", []):
+                if trigger.lower() in user_lower:
+                    return skill
+        return None
+
     def learn_skill_from_task(self, task_name: str, task_description: str, execution_log: List[str]) -> Dict[str, Any]:
         prompt = f"""
         Act as Dexter's Self-Learning Agent Memory System.

@@ -36,7 +36,14 @@ class DayPlannerTool:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
     def get_agenda(self) -> Dict[str, Any]:
-        return self._load_planner()
+        planner = self._load_planner()
+        today = time.strftime("%Y-%m-%d")
+        if planner.get("date") != today:
+            # Carry over incomplete tasks, mark date as today
+            incomplete = [t for t in planner.get("tasks", []) if not t.get("completed", False)]
+            planner = {"date": today, "tasks": incomplete}
+            self._save_planner(planner)
+        return planner
 
     def add_task(self, title: str, task_time: str = "12:00 PM") -> Dict[str, Any]:
         planner = self._load_planner()

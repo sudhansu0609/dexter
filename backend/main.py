@@ -1,10 +1,18 @@
 import os
 import sys
 import json
+import time
 import urllib.parse
 
 # Ensure backend directory is in python path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Load .env if python-dotenv available
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+except ImportError:
+    pass
 
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException
@@ -16,7 +24,7 @@ from spilled_coffee_controller import SpilledCoffeeAIController
 from skill_engine import DexterSkillEngine
 from dexter_tools import DayPlannerTool, YouTubeMusicTool, AppLauncherTool, PlaywrightBrowserTool
 
-app = FastAPI(title="Dexter AI Super Assistant Engine", version="1.0.0")
+app = FastAPI(title="Dexter AI Super Assistant Engine", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,9 +53,24 @@ class AddTaskRequest(BaseModel):
 class LaunchAppRequest(BaseModel):
     appName: str
 
+class BrowseRequest(BaseModel):
+    url: str
+
 class CurateRequest(BaseModel):
     niche: Optional[str] = "AI Tech & Viral Trends"
     count: Optional[int] = 3
+
+def _speech_url(text: str) -> str:
+    """Build a safe speech URL — truncate on word boundary, max 180 chars."""
+    clean = text[:180].rsplit(" ", 1)[0] if len(text) > 180 else text
+    return f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(clean)}&tl=en&client=tw-ob"
+
+# ───────── Intent keywords (ordered specific → broad) ─────────
+PLANNER_KEYWORDS = ["plan my day", "agenda", "schedule", "my tasks", "today's plan", "daily plan"]
+CURATE_KEYWORDS  = ["curate", "video title", "spilledcoffee", "overnight content", "generate titles"]
+YOUTUBE_KEYWORDS = ["play ", "youtube ", "play song", "play music", "play video"]
+BROWSE_KEYWORDS  = ["go to ", "browse ", "navigate ", "open website", "open url", "visit "]
+LAUNCH_KEYWORDS  = ["open ", "launch ", "start app"]
 
 @app.get("/api/dexter/status")
 def get_status():
@@ -68,71 +91,71 @@ def get_status():
 @app.post("/api/dexter/chat")
 def process_chat(req: ChatRequest):
     msg = req.message.strip().lower()
-    
-    # 1. Intent Detection for App Launching
-    if any(k in msg for k in ["open ", "launch ", "start "]):
-        app_target = msg.replace("open ", "").replace("launch ", "").replace("start ", "").replace("app", "").strip()
-        launch_res = AppLauncherTool.launch_app(app_target)
-        reply = f"I have launched {launch_res.get('appName', app_target)} for you on your desktop!"
-        return {
-            "reply": reply,
-            "action": "launch_app",
-            "details": launch_res,
-            "speechUrl": f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(reply[:100])}&tl=en&client=tw-ob"
-        }
 
-    # 2. Intent Detection for YouTube & Music Playback
-    if any(k in msg for k in ["play ", "youtube", "music", "song"]):
-        song_query = msg.replace("play ", "").replace("on youtube", "").replace("song", "").strip()
-        yt_res = youtube_tool.search_and_play(song_query)
-        reply = f"Searching and playing '{song_query}' on YouTube now!"
-        return {
-            "reply": reply,
-            "action": "play_youtube",
-            "details": yt_res,
-            "speechUrl": f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(reply[:100])}&tl=en&client=tw-ob"
-        }
-
-    # 3. Intent Detection for SpilledCoffeeAI Overnight Video Curation
-    if any(k in msg for k in ["curate", "video title", "spilledcoffee", "overnight content"]):
-        curate_res = spilled_coffee.run_overnight_curation(count=3)
-        reply = f"I have curated {curate_res['count']} viral video titles and script outlines for SpilledCoffeeAI! They are ready in your dashboard."
-        return {
-            "reply": reply,
-            "action": "curate_content",
-            "details": curate_res,
-            "speechUrl": f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(reply[:100])}&tl=en&client=tw-ob"
-        }
-
-    # 4. Intent Detection for Day Planning & Agenda
-    if any(k in msg for k in ["plan my day", "agenda", "schedule", "my tasks"]):
+    # ── 1. Day Planning & Agenda (check FIRST — avoids "start my day" hitting app launcher) ──
+    if any(k in msg for k in PLANNER_KEYWORDS):
         agenda = day_planner.get_agenda()
         task_list = [f"{t['time']} - {t['title']}" for t in agenda.get("tasks", [])]
-        reply = "Here is your agenda for today: " + ", ".join(task_list[:3]) + "."
-        return {
-            "reply": reply,
-            "action": "get_agenda",
-            "details": agenda,
-            "speechUrl": f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(reply[:100])}&tl=en&client=tw-ob"
-        }
+        reply = "Here is your agenda for today: " + ", ".join(task_list[:4]) + "." if task_list else "Your agenda is empty. Add some tasks!"
+        return {"reply": reply, "action": "get_agenda", "details": agenda, "speechUrl": _speech_url(reply)}
 
-    # 5. Hybrid LLM Reasoning Engine
+    # ── 2. SpilledCoffeeAI Overnight Content Curation ──
+    if any(k in msg for k in CURATE_KEYWORDS):
+        curate_res = spilled_coffee.run_overnight_curation(count=3)
+        reply = f"I have curated {curate_res['count']} viral video titles and script outlines for SpilledCoffeeAI! They are ready in your dashboard."
+        return {"reply": reply, "action": "curate_content", "details": curate_res, "speechUrl": _speech_url(reply)}
+
+    # ── 3. YouTube & Music Playback ──
+    if any(k in msg for k in YOUTUBE_KEYWORDS):
+        song_query = msg
+        for strip_word in ["play ", "on youtube", "song ", "music ", "video "]:
+            song_query = song_query.replace(strip_word, "")
+        song_query = song_query.strip()
+        yt_res = youtube_tool.search_and_play(song_query)
+        reply = f"Searching and playing '{song_query}' on YouTube now!"
+        return {"reply": reply, "action": "play_youtube", "details": yt_res, "speechUrl": _speech_url(reply)}
+
+    # ── 4. Web Browsing via Playwright ──
+    if any(k in msg for k in BROWSE_KEYWORDS):
+        url_target = msg
+        for strip_word in ["go to ", "browse ", "navigate ", "open website ", "open url ", "visit "]:
+            url_target = url_target.replace(strip_word, "")
+        url_target = url_target.strip()
+        browse_res = PlaywrightBrowserTool.browse_url(url_target)
+        reply = f"Opening {url_target} in your browser now."
+        return {"reply": reply, "action": "browse_url", "details": browse_res, "speechUrl": _speech_url(reply)}
+
+    # ── 5. App Launching (checked AFTER planner & YouTube to avoid false positives) ──
+    if any(k in msg for k in LAUNCH_KEYWORDS):
+        app_target = msg
+        for strip_word in ["open ", "launch ", "start ", "app"]:
+            app_target = app_target.replace(strip_word, "")
+        app_target = app_target.strip()
+        if app_target:
+            launch_res = AppLauncherTool.launch_app(app_target)
+            reply = f"I have launched {launch_res.get('appName', app_target)} for you on your desktop!"
+            return {"reply": reply, "action": "launch_app", "details": launch_res, "speechUrl": _speech_url(reply)}
+
+    # ── 6. Check learned skills for a matching trigger ──
+    matched_skill = skill_engine.match_skill(msg)
+    if matched_skill:
+        skill_reply = f"I found a learned skill '{matched_skill['name']}' that matches your request. Executing steps: {', '.join(matched_skill.get('steps', [])[:3])}"
+        return {"reply": skill_reply, "action": "skill_match", "details": matched_skill, "speechUrl": _speech_url(skill_reply)}
+
+    # ── 7. Hybrid LLM Reasoning Engine (fallback) ──
     system_prompt = (
         "You are Dexter, an intelligent, ultra-smart personal AI super assistant. "
         "You assist the user with planning their day, curating viral YouTube video scripts, launching apps, and answering questions. "
         "Speak warmly, with high intelligence and enthusiasm."
     )
     llm_reply = llm_router.generate(req.message, system_prompt=system_prompt, provider=req.provider, model=req.model)
-    
-    # Auto-learn skill if multi-step task
-    if len(msg.split()) > 6:
-        skill_engine.learn_skill_from_task("User Command Reasoning", req.message, [req.message, llm_reply[:80]])
 
-    return {
-        "reply": llm_reply,
-        "action": "chat_response",
-        "speechUrl": f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(llm_reply[:100])}&tl=en&client=tw-ob"
-    }
+    # Auto-learn skill only if substantive multi-step task — use a unique name based on timestamp
+    if len(msg.split()) > 8:
+        skill_name = f"task_{int(time.time())}"
+        skill_engine.learn_skill_from_task(skill_name, req.message, [req.message, llm_reply[:80]])
+
+    return {"reply": llm_reply, "action": "chat_response", "speechUrl": _speech_url(llm_reply)}
 
 @app.get("/api/dexter/planner")
 def get_planner():
@@ -162,6 +185,10 @@ def get_skills():
 @app.post("/api/dexter/system/launch")
 def launch_system_app(req: LaunchAppRequest):
     return AppLauncherTool.launch_app(req.appName)
+
+@app.post("/api/dexter/browser/navigate")
+def browse_url(req: BrowseRequest):
+    return PlaywrightBrowserTool.browse_url(req.url)
 
 @app.get("/api/dexter/playlists")
 def get_playlists():

@@ -111,7 +111,7 @@ class SpilledCoffeeAIController:
             new_records.append(record)
             current_queue.insert(0, record)
             
-        self._save_queue(current_queue)
+        self._save_queue(current_queue[:50])  # cap at 50 items to prevent unbounded growth
         return {
             "success": True,
             "count": len(new_records),

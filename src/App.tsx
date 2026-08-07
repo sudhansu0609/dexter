@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Mic, Radio, Volume2, VolumeX, Sparkles, Play, Plus, CheckCircle, Cpu, Shield, Zap, Layers, RefreshCw, ExternalLink, Activity, Tv, Calendar, Terminal } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Mic, Radio, Volume2, VolumeX, Sparkles, Play, Plus, CheckCircle, Cpu, Shield, Zap, Layers, RefreshCw, ExternalLink, Activity, Tv, Calendar, Terminal, Globe } from 'lucide-react';
 
 interface Task {
   id: string;
@@ -26,6 +26,8 @@ interface SkillItem {
   learnedAt: string;
 }
 
+const API_BASE = 'http://localhost:8098';
+
 export default function App() {
   // Voice & Input State
   const [inputMsg, setInputMsg] = useState('');
@@ -47,9 +49,15 @@ export default function App() {
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [isCurating, setIsCurating] = useState(false);
 
-  // Audio Speech & Canvas Refs
+  // Refs
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const recognitionRef = useRef<any>(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+
+  // Auto-scroll chat to bottom when messages change
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatLog, isThinking]);
 
   useEffect(() => {
     fetchStatus();
@@ -83,6 +91,10 @@ export default function App() {
 
     const render = () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // Reset shadow state before drawing synapses
+      ctx.shadowBlur = 0;
+      ctx.shadowColor = 'transparent';
 
       // Draw Neural Connections (Synapses)
       for (let i = 0; i < particleCount; i++) {
@@ -120,6 +132,10 @@ export default function App() {
         ctx.shadowBlur = 12;
         ctx.shadowColor = p.color;
         ctx.fill();
+
+        // Reset shadow after each particle so it doesn't bleed
+        ctx.shadowBlur = 0;
+        ctx.shadowColor = 'transparent';
       });
 
       animFrame = requestAnimationFrame(render);
@@ -138,16 +154,16 @@ export default function App() {
       rec.lang = 'en-US';
 
       rec.onresult = (e: any) => {
-        let text = '';
-        for (let i = 0; i < e.results.length; i++) {
-          text += e.results[i][0].transcript;
-        }
-        if (text.trim()) {
-          setInputMsg(text.trim());
+        // Only take the LATEST result to avoid text duplication from interim results
+        const lastResult = e.results[e.results.length - 1];
+        const transcript = lastResult[0].transcript;
+        if (transcript.trim()) {
+          setInputMsg(transcript.trim());
         }
       };
 
       rec.onerror = (err: any) => console.log('Mic Error:', err);
+      rec.onend = () => setIsListening(false);
       recognitionRef.current = rec;
     }
   };
@@ -168,7 +184,7 @@ export default function App() {
 
   const fetchStatus = async () => {
     try {
-      const res = await fetch('http://localhost:8098/api/dexter/status');
+      const res = await fetch(`${API_BASE}/api/dexter/status`);
       const data = await res.json();
       setModelsStatus(data);
     } catch (e) {}
@@ -176,7 +192,7 @@ export default function App() {
 
   const fetchPlanner = async () => {
     try {
-      const res = await fetch('http://localhost:8098/api/dexter/planner');
+      const res = await fetch(`${API_BASE}/api/dexter/planner`);
       const data = await res.json();
       setTasks(data.tasks || []);
     } catch (e) {}
@@ -184,7 +200,7 @@ export default function App() {
 
   const fetchOvernightQueue = async () => {
     try {
-      const res = await fetch('http://localhost:8098/api/dexter/spilledcoffee/overnight-queue');
+      const res = await fetch(`${API_BASE}/api/dexter/spilledcoffee/overnight-queue`);
       const data = await res.json();
       setOvernightItems(data);
     } catch (e) {}
@@ -192,7 +208,7 @@ export default function App() {
 
   const fetchSkills = async () => {
     try {
-      const res = await fetch('http://localhost:8098/api/dexter/skills');
+      const res = await fetch(`${API_BASE}/api/dexter/skills`);
       const data = await res.json();
       setSkills(data);
     } catch (e) {}
@@ -208,7 +224,7 @@ export default function App() {
     setIsThinking(true);
 
     try {
-      const res = await fetch('http://localhost:8098/api/dexter/chat', {
+      const res = await fetch(`${API_BASE}/api/dexter/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: textToSend, provider })
@@ -219,12 +235,12 @@ export default function App() {
       const dexterMsg = { id: `d-${Date.now()}`, sender: 'dexter' as const, text: data.reply, action: data.action };
       setChatLog(prev => [...prev, dexterMsg]);
 
-      // Refresh status and tasks if action taken
+      // Refresh all widgets after action
       fetchPlanner();
       fetchOvernightQueue();
       fetchSkills();
 
-      // Speak response using Web Speech Synthesis or Audio Stream
+      // Speak response
       speakText(data.reply);
     } catch (err: any) {
       setIsThinking(false);
@@ -247,7 +263,7 @@ export default function App() {
     e.preventDefault();
     if (!newTaskTitle.trim()) return;
     try {
-      await fetch('http://localhost:8098/api/dexter/planner/add', {
+      await fetch(`${API_BASE}/api/dexter/planner/add`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: newTaskTitle })
@@ -257,22 +273,31 @@ export default function App() {
     } catch (e) {}
   };
 
+  const handleToggleTask = async (taskId: string) => {
+    try {
+      await fetch(`${API_BASE}/api/dexter/planner/toggle/${taskId}`, { method: 'POST' });
+      fetchPlanner();
+    } catch (e) {}
+  };
+
   const handleRunCurate = async () => {
     setIsCurating(true);
     try {
-      await fetch('http://localhost:8098/api/dexter/spilledcoffee/curate', {
+      await fetch(`${API_BASE}/api/dexter/spilledcoffee/curate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ niche: 'AI Tech & Viral Trends', count: 3 })
       });
       fetchOvernightQueue();
-    } catch (e) {}
-    setIsCurating(false);
+    } catch (e) {
+    } finally {
+      setIsCurating(false);
+    }
   };
 
   const handleLaunchApp = async (appName: string) => {
     try {
-      await fetch('http://localhost:8098/api/dexter/system/launch', {
+      await fetch(`${API_BASE}/api/dexter/system/launch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ appName })
@@ -285,9 +310,9 @@ export default function App() {
     <div style={{ padding: '20px', maxWidth: '1440px', margin: '0 auto' }}>
       
       {/* Top Header Navbar */}
-      <header className="dexter-panel" style={{ padding: '14px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px' }}>
+      <header className="dexter-panel dexter-header" style={{ padding: '14px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
-          <div style={{ width: '42px', height: '42px', borderRadius: '12px', background: 'linear-gradient(135deg, #38bdf8 0%, #a855f7 100%)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px' }}>
+          <div style={{ width: '42px', height: '42px', borderRadius: '12px', background: 'linear-gradient(135deg, #38bdf8 0%, #a855f7 100%)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px', flexShrink: 0 }}>
             🧠
           </div>
           <div>
@@ -297,14 +322,14 @@ export default function App() {
         </div>
 
         {/* LLM Provider Switcher & Status */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(15, 23, 42, 0.6)', padding: '6px 12px', borderRadius: '12px', border: '1px solid var(--bg-card-border)', fontSize: '12px' }}>
             <Cpu size={16} color="#38bdf8" />
             <span style={{ color: 'var(--text-muted)' }}>LLM Engine:</span>
             <select
               value={provider}
               onChange={(e: any) => setProvider(e.target.value)}
-              style={{ background: 'transparent', border: 'none', color: '#38bdf8', fontWeight: 700, cursor: 'pointer' }}
+              style={{ background: '#0f172a', border: 'none', color: '#38bdf8', fontWeight: 700, cursor: 'pointer', padding: '2px 4px', borderRadius: '6px' }}
             >
               <option value="auto">Auto (Local / Gemini)</option>
               <option value="lmstudio">Local LM Studio</option>
@@ -320,8 +345,8 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Grid Layout */}
-      <div style={{ display: 'grid', gridTemplateColumns: '360px 1fr 340px', gap: '20px' }}>
+      {/* Main Grid Layout — responsive: 3-col on desktop, stacked on mobile */}
+      <div className="dexter-main-grid">
         
         {/* LEFT COLUMN: Futuristic Animated Brain Visualizer & Day Planner */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -332,12 +357,12 @@ export default function App() {
               <Sparkles size={14} /> Synaptic AI Node Visualizer
             </div>
             
-            <div style={{ position: 'relative', width: '280px', height: '180px', margin: '0 auto', background: 'rgba(9, 13, 22, 0.8)', borderRadius: '16px', border: '1px solid rgba(56, 189, 248, 0.3)', overflow: 'hidden' }}>
-              <canvas ref={canvasRef} width={280} height={180} style={{ width: '100%', height: '100%' }} />
+            <div style={{ position: 'relative', width: '100%', maxWidth: '320px', height: '180px', margin: '0 auto', background: 'rgba(9, 13, 22, 0.8)', borderRadius: '16px', border: '1px solid rgba(56, 189, 248, 0.3)', overflow: 'hidden' }}>
+              <canvas ref={canvasRef} width={320} height={180} style={{ width: '100%', height: '100%' }} />
               
               {/* Status Badge */}
-              <div style={{ position: 'absolute', bottom: '10px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(15, 23, 42, 0.85)', padding: '4px 12px', borderRadius: '12px', border: '1px solid rgba(168, 85, 247, 0.4)', fontSize: '11px', color: isSpeaking ? '#f472b6' : isThinking ? '#a855f7' : '#38bdf8', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: isSpeaking ? '#f472b6' : isThinking ? '#a855f7' : '#38bdf8' }} />
+              <div style={{ position: 'absolute', bottom: '10px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(15, 23, 42, 0.85)', padding: '4px 12px', borderRadius: '12px', border: '1px solid rgba(168, 85, 247, 0.4)', fontSize: '11px', color: isSpeaking ? '#f472b6' : isThinking ? '#a855f7' : '#38bdf8', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}>
+                <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: isSpeaking ? '#f472b6' : isThinking ? '#a855f7' : '#38bdf8', flexShrink: 0 }} />
                 {isSpeaking ? 'Dexter Speaking...' : isThinking ? 'Processing Intelligence...' : 'Listening & Ready'}
               </div>
             </div>
@@ -367,7 +392,11 @@ export default function App() {
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '200px', overflowY: 'auto' }}>
               {tasks.map(t => (
-                <div key={t.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'rgba(15, 23, 42, 0.6)', borderRadius: '10px', border: '1px solid var(--bg-card-border)', fontSize: '12px' }}>
+                <div
+                  key={t.id}
+                  onClick={() => handleToggleTask(t.id)}
+                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'rgba(15, 23, 42, 0.6)', borderRadius: '10px', border: '1px solid var(--bg-card-border)', fontSize: '12px', cursor: 'pointer', transition: 'all 0.15s ease' }}
+                >
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                     <CheckCircle size={14} color={t.completed ? '#10b981' : '#64748b'} />
                     <span style={{ textDecoration: t.completed ? 'line-through' : 'none', color: t.completed ? '#64748b' : '#f8fafc' }}>
@@ -383,7 +412,7 @@ export default function App() {
         </div>
 
         {/* MIDDLE COLUMN: Interactive Dexter Voice Workspace & Chat Feed */}
-        <div className="dexter-panel" style={{ padding: '20px', display: 'flex', flexDirection: 'column', height: 'calc(100vh - 120px)' }}>
+        <div className="dexter-panel dexter-chat-col" style={{ padding: '20px', display: 'flex', flexDirection: 'column' }}>
           
           {/* Chat Feed */}
           <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '14px', marginBottom: '16px', paddingRight: '6px' }}>
@@ -413,10 +442,12 @@ export default function App() {
                 <span>Dexter is reasoning & executing tools...</span>
               </div>
             )}
+            {/* Scroll anchor */}
+            <div ref={chatEndRef} />
           </div>
 
           {/* Voice Input Controls Bar */}
-          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', background: 'rgba(15, 23, 42, 0.8)', padding: '12px', borderRadius: '16px', border: '1px solid var(--bg-card-border)' }}>
+          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', background: 'rgba(15, 23, 42, 0.8)', padding: '12px', borderRadius: '16px', border: '1px solid var(--bg-card-border)', flexWrap: 'wrap' }}>
             <button
               type="button"
               onClick={toggleMic}
@@ -428,7 +459,8 @@ export default function App() {
                 borderRadius: '12px',
                 display: 'flex',
                 alignItems: 'center',
-                justifyContent: 'center'
+                justifyContent: 'center',
+                flexShrink: 0
               }}
               title="Continuous Voice Mic Command"
             >
@@ -441,7 +473,7 @@ export default function App() {
               value={inputMsg}
               onChange={(e) => setInputMsg(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-              style={{ flex: 1, borderRadius: '12px' }}
+              style={{ flex: 1, borderRadius: '12px', minWidth: '180px' }}
             />
 
             <button
@@ -454,7 +486,8 @@ export default function App() {
                 padding: '12px 20px',
                 borderRadius: '12px',
                 fontWeight: 800,
-                fontSize: '13px'
+                fontSize: '13px',
+                flexShrink: 0
               }}
             >
               Ask Dexter
@@ -476,9 +509,9 @@ export default function App() {
                 type="button"
                 onClick={handleRunCurate}
                 disabled={isCurating}
-                style={{ background: 'rgba(244, 114, 182, 0.2)', color: '#f472b6', border: '1px solid rgba(244, 114, 182, 0.4)', padding: '4px 10px', borderRadius: '8px', fontSize: '11px', fontWeight: 700 }}
+                style={{ background: 'rgba(244, 114, 182, 0.2)', color: '#f472b6', border: '1px solid rgba(244, 114, 182, 0.4)', padding: '4px 10px', borderRadius: '8px', fontSize: '11px', fontWeight: 700, opacity: isCurating ? 0.6 : 1 }}
               >
-                {isCurating ? 'Curating...' : '⚡ Curate Titles'}
+                {isCurating ? 'Curating...' : 'Curate Titles'}
               </button>
             </div>
 
@@ -487,7 +520,11 @@ export default function App() {
             </p>
 
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '200px', overflowY: 'auto' }}>
-              {overnightItems.map(item => (
+              {overnightItems.length === 0 ? (
+                <div style={{ padding: '12px', background: 'rgba(15, 23, 42, 0.4)', borderRadius: '10px', border: '1px dashed rgba(244, 114, 182, 0.3)', textAlign: 'center', color: '#64748b', fontSize: '11px' }}>
+                  No curated content yet. Click <strong>Curate Titles</strong> to generate.
+                </div>
+              ) : overnightItems.map(item => (
                 <div key={item.id} style={{ background: 'rgba(15, 23, 42, 0.6)', padding: '10px', borderRadius: '10px', border: '1px solid rgba(244, 114, 182, 0.3)' }}>
                   <div style={{ fontSize: '12px', fontWeight: 800, color: '#f472b6', marginBottom: '4px' }}>
                     {item.title}
@@ -528,9 +565,13 @@ export default function App() {
               <Layers size={16} /> Self-Learned Skills ({skills.length})
             </h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '160px', overflowY: 'auto' }}>
-              {skills.map((s, idx) => (
+              {skills.length === 0 ? (
+                <div style={{ padding: '12px', background: 'rgba(15, 23, 42, 0.4)', borderRadius: '10px', border: '1px dashed rgba(168, 85, 247, 0.3)', textAlign: 'center', color: '#64748b', fontSize: '11px' }}>
+                  No skills learned yet. Dexter learns automatically from complex tasks.
+                </div>
+              ) : skills.map((s, idx) => (
                 <div key={idx} style={{ background: 'rgba(15, 23, 42, 0.6)', padding: '8px 10px', borderRadius: '10px', border: '1px solid rgba(168, 85, 247, 0.25)', fontSize: '11px' }}>
-                  <div style={{ fontWeight: 700, color: '#a855f7' }}>⚡ {s.name}</div>
+                  <div style={{ fontWeight: 700, color: '#a855f7' }}>{s.name}</div>
                   <div style={{ color: '#94a3b8', fontSize: '10px' }}>{s.description}</div>
                 </div>
               ))}
