@@ -14,10 +14,11 @@ try:
 except ImportError:
     pass
 
-from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
 
 from hybrid_llm import HybridLLMRouter
 from spilled_coffee_controller import SpilledCoffeeAIController

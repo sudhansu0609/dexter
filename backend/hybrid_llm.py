@@ -76,9 +76,9 @@ class HybridLLMRouter:
                 data = res.json()
                 return data["choices"][0]["message"]["content"]
             else:
-                return f"[Dexter Local Response]: Hello! I am Dexter. I received your request: '{prompt}'."
+                return "I'm having a bit of trouble connecting to my local language model right now. Could you please check if LM Studio or Ollama is running?"
         except Exception as e:
-            return f"[Dexter Fallback Response]: Hello! I am Dexter, your AI assistant. System notice: {str(e)[:100]}."
+            return "I apologize, but my local reasoning engine seems to be offline at the moment. Please make sure LM Studio is running in the background."
 
     def _call_gemini(self, prompt: str, system_prompt: str, model: str, temperature: float) -> str:
         try:
@@ -88,7 +88,7 @@ class HybridLLMRouter:
             response = g_model.generate_content(prompt)
             return response.text
         except Exception as e:
-            return f"[Gemini Fallback]: Processing complete. Response to '{prompt}'."
+            return "I'm currently unable to reach the Gemini servers. Please check my API key configuration."
 
     def _call_openai(self, prompt: str, system_prompt: str, model: str, temperature: float, max_tokens: int) -> str:
         try:
