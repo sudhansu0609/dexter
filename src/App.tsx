@@ -321,34 +321,81 @@ export default function App() {
     }
   };
 
-  const speakText = (text: string) => {
-    if ('speechSynthesis' in window && !isVoiceMutedRef.current) {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(text.substring(0, 200));
-      
-      utterance.onstart = () => {
-        setIsSpeaking(true);
-        isSpeakingRef.current = true;
-      };
-      
-      utterance.onend = () => {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const speakText = async (text: string) => {
+    if (isVoiceMutedRef.current) {
+      startListening();
+      return;
+    }
+
+    // 1. Immediately abort mic recognition & set speaking flags
+    stopListening();
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch (e) {}
+    }
+
+    setIsSpeaking(true);
+    isSpeakingRef.current = true;
+
+    try {
+      // 2. Fetch Kokoro ONNX audio from backend endpoint
+      const res = await fetch(`${API_BASE}/api/dexter/tts/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, voiceKey: 'michael' })
+      });
+
+      if (!res.ok) throw new Error('TTS fetch failed');
+
+      const blob = await res.blob();
+      const audioUrl = URL.createObjectURL(blob);
+
+      if (audioRef.current) {
+        audioRef.current.pause();
+      }
+
+      const audio = new Audio(audioUrl);
+      audioRef.current = audio;
+
+      audio.onended = () => {
         setIsSpeaking(false);
         isSpeakingRef.current = false;
-        // Resume continuous listening after Dexter finishes speaking
+        // Resume listening after 600ms buffer so mic doesn't catch echo tail
         setTimeout(() => {
           if (!isVoiceMutedRef.current) startListening();
-        }, 400);
+        }, 600);
       };
 
-      utterance.onerror = () => {
+      audio.onerror = () => {
         setIsSpeaking(false);
         isSpeakingRef.current = false;
         if (!isVoiceMutedRef.current) startListening();
       };
 
-      window.speechSynthesis.speak(utterance);
-    } else {
-      startListening();
+      await audio.play();
+    } catch (e) {
+      console.warn('Backend Kokoro TTS playback error, falling back to browser synthesis', e);
+      // Fallback
+      if ('speechSynthesis' in window && !isVoiceMutedRef.current) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text.substring(0, 200));
+        utterance.onend = () => {
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          setTimeout(() => { if (!isVoiceMutedRef.current) startListening(); }, 600);
+        };
+        utterance.onerror = () => {
+          setIsSpeaking(false);
+          isSpeakingRef.current = false;
+          if (!isVoiceMutedRef.current) startListening();
+        };
+        window.speechSynthesis.speak(utterance);
+      } else {
+        setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        startListening();
+      }
     }
   };
 
