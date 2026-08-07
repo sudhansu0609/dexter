@@ -23,9 +23,11 @@ from hybrid_llm import HybridLLMRouter
 from spilled_coffee_controller import SpilledCoffeeAIController
 from skill_engine import DexterSkillEngine
 from dexter_tools import DayPlannerTool, YouTubeMusicTool, AppLauncherTool, PlaywrightBrowserTool
+from fastapi.responses import FileResponse
 from filesystem_tool import FileSystemTool
+from voice_engine import DexterVoiceEngine
 
-app = FastAPI(title="Dexter AI Super Assistant Engine", version="1.2.0")
+app = FastAPI(title="Dexter AI Super Assistant Engine", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,12 +42,14 @@ spilled_coffee = SpilledCoffeeAIController(llm_router)
 skill_engine = DexterSkillEngine(llm_router)
 day_planner = DayPlannerTool()
 youtube_tool = YouTubeMusicTool()
+voice_engine = DexterVoiceEngine()
 
 class ChatRequest(BaseModel):
     message: str
     provider: Optional[str] = "auto"
     model: Optional[str] = None
     voiceEnabled: Optional[bool] = True
+    voiceKey: Optional[str] = "christopher"
 
 class AddTaskRequest(BaseModel):
     title: str
@@ -75,9 +79,13 @@ class CurateRequest(BaseModel):
     niche: Optional[str] = "AI Tech & Viral Trends"
     count: Optional[int] = 3
 
+class TTSRequest(BaseModel):
+    text: str
+    voiceKey: Optional[str] = "christopher"
+
 def _speech_url(text: str) -> str:
-    """Build a safe speech URL — truncate on word boundary, max 180 chars."""
-    clean = text[:180].rsplit(" ", 1)[0] if len(text) > 180 else text
+    """Build a safe speech URL for continuous audio output."""
+    clean = text[:200].rsplit(" ", 1)[0] if len(text) > 200 else text
     return f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(clean)}&tl=en&client=tw-ob"
 
 # ───────── Intent keywords (ordered specific → broad) ─────────
@@ -232,6 +240,11 @@ def write_file(req: FileWriteRequest):
 @app.post("/api/dexter/filesystem/open")
 def open_file_path(req: FileOpenRequest):
     return FileSystemTool.open_local_path(req.path)
+
+@app.post("/api/dexter/tts/generate")
+def generate_expressive_tts(req: TTSRequest):
+    file_path = voice_engine.generate_speech(req.text, req.voiceKey or "christopher")
+    return FileResponse(file_path, media_type="audio/mpeg")
 
 @app.get("/api/dexter/playlists")
 def get_playlists():

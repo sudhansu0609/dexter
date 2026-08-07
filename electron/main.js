@@ -22,13 +22,19 @@ function createWindow() {
     }
   });
 
+  const fs = require('fs');
+  const distPath = path.join(__dirname, '../dist/index.html');
   const devUrl = 'http://localhost:3006';
-  mainWindow.loadURL(devUrl).catch(() => {
-    // If dev server loading fails initially, retry after 2 seconds
-    setTimeout(() => {
+
+  if (fs.existsSync(distPath)) {
+    mainWindow.loadFile(distPath).catch(() => {
       mainWindow.loadURL(devUrl);
-    }, 2000);
-  });
+    });
+  } else {
+    mainWindow.loadURL(devUrl).catch(() => {
+      setTimeout(() => mainWindow.loadURL(devUrl), 1500);
+    });
+  }
 
   mainWindow.on('closed', () => {
     mainWindow = null;
