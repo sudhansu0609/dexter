@@ -21,7 +21,7 @@ def launch_desktop():
     # 2. Determine target URL / html file
     dist_index = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist", "index.html")
     if os.path.exists(dist_index):
-        target_url = f"file:///{dist_index.replace('\\', '/')}"
+        target_url = "file:///" + dist_index.replace("\\", "/")
     else:
         target_url = "http://localhost:3006"
 
