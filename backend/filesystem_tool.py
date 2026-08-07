@@ -83,6 +83,32 @@ class FileSystemTool:
             return {"success": False, "error": str(e)}
 
     @classmethod
+    def create_folder(cls, folder_path: str) -> Dict[str, Any]:
+        try:
+            # Resolve target path: if relative, default to Desktop
+            clean_path = folder_path.strip().strip("'\"")
+            if not os.path.isabs(clean_path):
+                desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+                target_dir = os.path.join(desktop, clean_path)
+            else:
+                target_dir = clean_path
+
+            os.makedirs(target_dir, exist_ok=True)
+            # Automatically open folder in Windows File Explorer
+            try:
+                os.startfile(target_dir)
+            except Exception:
+                subprocess.Popen(f'explorer "{target_dir}"', shell=True)
+
+            return {
+                "success": True,
+                "folderPath": target_dir,
+                "message": f"Successfully created folder '{os.path.basename(target_dir)}' and opened it in File Explorer."
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @classmethod
     def open_local_path(cls, target_path: str) -> Dict[str, Any]:
         if not os.path.exists(target_path):
             return {"success": False, "error": f"Path '{target_path}' does not exist."}

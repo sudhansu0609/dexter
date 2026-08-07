@@ -91,7 +91,8 @@ def _speech_url(text: str) -> str:
     return f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(clean)}&tl=en&client=tw-ob"
 
 # ───────── Intent keywords (ordered specific → broad) ─────────
-STICKY_NOTE_KEYWORDS = ["sticky note", "add note", "create note", "take a note", "write note", "my notes", "notes"]
+FOLDER_CREATE_KEYWORDS = ["create folder", "make folder", "new folder", "create directory", "make directory", "new directory"]
+STICKY_NOTE_KEYWORDS   = ["sticky note", "add note", "create note", "take a note", "write note", "my notes", "notes"]
 CALENDAR_KEYWORDS    = ["calendar", "schedule my day", "add task", "schedule event", "add event", "book time", "schedule"]
 PLANNER_KEYWORDS     = ["plan my day", "agenda", "schedule", "my tasks", "today's plan", "daily plan"]
 CURATE_KEYWORDS      = ["curate", "video title", "spilledcoffee", "overnight content", "generate titles"]
@@ -121,6 +122,17 @@ def get_status():
 @app.post("/api/dexter/chat")
 def process_chat(req: ChatRequest):
     msg = req.message.strip().lower()
+
+    # ── 0. Folder & Directory Creation ──
+    if any(k in msg for k in FOLDER_CREATE_KEYWORDS):
+        import re
+        folder_name = re.sub(r'^(dexter\s+)?(create folder|make folder|new folder|create directory|make directory|new directory)\s*(named|called|for)?\s*', '', msg, flags=re.IGNORECASE).strip()
+        if not folder_name:
+            folder_name = "New_Dexter_Folder"
+        
+        folder_res = FileSystemTool.create_folder(folder_name)
+        reply = f"Created folder '{os.path.basename(folder_res['folderPath'])}' and opened it in File Explorer!"
+        return {"reply": reply, "action": "create_folder", "details": folder_res, "speechUrl": _speech_url(reply)}
 
     # ── 1. Sticky Notes Integration ──
     if any(k in msg for k in STICKY_NOTE_KEYWORDS):
@@ -286,6 +298,13 @@ def read_file(req: FileReadRequest):
 @app.post("/api/dexter/filesystem/write")
 def write_file(req: FileWriteRequest):
     return FileSystemTool.write_file(req.path, req.content)
+
+class CreateFolderRequest(BaseModel):
+    path: str
+
+@app.post("/api/dexter/filesystem/create-folder")
+def create_folder(req: CreateFolderRequest):
+    return FileSystemTool.create_folder(req.path)
 
 @app.post("/api/dexter/filesystem/open")
 def open_file_path(req: FileOpenRequest):
