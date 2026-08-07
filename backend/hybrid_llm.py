@@ -30,11 +30,11 @@ class HybridLLMRouter:
     def generate(
         self,
         prompt: str,
-        system_prompt: str = "You are Dexter, an intelligent, personal AI super assistant.",
+        system_prompt: str = "You are Dexter, an intelligent AI super assistant. Be extremely concise, direct, and precise. Keep answers brief (1-3 sentences max) unless detailed information is explicitly requested. Do not use filler or conversational fluff.",
         provider: str = "auto",
         model: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 1024
+        temperature: float = 0.5,
+        max_tokens: int = 256
     ) -> str:
         # Determine provider automatically if 'auto'
         if provider == "auto":

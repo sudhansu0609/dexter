@@ -181,29 +181,60 @@ export default function App() {
     return () => cancelAnimationFrame(animFrame);
   }, [isSpeaking, isThinking]);
 
+  const stopSpeaking = () => {
+    if (audioRef.current) {
+      try {
+        audioRef.current.pause();
+        audioRef.current.currentTime = 0;
+      } catch (e) {}
+    }
+    if ('speechSynthesis' in window) {
+      try { window.speechSynthesis.cancel(); } catch (e) {}
+    }
+    setIsSpeaking(false);
+    isSpeakingRef.current = false;
+    lastSpeechEndTimeRef.current = Date.now();
+    setTimeout(() => {
+      if (!isVoiceMutedRef.current && !isThinkingRef.current) {
+        startListening();
+      }
+    }, 800);
+  };
+
   // Continuous Hands-Free Speech Recognition Loop
   const initSpeechRecognition = () => {
     if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       const rec = new SpeechRecognition();
       rec.continuous = true;
-      rec.interimResults = false;
+      rec.interimResults = true; // Enable interim results to detect 'stop' instantly
       rec.lang = 'en-US';
 
       rec.onresult = (e: any) => {
-        // LAYER 1: Mute, speaking, or thinking checks
-        if (isVoiceMutedRef.current || isSpeakingRef.current || isThinkingRef.current) return;
-
-        // LAYER 2: 2.0 Second Post-Speech Cooldown check
-        if (Date.now() - lastSpeechEndTimeRef.current < 2000) return;
-
         const lastResult = e.results[e.results.length - 1];
-        if (lastResult && lastResult.isFinal) {
+        if (!lastResult) return;
+
+        const rawTranscript = (lastResult[0]?.transcript || '').trim().toLowerCase();
+
+        // ── Voice Interrupt Detection while Dexter is speaking ──
+        if (isSpeakingRef.current) {
+          const INTERRUPT_KEYWORDS = ["stop", "shut up", "quiet", "pause", "be quiet", "stop speaking", "stop talking", "cancel"];
+          if (INTERRUPT_KEYWORDS.some(k => rawTranscript.includes(k))) {
+            console.log('[Voice Interrupt] Stop keyword detected while speaking:', rawTranscript);
+            stopSpeaking();
+            return;
+          }
+          return;
+        }
+
+        if (isVoiceMutedRef.current || isThinkingRef.current) return;
+        if (Date.now() - lastSpeechEndTimeRef.current < 1500) return;
+
+        if (lastResult.isFinal) {
           const transcript = lastResult[0].transcript.trim();
-          
           if (transcript.length < 3) return;
 
-          // LAYER 3: Self-Echo / Deduplication Filter
+          // Self-Echo / Deduplication Filter
           const cleanTranscript = transcript.toLowerCase();
           const cleanLastSpoken = lastSpokenTextRef.current.toLowerCase();
           if (cleanLastSpoken && cleanLastSpoken.includes(cleanTranscript)) {
@@ -222,10 +253,10 @@ export default function App() {
       rec.onend = () => {
         setIsListening(false);
         // Only restart if idle, not muted, not speaking, not thinking, and past cooldown
-        if (!isVoiceMutedRef.current && !isSpeakingRef.current && !isThinkingRef.current && Date.now() - lastSpeechEndTimeRef.current >= 2000) {
+        if (!isVoiceMutedRef.current && !isSpeakingRef.current && !isThinkingRef.current && Date.now() - lastSpeechEndTimeRef.current >= 1500) {
           setTimeout(() => {
             startListening();
-          }, 500);
+          }, 400);
         }
       };
 
@@ -253,6 +284,9 @@ export default function App() {
   };
 
   const toggleVoiceMute = () => {
+    if (isSpeaking) {
+      stopSpeaking();
+    }
     setIsVoiceMuted(prev => !prev);
   };
 
