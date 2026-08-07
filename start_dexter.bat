@@ -41,4 +41,8 @@ echo Visualizer Web Studio : http://localhost:%FRONTEND_PORT%
 echo FastAPI Intelligence Engine: http://localhost:%BACKEND_PORT%
 echo ===================================================
 echo.
+echo Launching Dexter Web Interface in your default browser...
+timeout /t 2 /nobreak >nul
+start http://localhost:%FRONTEND_PORT%
+echo.
 pause
