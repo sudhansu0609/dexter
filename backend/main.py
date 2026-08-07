@@ -163,13 +163,18 @@ def process_chat(req: ChatRequest):
 
     # ── 6. App Launching ──
     if any(k in msg for k in LAUNCH_KEYWORDS):
-        app_target = msg
-        for strip_word in ["open ", "launch ", "start ", "app"]:
-            app_target = app_target.replace(strip_word, "")
-        app_target = app_target.strip()
+        import re
+        # Clean leading action words
+        app_target = re.sub(r'^(i asked it to |please |can you |could you )?(open|launch|start|run)\s+(the\s+)?(app\s+)?', '', msg, flags=re.IGNORECASE).strip()
+        # Clean trailing filler words
+        app_target = re.sub(r'\s+(on my pc|on my computer|for me|app|application|please).*$', '', app_target, flags=re.IGNORECASE).strip()
+        
         if app_target:
             launch_res = AppLauncherTool.launch_app(app_target)
-            reply = f"I have launched {launch_res.get('appName', app_target)} for you on your desktop!"
+            if launch_res.get("success"):
+                reply = f"I have launched {launch_res.get('appName', app_target)} for you on your desktop!"
+            else:
+                reply = f"I tried to launch {app_target}, but ran into an issue: {launch_res.get('error', 'App not found')}."
             return {"reply": reply, "action": "launch_app", "details": launch_res, "speechUrl": _speech_url(reply)}
 
     # ── 7. Check learned skills for a matching trigger ──

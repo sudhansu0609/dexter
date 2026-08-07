@@ -114,8 +114,13 @@ class YouTubeMusicTool:
 
 class AppLauncherTool:
     APP_COMMANDS = {
-        "chrome": "chrome.exe",
-        "google chrome": "chrome.exe",
+        "edge": "start msedge:",
+        "ms edge": "start msedge:",
+        "msedge": "start msedge:",
+        "microsoft edge": "start msedge:",
+        "browser": "start msedge:",
+        "chrome": "start chrome",
+        "google chrome": "start chrome",
         "notepad": "notepad.exe",
         "calc": "calc.exe",
         "calculator": "calc.exe",
@@ -124,21 +129,33 @@ class AppLauncherTool:
         "code": "code",
         "spotify": "spotify.exe",
         "cmd": "cmd.exe",
-        "powershell": "powershell.exe"
+        "powershell": "powershell.exe",
+        "explorer": "explorer.exe",
+        "file explorer": "explorer.exe",
+        "task manager": "taskmgr.exe",
+        "settings": "start ms-settings:"
     }
 
     @classmethod
     def launch_app(cls, app_name: str) -> Dict[str, Any]:
         clean_name = app_name.lower().strip()
-        cmd_to_run = cls.APP_COMMANDS.get(clean_name, clean_name)
-        
+        # Strip common trailing filler words
+        for filler in [" on my pc", " on my computer", " for me", " app", " application", " please"]:
+            clean_name = clean_name.replace(filler, "")
+        clean_name = clean_name.strip()
+
+        cmd_to_run = cls.APP_COMMANDS.get(clean_name)
+        if not cmd_to_run:
+            # Fallback for generic app names
+            cmd_to_run = f"start {clean_name}"
+
         try:
             subprocess.Popen(cmd_to_run, shell=True)
             return {
                 "success": True,
-                "appName": app_name,
+                "appName": clean_name or app_name,
                 "command": cmd_to_run,
-                "message": f"Successfully launched {app_name}"
+                "message": f"Successfully launched {clean_name or app_name}"
             }
         except Exception as e:
             return {
