@@ -5,16 +5,16 @@ let mainWindow = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 440,
-    height: 640,
+    width: 450,
+    height: 660,
     minWidth: 380,
     minHeight: 500,
     title: 'Dexter AI Super Assistant',
-    frame: false,
-    transparent: false,
+    frame: true,
     backgroundColor: '#090d16',
-    alwaysOnTop: false,
+    alwaysOnTop: true,
     resizable: true,
+    show: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
@@ -35,6 +35,19 @@ function createWindow() {
       setTimeout(() => mainWindow.loadURL(devUrl), 1500);
     });
   }
+
+  // Focus and bring to front on startup
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
+    mainWindow.focus();
+  });
+
+  // Release alwaysOnTop after 3 seconds so user can move/minimize freely
+  setTimeout(() => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setAlwaysOnTop(false);
+    }
+  }, 3000);
 
   mainWindow.on('closed', () => {
     mainWindow = null;
