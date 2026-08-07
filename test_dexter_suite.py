@@ -122,6 +122,15 @@ def run_tests():
     except Exception as e:
         print("[FAIL] Test 12:", e)
 
+    # 13. Desktop File System Search
+    try:
+        res = requests.post(f"{BASE_URL}/api/dexter/filesystem/search", json={"query": "dexter"}, timeout=10)
+        assert res.status_code == 200
+        data = res.json()
+        print("[OK] Test 13: FileSystem search returned", data["count"], "results for query 'dexter'.")
+    except Exception as e:
+        print("[FAIL] Test 13:", e)
+
     print("===================================================")
     print("All 12 Post-Fix Verification Tests Executed!")
     print("===================================================")

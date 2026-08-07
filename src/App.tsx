@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, Radio, Volume2, VolumeX, Sparkles, Play, Plus, CheckCircle, Cpu, Shield, Zap, Layers, RefreshCw, ExternalLink, Activity, Tv, Calendar, Terminal, Globe } from 'lucide-react';
+import { Mic, MicOff, Radio, Volume2, VolumeX, Sparkles, Play, Plus, CheckCircle, Cpu, Shield, Zap, Layers, RefreshCw, ExternalLink, Activity, Tv, Calendar, Terminal, Maximize2, Minimize2, X, FolderSearch, Search, FileText } from 'lucide-react';
 
 interface Task {
   id: string;
@@ -26,14 +26,26 @@ interface SkillItem {
   learnedAt: string;
 }
 
+interface FileResult {
+  fileName: string;
+  path: string;
+  sizeBytes: number;
+}
+
 const API_BASE = 'http://localhost:8098';
 
 export default function App() {
+  // Desktop Window State
+  const [isExpanded, setIsExpanded] = useState(false);
+
   // Voice & Input State
   const [inputMsg, setInputMsg] = useState('');
   const [chatLog, setChatLog] = useState<{ id: string; sender: 'user' | 'dexter'; text: string; action?: string }[]>([
-    { id: 'w1', sender: 'dexter', text: 'Hello! I am Dexter, your personal AI super assistant. How can I help you plan your day, curate video content, or launch apps?' }
+    { id: 'w1', sender: 'dexter', text: 'Hello! I am Dexter, your AI super assistant. Speak your command hands-free or type a request.' }
   ]);
+  
+  // Hands-Free & Mute State
+  const [isVoiceMuted, setIsVoiceMuted] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
@@ -49,12 +61,33 @@ export default function App() {
   const [skills, setSkills] = useState<SkillItem[]>([]);
   const [isCurating, setIsCurating] = useState(false);
 
+  // Desktop File Search State
+  const [fileQuery, setFileQuery] = useState('');
+  const [fileResults, setFileResults] = useState<FileResult[]>([]);
+  const [isSearchingFiles, setIsSearchingFiles] = useState(false);
+
   // Refs
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const recognitionRef = useRef<any>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const isSpeakingRef = useRef(false);
+  const isVoiceMutedRef = useRef(false);
 
-  // Auto-scroll chat to bottom when messages change
+  useEffect(() => {
+    isSpeakingRef.current = isSpeaking;
+  }, [isSpeaking]);
+
+  useEffect(() => {
+    isVoiceMutedRef.current = isVoiceMuted;
+    if (isVoiceMuted) {
+      stopListening();
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    } else {
+      startListening();
+    }
+  }, [isVoiceMuted]);
+
+  // Auto-scroll chat to bottom
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatLog, isThinking]);
@@ -76,7 +109,7 @@ export default function App() {
 
     let animFrame: number;
     const particles: { x: number; y: number; vx: number; vy: number; radius: number; color: string }[] = [];
-    const particleCount = 35;
+    const particleCount = 40;
 
     for (let i = 0; i < particleCount; i++) {
       particles.push({
@@ -91,12 +124,10 @@ export default function App() {
 
     const render = () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-      // Reset shadow state before drawing synapses
       ctx.shadowBlur = 0;
       ctx.shadowColor = 'transparent';
 
-      // Draw Neural Connections (Synapses)
+      // Draw Synapses
       for (let i = 0; i < particleCount; i++) {
         for (let j = i + 1; j < particleCount; j++) {
           const dx = particles[i].x - particles[j].x;
@@ -110,7 +141,7 @@ export default function App() {
               : isThinking 
               ? `rgba(168, 85, 247, ${1 - dist / 75})` 
               : `rgba(56, 189, 248, ${0.4 - dist / 180})`;
-            ctx.lineWidth = isSpeaking ? 1.8 : 1.0;
+            ctx.lineWidth = isSpeaking ? 2.0 : 1.0;
             ctx.moveTo(particles[i].x, particles[i].y);
             ctx.lineTo(particles[j].x, particles[j].y);
             ctx.stroke();
@@ -118,7 +149,7 @@ export default function App() {
         }
       }
 
-      // Draw Particles (Brain Nodes)
+      // Draw Particles
       particles.forEach((p) => {
         p.x += p.vx * (isSpeaking ? 2.5 : isThinking ? 1.8 : 1.0);
         p.y += p.vy * (isSpeaking ? 2.5 : isThinking ? 1.8 : 1.0);
@@ -132,8 +163,6 @@ export default function App() {
         ctx.shadowBlur = 12;
         ctx.shadowColor = p.color;
         ctx.fill();
-
-        // Reset shadow after each particle so it doesn't bleed
         ctx.shadowBlur = 0;
         ctx.shadowColor = 'transparent';
       });
@@ -145,40 +174,76 @@ export default function App() {
     return () => cancelAnimationFrame(animFrame);
   }, [isSpeaking, isThinking]);
 
+  // Continuous Hands-Free Speech Recognition Loop
   const initSpeechRecognition = () => {
     if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       const rec = new SpeechRecognition();
       rec.continuous = true;
-      rec.interimResults = true;
+      rec.interimResults = false;
       rec.lang = 'en-US';
 
       rec.onresult = (e: any) => {
-        // Only take the LATEST result to avoid text duplication from interim results
+        if (isVoiceMutedRef.current || isSpeakingRef.current) return;
         const lastResult = e.results[e.results.length - 1];
-        const transcript = lastResult[0].transcript;
-        if (transcript.trim()) {
-          setInputMsg(transcript.trim());
+        if (lastResult && lastResult.isFinal) {
+          const transcript = lastResult[0].transcript.trim();
+          if (transcript.length > 2) {
+            handleSendMessage(transcript);
+          }
         }
       };
 
-      rec.onerror = (err: any) => console.log('Mic Error:', err);
-      rec.onend = () => setIsListening(false);
+      rec.onerror = (err: any) => {
+        // Silently restart on timeout
+      };
+
+      rec.onend = () => {
+        setIsListening(false);
+        // Auto-restart continuous listening if not muted and not speaking
+        if (!isVoiceMutedRef.current && !isSpeakingRef.current) {
+          setTimeout(() => {
+            startListening();
+          }, 300);
+        }
+      };
+
       recognitionRef.current = rec;
+      startListening();
     }
   };
 
-  const toggleMic = () => {
-    if (!recognitionRef.current) {
-      alert('Speech Recognition is not supported in this browser. Please use Chrome/Edge.');
-      return;
+  const startListening = () => {
+    if (recognitionRef.current && !isVoiceMutedRef.current) {
+      try {
+        recognitionRef.current.start();
+        setIsListening(true);
+      } catch (e) {}
     }
-    if (isListening) {
-      recognitionRef.current.stop();
-      setIsListening(false);
-    } else {
-      recognitionRef.current.start();
-      setIsListening(true);
+  };
+
+  const stopListening = () => {
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+        setIsListening(false);
+      } catch (e) {}
+    }
+  };
+
+  const toggleVoiceMute = () => {
+    setIsVoiceMuted(prev => !prev);
+  };
+
+  const toggleExpandWindow = () => {
+    const nextState = !isExpanded;
+    setIsExpanded(nextState);
+    if ((window as any).electronAPI) {
+      if (nextState) {
+        (window as any).electronAPI.setExpanded();
+      } else {
+        (window as any).electronAPI.setCompact();
+      }
     }
   };
 
@@ -218,6 +283,9 @@ export default function App() {
     const textToSend = customText || inputMsg;
     if (!textToSend.trim()) return;
 
+    // Temporarily pause mic while processing & speaking
+    stopListening();
+
     const userMsg = { id: `u-${Date.now()}`, sender: 'user' as const, text: textToSend };
     setChatLog(prev => [...prev, userMsg]);
     setInputMsg('');
@@ -235,27 +303,52 @@ export default function App() {
       const dexterMsg = { id: `d-${Date.now()}`, sender: 'dexter' as const, text: data.reply, action: data.action };
       setChatLog(prev => [...prev, dexterMsg]);
 
-      // Refresh all widgets after action
+      // Refresh all widgets
       fetchPlanner();
       fetchOvernightQueue();
       fetchSkills();
 
-      // Speak response
-      speakText(data.reply);
+      // Speak response if voice is active
+      if (!isVoiceMutedRef.current) {
+        speakText(data.reply);
+      } else {
+        startListening();
+      }
     } catch (err: any) {
       setIsThinking(false);
       setChatLog(prev => [...prev, { id: `err-${Date.now()}`, sender: 'dexter', text: 'Error connecting to Dexter Backend Server.' }]);
+      startListening();
     }
   };
 
   const speakText = (text: string) => {
-    if ('speechSynthesis' in window) {
+    if ('speechSynthesis' in window && !isVoiceMutedRef.current) {
       window.speechSynthesis.cancel();
       const utterance = new SpeechSynthesisUtterance(text.substring(0, 200));
-      utterance.onstart = () => setIsSpeaking(true);
-      utterance.onend = () => setIsSpeaking(false);
-      utterance.onerror = () => setIsSpeaking(false);
+      
+      utterance.onstart = () => {
+        setIsSpeaking(true);
+        isSpeakingRef.current = true;
+      };
+      
+      utterance.onend = () => {
+        setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        // Resume continuous listening after Dexter finishes speaking
+        setTimeout(() => {
+          if (!isVoiceMutedRef.current) startListening();
+        }, 400);
+      };
+
+      utterance.onerror = () => {
+        setIsSpeaking(false);
+        isSpeakingRef.current = false;
+        if (!isVoiceMutedRef.current) startListening();
+      };
+
       window.speechSynthesis.speak(utterance);
+    } else {
+      startListening();
     }
   };
 
@@ -306,279 +399,338 @@ export default function App() {
     } catch (e) {}
   };
 
+  const handleSearchFiles = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!fileQuery.trim()) return;
+    setIsSearchingFiles(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/dexter/filesystem/search`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: fileQuery })
+      });
+      const data = await res.json();
+      setFileResults(data.results || []);
+    } catch (e) {}
+    setIsSearchingFiles(false);
+  };
+
+  const handleOpenFile = async (path: string) => {
+    try {
+      await fetch(`${API_BASE}/api/dexter/filesystem/open`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path })
+      });
+    } catch (e) {}
+  };
+
   return (
-    <div style={{ padding: '20px', maxWidth: '1440px', margin: '0 auto' }}>
+    <div style={{ padding: '14px', maxWidth: isExpanded ? '1440px' : '460px', margin: '0 auto', transition: 'max-width 0.3s ease' }}>
       
-      {/* Top Header Navbar */}
-      <header className="dexter-panel dexter-header" style={{ padding: '14px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px', flexWrap: 'wrap', gap: '12px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
-          <div style={{ width: '42px', height: '42px', borderRadius: '12px', background: 'linear-gradient(135deg, #38bdf8 0%, #a855f7 100%)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '22px', flexShrink: 0 }}>
+      {/* Frameless Desktop Window Title Bar */}
+      <header className="dexter-panel dexter-header" style={{ padding: '10px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px', appRegion: 'drag' } as any}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div style={{ width: '32px', height: '32px', borderRadius: '10px', background: 'linear-gradient(135deg, #38bdf8 0%, #a855f7 100%)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '18px' }}>
             🧠
           </div>
           <div>
-            <h1 style={{ fontSize: '20px', color: '#f8fafc', margin: 0 }}>DEXTER <span style={{ fontSize: '11px', background: 'rgba(56, 189, 248, 0.2)', color: '#38bdf8', padding: '2px 8px', borderRadius: '12px', border: '1px solid rgba(56, 189, 248, 0.4)' }}>SUPER ASSISTANT</span></h1>
-            <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: 0 }}>Autonomous Day Planning • spilledCoffeeAi Automation • Self-Improving AI Skills</p>
+            <h1 style={{ fontSize: '15px', color: '#f8fafc', margin: 0, display: 'flex', alignItems: 'center', gap: '6px' }}>
+              DEXTER <span style={{ fontSize: '9px', background: 'rgba(56, 189, 248, 0.2)', color: '#38bdf8', padding: '1px 6px', borderRadius: '8px', border: '1px solid rgba(56, 189, 248, 0.4)' }}>DESKTOP AI</span>
+            </h1>
           </div>
         </div>
 
-        {/* LLM Provider Switcher & Status */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(15, 23, 42, 0.6)', padding: '6px 12px', borderRadius: '12px', border: '1px solid var(--bg-card-border)', fontSize: '12px' }}>
-            <Cpu size={16} color="#38bdf8" />
-            <span style={{ color: 'var(--text-muted)' }}>LLM Engine:</span>
-            <select
-              value={provider}
-              onChange={(e: any) => setProvider(e.target.value)}
-              style={{ background: '#0f172a', border: 'none', color: '#38bdf8', fontWeight: 700, cursor: 'pointer', padding: '2px 4px', borderRadius: '6px' }}
-            >
-              <option value="auto">Auto (Local / Gemini)</option>
-              <option value="lmstudio">Local LM Studio</option>
-              <option value="gemini">Google Gemini API</option>
-              <option value="openai">OpenAI GPT-4o</option>
-              <option value="ollama">Ollama GGUF</option>
-            </select>
-          </div>
+        {/* Window Action Controls & Voice Mute */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', appRegion: 'no-drag' } as any}>
+          
+          {/* Dedicated Voice Mute Button */}
+          <button
+            type="button"
+            onClick={toggleVoiceMute}
+            style={{
+              background: isVoiceMuted ? 'rgba(239, 68, 68, 0.2)' : 'rgba(16, 185, 129, 0.2)',
+              color: isVoiceMuted ? '#f87171' : '#10b981',
+              border: isVoiceMuted ? '1px solid rgba(239, 68, 68, 0.4)' : '1px solid rgba(16, 185, 129, 0.4)',
+              padding: '6px 10px',
+              borderRadius: '10px',
+              fontSize: '11px',
+              fontWeight: 700,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '4px'
+            }}
+            title={isVoiceMuted ? 'Unmute Voice' : 'Disable/Mute Voice'}
+          >
+            {isVoiceMuted ? <MicOff size={14} /> : <Radio className="brain-active-pulse" size={14} />}
+            {isVoiceMuted ? 'Muted' : 'Hands-Free On'}
+          </button>
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px', background: 'rgba(16, 185, 129, 0.15)', color: '#10b981', border: '1px solid rgba(16, 185, 129, 0.3)', padding: '6px 12px', borderRadius: '12px', fontSize: '12px', fontWeight: 700 }}>
-            <Activity size={14} /> System Active
-          </div>
+          {/* Window Expand / Compact Toggle */}
+          <button
+            type="button"
+            onClick={toggleExpandWindow}
+            style={{ background: 'rgba(15, 23, 42, 0.6)', color: '#38bdf8', border: '1px solid var(--bg-card-border)', padding: '6px 8px', borderRadius: '8px' }}
+            title={isExpanded ? 'Compact View' : 'Expand Full Dashboard'}
+          >
+            {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+          </button>
+
+          {/* Electron Close Window */}
+          {(window as any).electronAPI && (
+            <button
+              type="button"
+              onClick={() => (window as any).electronAPI.close()}
+              style={{ background: 'rgba(239, 68, 68, 0.2)', color: '#f87171', border: '1px solid rgba(239, 68, 68, 0.4)', padding: '6px 8px', borderRadius: '8px' }}
+            >
+              <X size={14} />
+            </button>
+          )}
         </div>
       </header>
 
-      {/* Main Grid Layout — responsive: 3-col on desktop, stacked on mobile */}
-      <div className="dexter-main-grid">
+      {/* Main Grid Layout (Compact by default, expanded when toggled) */}
+      <div style={{ display: 'grid', gridTemplateColumns: isExpanded ? '340px 1fr 340px' : '1fr', gap: '16px' }}>
         
-        {/* LEFT COLUMN: Futuristic Animated Brain Visualizer & Day Planner */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+        {/* CENTER COLUMN: Synaptic Visualizer & Continuous Voice Workspace */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
           
-          {/* Futuristic Animated Particle Brain Node Card */}
-          <div className="dexter-panel dexter-glow-border" style={{ padding: '20px', textAlign: 'center' }}>
-            <div style={{ fontSize: '12px', fontWeight: 800, color: '#a855f7', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '10px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
+          {/* Synaptic AI Node Visualizer Card (Primary Default UI) */}
+          <div className="dexter-panel dexter-glow-border" style={{ padding: '16px', textAlign: 'center' }}>
+            <div style={{ fontSize: '11px', fontWeight: 800, color: '#a855f7', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
               <Sparkles size={14} /> Synaptic AI Node Visualizer
             </div>
             
-            <div style={{ position: 'relative', width: '100%', maxWidth: '320px', height: '180px', margin: '0 auto', background: 'rgba(9, 13, 22, 0.8)', borderRadius: '16px', border: '1px solid rgba(56, 189, 248, 0.3)', overflow: 'hidden' }}>
-              <canvas ref={canvasRef} width={320} height={180} style={{ width: '100%', height: '100%' }} />
+            <div style={{ position: 'relative', width: '100%', height: '180px', margin: '0 auto', background: 'rgba(9, 13, 22, 0.8)', borderRadius: '16px', border: '1px solid rgba(56, 189, 248, 0.3)', overflow: 'hidden' }}>
+              <canvas ref={canvasRef} width={380} height={180} style={{ width: '100%', height: '100%' }} />
               
               {/* Status Badge */}
-              <div style={{ position: 'absolute', bottom: '10px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(15, 23, 42, 0.85)', padding: '4px 12px', borderRadius: '12px', border: '1px solid rgba(168, 85, 247, 0.4)', fontSize: '11px', color: isSpeaking ? '#f472b6' : isThinking ? '#a855f7' : '#38bdf8', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}>
-                <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: isSpeaking ? '#f472b6' : isThinking ? '#a855f7' : '#38bdf8', flexShrink: 0 }} />
-                {isSpeaking ? 'Dexter Speaking...' : isThinking ? 'Processing Intelligence...' : 'Listening & Ready'}
+              <div style={{ position: 'absolute', bottom: '10px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(15, 23, 42, 0.85)', padding: '4px 12px', borderRadius: '12px', border: '1px solid rgba(168, 85, 247, 0.4)', fontSize: '11px', color: isVoiceMuted ? '#f87171' : isSpeaking ? '#f472b6' : isThinking ? '#a855f7' : '#38bdf8', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}>
+                <span style={{ width: '6px', height: '6px', borderRadius: '50%', background: isVoiceMuted ? '#f87171' : isSpeaking ? '#f472b6' : isThinking ? '#a855f7' : '#38bdf8', flexShrink: 0 }} />
+                {isVoiceMuted ? 'Voice Muted (Text Mode)' : isSpeaking ? 'Dexter Speaking...' : isThinking ? 'Processing Intelligence...' : isListening ? 'Continuous Listening...' : 'Ready'}
               </div>
             </div>
           </div>
 
-          {/* Day Planner & Task Agenda Widget */}
-          <div className="dexter-panel" style={{ padding: '20px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px' }}>
-              <h3 style={{ fontSize: '14px', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <Calendar size={16} /> Day Planner Agenda
-              </h3>
-              <span style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{tasks.length} Tasks</span>
+          {/* Chat Feed */}
+          <div className="dexter-panel" style={{ padding: '14px', height: isExpanded ? '460px' : '260px', display: 'flex', flexDirection: 'column' }}>
+            <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '10px', paddingRight: '4px' }}>
+              {chatLog.map(m => (
+                <div key={m.id} style={{ display: 'flex', justifyContent: m.sender === 'user' ? 'flex-end' : 'flex-start' }}>
+                  <div style={{
+                    maxWidth: '85%',
+                    padding: '10px 14px',
+                    borderRadius: m.sender === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+                    background: m.sender === 'user' ? 'linear-gradient(135deg, #38bdf8 0%, #0284c7 100%)' : 'rgba(15, 23, 42, 0.8)',
+                    color: '#ffffff',
+                    border: m.sender === 'user' ? 'none' : '1px solid rgba(168, 85, 247, 0.3)',
+                    fontSize: '12px',
+                    lineHeight: 1.4
+                  }}>
+                    <div style={{ fontSize: '10px', fontWeight: 800, opacity: 0.8, marginBottom: '2px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                      {m.sender === 'user' ? '👤 YOU' : '🧠 DEXTER AI'}
+                    </div>
+                    <div>{m.text}</div>
+                  </div>
+                </div>
+              ))}
+              {isThinking && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#a855f7', fontSize: '11px', fontWeight: 600, background: 'rgba(168, 85, 247, 0.1)', padding: '8px 12px', borderRadius: '10px', width: 'fit-content' }}>
+                  <RefreshCw className="brain-active-pulse" size={12} />
+                  <span>Dexter is reasoning & executing tools...</span>
+                </div>
+              )}
+              <div ref={chatEndRef} />
             </div>
 
-            <form onSubmit={handleAddTask} style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
+            {/* Prompt Input Control Bar */}
+            <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px' }}>
               <input
                 type="text"
-                placeholder="Add daily goal or task..."
-                value={newTaskTitle}
-                onChange={(e) => setNewTaskTitle(e.target.value)}
-                style={{ flex: 1, fontSize: '12px', padding: '8px 12px' }}
+                placeholder={isVoiceMuted ? 'Type command (Voice is muted)' : 'Speak hands-free or type here...'}
+                value={inputMsg}
+                onChange={(e) => setInputMsg(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
+                style={{ flex: 1, borderRadius: '10px', fontSize: '12px', padding: '8px 12px' }}
               />
-              <button type="submit" style={{ background: '#38bdf8', color: '#090d16', padding: '8px 12px', borderRadius: '10px', fontWeight: 800, fontSize: '12px' }}>
-                <Plus size={14} />
-              </button>
-            </form>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '200px', overflowY: 'auto' }}>
-              {tasks.map(t => (
-                <div
-                  key={t.id}
-                  onClick={() => handleToggleTask(t.id)}
-                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'rgba(15, 23, 42, 0.6)', borderRadius: '10px', border: '1px solid var(--bg-card-border)', fontSize: '12px', cursor: 'pointer', transition: 'all 0.15s ease' }}
-                >
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <CheckCircle size={14} color={t.completed ? '#10b981' : '#64748b'} />
-                    <span style={{ textDecoration: t.completed ? 'line-through' : 'none', color: t.completed ? '#64748b' : '#f8fafc' }}>
-                      {t.title}
-                    </span>
-                  </div>
-                  <span style={{ fontSize: '10px', color: '#94a3b8' }}>{t.time}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-        </div>
-
-        {/* MIDDLE COLUMN: Interactive Dexter Voice Workspace & Chat Feed */}
-        <div className="dexter-panel dexter-chat-col" style={{ padding: '20px', display: 'flex', flexDirection: 'column' }}>
-          
-          {/* Chat Feed */}
-          <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '14px', marginBottom: '16px', paddingRight: '6px' }}>
-            {chatLog.map(m => (
-              <div key={m.id} style={{ display: 'flex', justifyContent: m.sender === 'user' ? 'flex-end' : 'flex-start' }}>
-                <div style={{
-                  maxWidth: '82%',
-                  padding: '12px 16px',
-                  borderRadius: m.sender === 'user' ? '18px 18px 4px 18px' : '18px 18px 18px 4px',
-                  background: m.sender === 'user' ? 'linear-gradient(135deg, #38bdf8 0%, #0284c7 100%)' : 'rgba(15, 23, 42, 0.8)',
-                  color: '#ffffff',
-                  border: m.sender === 'user' ? 'none' : '1px solid rgba(168, 85, 247, 0.3)',
-                  boxShadow: '0 4px 14px rgba(0,0,0,0.2)',
-                  fontSize: '13px',
-                  lineHeight: 1.5
-                }}>
-                  <div style={{ fontSize: '11px', fontWeight: 800, opacity: 0.8, marginBottom: '4px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                    {m.sender === 'user' ? '👤 YOU' : '🧠 DEXTER AI'}
-                  </div>
-                  <div>{m.text}</div>
-                </div>
-              </div>
-            ))}
-            {isThinking && (
-              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#a855f7', fontSize: '12px', fontWeight: 600, background: 'rgba(168, 85, 247, 0.1)', padding: '10px 14px', borderRadius: '12px', width: 'fit-content' }}>
-                <RefreshCw className="brain-active-pulse" size={14} />
-                <span>Dexter is reasoning & executing tools...</span>
-              </div>
-            )}
-            {/* Scroll anchor */}
-            <div ref={chatEndRef} />
-          </div>
-
-          {/* Voice Input Controls Bar */}
-          <div style={{ display: 'flex', gap: '10px', alignItems: 'center', background: 'rgba(15, 23, 42, 0.8)', padding: '12px', borderRadius: '16px', border: '1px solid var(--bg-card-border)', flexWrap: 'wrap' }}>
-            <button
-              type="button"
-              onClick={toggleMic}
-              style={{
-                background: isListening ? 'rgba(244, 114, 182, 0.25)' : 'rgba(56, 189, 248, 0.2)',
-                color: isListening ? '#f472b6' : '#38bdf8',
-                border: isListening ? '1px solid #f472b6' : '1px solid #38bdf8',
-                padding: '12px',
-                borderRadius: '12px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                flexShrink: 0
-              }}
-              title="Continuous Voice Mic Command"
-            >
-              {isListening ? <Radio className="brain-active-pulse" size={20} /> : <Mic size={20} />}
-            </button>
-
-            <input
-              type="text"
-              placeholder={isListening ? 'Listening... Speak your command to Dexter' : 'Type prompt (e.g., "Plan my day", "Play lo-fi on YouTube", "Open Chrome")'}
-              value={inputMsg}
-              onChange={(e) => setInputMsg(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-              style={{ flex: 1, borderRadius: '12px', minWidth: '180px' }}
-            />
-
-            <button
-              type="button"
-              onClick={() => handleSendMessage()}
-              style={{
-                background: 'linear-gradient(135deg, #a855f7 0%, #38bdf8 100%)',
-                color: '#ffffff',
-                border: 'none',
-                padding: '12px 20px',
-                borderRadius: '12px',
-                fontWeight: 800,
-                fontSize: '13px',
-                flexShrink: 0
-              }}
-            >
-              Ask Dexter
-            </button>
-          </div>
-
-        </div>
-
-        {/* RIGHT COLUMN: spilledCoffeeAI Curation & Self-Learned Skills */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
-          
-          {/* spilledCoffeeAI Overnight Content Curation Card */}
-          <div className="dexter-panel" style={{ padding: '20px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-              <h3 style={{ fontSize: '14px', color: '#f472b6', display: 'flex', alignItems: 'center', gap: '6px' }}>
-                <Tv size={16} /> spilledCoffeeAI Queue
-              </h3>
               <button
                 type="button"
-                onClick={handleRunCurate}
-                disabled={isCurating}
-                style={{ background: 'rgba(244, 114, 182, 0.2)', color: '#f472b6', border: '1px solid rgba(244, 114, 182, 0.4)', padding: '4px 10px', borderRadius: '8px', fontSize: '11px', fontWeight: 700, opacity: isCurating ? 0.6 : 1 }}
+                onClick={() => handleSendMessage()}
+                style={{
+                  background: 'linear-gradient(135deg, #a855f7 0%, #38bdf8 100%)',
+                  color: '#ffffff',
+                  padding: '8px 14px',
+                  borderRadius: '10px',
+                  fontWeight: 800,
+                  fontSize: '12px',
+                  flexShrink: 0
+                }}
               >
-                {isCurating ? 'Curating...' : 'Curate Titles'}
+                Send
               </button>
             </div>
-
-            <p style={{ fontSize: '11px', color: 'var(--text-muted)', marginBottom: '12px' }}>
-              Overnight viral video titles and script outlines ready for review:
-            </p>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', maxHeight: '200px', overflowY: 'auto' }}>
-              {overnightItems.length === 0 ? (
-                <div style={{ padding: '12px', background: 'rgba(15, 23, 42, 0.4)', borderRadius: '10px', border: '1px dashed rgba(244, 114, 182, 0.3)', textAlign: 'center', color: '#64748b', fontSize: '11px' }}>
-                  No curated content yet. Click <strong>Curate Titles</strong> to generate.
-                </div>
-              ) : overnightItems.map(item => (
-                <div key={item.id} style={{ background: 'rgba(15, 23, 42, 0.6)', padding: '10px', borderRadius: '10px', border: '1px solid rgba(244, 114, 182, 0.3)' }}>
-                  <div style={{ fontSize: '12px', fontWeight: 800, color: '#f472b6', marginBottom: '4px' }}>
-                    {item.title}
-                  </div>
-                  <div style={{ fontSize: '11px', color: '#e2e8f0', marginBottom: '4px', fontStyle: 'italic' }}>
-                    "{item.hook}"
-                  </div>
-                  <div style={{ fontSize: '10px', color: '#94a3b8' }}>
-                    Target: {item.targetAudience} • CTR Potential: <strong style={{ color: '#10b981' }}>{item.ctrScore}</strong>
-                  </div>
-                </div>
-              ))}
-            </div>
           </div>
 
-          {/* Quick App Launcher & Tools */}
-          <div className="dexter-panel" style={{ padding: '20px' }}>
-            <h3 style={{ fontSize: '14px', color: '#38bdf8', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <Zap size={16} /> Quick OS App Launcher
-            </h3>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
-              {['Chrome', 'VSCode', 'Notepad', 'Calc', 'Spotify'].map(app => (
-                <button
-                  key={app}
-                  type="button"
-                  onClick={() => handleLaunchApp(app)}
-                  style={{ background: 'rgba(15, 23, 42, 0.6)', color: '#f8fafc', border: '1px solid var(--bg-card-border)', padding: '8px 10px', borderRadius: '10px', fontSize: '12px', fontWeight: 600, textAlign: 'left', display: 'flex', alignItems: 'center', gap: '6px' }}
-                >
-                  <ExternalLink size={12} color="#38bdf8" /> {app}
-                </button>
-              ))}
+          {/* Quick Desktop Controls Bar */}
+          {!isExpanded && (
+            <div style={{ display: 'flex', justifyContent: 'between', gap: '8px' }}>
+              <button
+                type="button"
+                onClick={toggleExpandWindow}
+                style={{ flex: 1, background: 'rgba(15, 23, 42, 0.6)', color: '#38bdf8', border: '1px solid var(--bg-card-border)', padding: '8px', borderRadius: '10px', fontSize: '11px', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}
+              >
+                <Maximize2 size={12} /> Open Full Day Planner & Curation Dashboard
+              </button>
             </div>
-          </div>
-
-          {/* Self-Learning Skills Registry */}
-          <div className="dexter-panel" style={{ padding: '20px' }}>
-            <h3 style={{ fontSize: '14px', color: '#a855f7', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <Layers size={16} /> Self-Learned Skills ({skills.length})
-            </h3>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '160px', overflowY: 'auto' }}>
-              {skills.length === 0 ? (
-                <div style={{ padding: '12px', background: 'rgba(15, 23, 42, 0.4)', borderRadius: '10px', border: '1px dashed rgba(168, 85, 247, 0.3)', textAlign: 'center', color: '#64748b', fontSize: '11px' }}>
-                  No skills learned yet. Dexter learns automatically from complex tasks.
-                </div>
-              ) : skills.map((s, idx) => (
-                <div key={idx} style={{ background: 'rgba(15, 23, 42, 0.6)', padding: '8px 10px', borderRadius: '10px', border: '1px solid rgba(168, 85, 247, 0.25)', fontSize: '11px' }}>
-                  <div style={{ fontWeight: 700, color: '#a855f7' }}>{s.name}</div>
-                  <div style={{ color: '#94a3b8', fontSize: '10px' }}>{s.description}</div>
-                </div>
-              ))}
-            </div>
-          </div>
+          )}
 
         </div>
+
+        {/* EXPANDED LEFT COLUMN: Day Planner & Local Desktop File Explorer (Visible when expanded) */}
+        {isExpanded && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            
+            {/* Day Planner Agenda Widget */}
+            <div className="dexter-panel" style={{ padding: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+                <h3 style={{ fontSize: '13px', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <Calendar size={15} /> Day Planner Agenda
+                </h3>
+                <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>{tasks.length} Tasks</span>
+              </div>
+
+              <form onSubmit={handleAddTask} style={{ display: 'flex', gap: '6px', marginBottom: '12px' }}>
+                <input
+                  type="text"
+                  placeholder="Add goal or task..."
+                  value={newTaskTitle}
+                  onChange={(e) => setNewTaskTitle(e.target.value)}
+                  style={{ flex: 1, fontSize: '11px', padding: '6px 10px' }}
+                />
+                <button type="submit" style={{ background: '#38bdf8', color: '#090d16', padding: '6px 10px', borderRadius: '8px', fontWeight: 800, fontSize: '11px' }}>
+                  <Plus size={12} />
+                </button>
+              </form>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '180px', overflowY: 'auto' }}>
+                {tasks.map(t => (
+                  <div
+                    key={t.id}
+                    onClick={() => handleToggleTask(t.id)}
+                    style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '6px 10px', background: 'rgba(15, 23, 42, 0.6)', borderRadius: '8px', border: '1px solid var(--bg-card-border)', fontSize: '11px', cursor: 'pointer' }}
+                  >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                      <CheckCircle size={12} color={t.completed ? '#10b981' : '#64748b'} />
+                      <span style={{ textDecoration: t.completed ? 'line-through' : 'none', color: t.completed ? '#64748b' : '#f8fafc' }}>
+                        {t.title}
+                      </span>
+                    </div>
+                    <span style={{ fontSize: '9px', color: '#94a3b8' }}>{t.time}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Desktop Local File Explorer Tool */}
+            <div className="dexter-panel" style={{ padding: '16px' }}>
+              <h3 style={{ fontSize: '13px', color: '#38bdf8', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <FolderSearch size={15} /> Local PC File Explorer
+              </h3>
+
+              <form onSubmit={handleSearchFiles} style={{ display: 'flex', gap: '6px', marginBottom: '10px' }}>
+                <input
+                  type="text"
+                  placeholder="Search files on PC..."
+                  value={fileQuery}
+                  onChange={(e) => setFileQuery(e.target.value)}
+                  style={{ flex: 1, fontSize: '11px', padding: '6px 10px' }}
+                />
+                <button type="submit" style={{ background: 'rgba(56, 189, 248, 0.2)', color: '#38bdf8', border: '1px solid #38bdf8', padding: '6px 10px', borderRadius: '8px', fontSize: '11px', fontWeight: 700 }}>
+                  {isSearchingFiles ? '...' : <Search size={12} />}
+                </button>
+              </form>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '160px', overflowY: 'auto' }}>
+                {fileResults.map((f, idx) => (
+                  <div key={idx} onClick={() => handleOpenFile(f.path)} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', background: 'rgba(15, 23, 42, 0.6)', padding: '6px 8px', borderRadius: '8px', border: '1px solid var(--bg-card-border)', cursor: 'pointer', fontSize: '11px' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
+                      <FileText size={12} color="#38bdf8" />
+                      <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{f.fileName}</span>
+                    </div>
+                    <ExternalLink size={10} color="#94a3b8" />
+                  </div>
+                ))}
+              </div>
+            </div>
+
+          </div>
+        )}
+
+        {/* EXPANDED RIGHT COLUMN: spilledCoffeeAI Queue, App Launcher & Skills (Visible when expanded) */}
+        {isExpanded && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            
+            {/* spilledCoffeeAI Queue */}
+            <div className="dexter-panel" style={{ padding: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+                <h3 style={{ fontSize: '13px', color: '#f472b6', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <Tv size={15} /> spilledCoffeeAI Queue
+                </h3>
+                <button
+                  type="button"
+                  onClick={handleRunCurate}
+                  disabled={isCurating}
+                  style={{ background: 'rgba(244, 114, 182, 0.2)', color: '#f472b6', border: '1px solid rgba(244, 114, 182, 0.4)', padding: '4px 8px', borderRadius: '6px', fontSize: '10px', fontWeight: 700 }}
+                >
+                  {isCurating ? '...' : '⚡ Curate'}
+                </button>
+              </div>
+
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '180px', overflowY: 'auto' }}>
+                {overnightItems.map(item => (
+                  <div key={item.id} style={{ background: 'rgba(15, 23, 42, 0.6)', padding: '8px', borderRadius: '8px', border: '1px solid rgba(244, 114, 182, 0.3)' }}>
+                    <div style={{ fontSize: '11px', fontWeight: 800, color: '#f472b6' }}>{item.title}</div>
+                    <div style={{ fontSize: '10px', color: '#e2e8f0', fontStyle: 'italic' }}>"{item.hook}"</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Quick App Launcher */}
+            <div className="dexter-panel" style={{ padding: '16px' }}>
+              <h3 style={{ fontSize: '13px', color: '#38bdf8', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Zap size={15} /> Quick OS App Launcher
+              </h3>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px' }}>
+                {['Chrome', 'VSCode', 'Notepad', 'Calc', 'Spotify'].map(app => (
+                  <button
+                    key={app}
+                    type="button"
+                    onClick={() => handleLaunchApp(app)}
+                    style={{ background: 'rgba(15, 23, 42, 0.6)', color: '#f8fafc', border: '1px solid var(--bg-card-border)', padding: '6px 8px', borderRadius: '8px', fontSize: '11px', fontWeight: 600, textAlign: 'left', display: 'flex', alignItems: 'center', gap: '4px' }}
+                  >
+                    <ExternalLink size={10} color="#38bdf8" /> {app}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Self-Learning Skills */}
+            <div className="dexter-panel" style={{ padding: '16px' }}>
+              <h3 style={{ fontSize: '13px', color: '#a855f7', marginBottom: '8px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <Layers size={15} /> Self-Learned Skills ({skills.length})
+              </h3>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '140px', overflowY: 'auto' }}>
+                {skills.map((s, idx) => (
+                  <div key={idx} style={{ background: 'rgba(15, 23, 42, 0.6)', padding: '6px 8px', borderRadius: '8px', border: '1px solid rgba(168, 85, 247, 0.25)', fontSize: '10px' }}>
+                    <div style={{ fontWeight: 700, color: '#a855f7' }}>⚡ {s.name}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+          </div>
+        )}
 
       </div>
     </div>

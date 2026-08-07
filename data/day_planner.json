@@ -5,7 +5,7 @@
       "id": "t1",
       "time": "09:00 AM",
       "title": "Morning Routine & Coffee",
-      "completed": false
+      "completed": true
     },
     {
       "id": "t2",
@@ -33,6 +33,12 @@
     },
     {
       "id": "t-1786117565",
+      "time": "09:00 PM",
+      "title": "Fix verification run",
+      "completed": false
+    },
+    {
+      "id": "t-1786120330",
       "time": "09:00 PM",
       "title": "Fix verification run",
       "completed": false

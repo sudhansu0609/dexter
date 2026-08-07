@@ -23,8 +23,9 @@ from hybrid_llm import HybridLLMRouter
 from spilled_coffee_controller import SpilledCoffeeAIController
 from skill_engine import DexterSkillEngine
 from dexter_tools import DayPlannerTool, YouTubeMusicTool, AppLauncherTool, PlaywrightBrowserTool
+from filesystem_tool import FileSystemTool
 
-app = FastAPI(title="Dexter AI Super Assistant Engine", version="1.1.0")
+app = FastAPI(title="Dexter AI Super Assistant Engine", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,6 +57,20 @@ class LaunchAppRequest(BaseModel):
 class BrowseRequest(BaseModel):
     url: str
 
+class FileSearchRequest(BaseModel):
+    query: str
+    path: Optional[str] = None
+
+class FileReadRequest(BaseModel):
+    path: str
+
+class FileWriteRequest(BaseModel):
+    path: str
+    content: str
+
+class FileOpenRequest(BaseModel):
+    path: str
+
 class CurateRequest(BaseModel):
     niche: Optional[str] = "AI Tech & Viral Trends"
     count: Optional[int] = 3
@@ -70,6 +85,7 @@ PLANNER_KEYWORDS = ["plan my day", "agenda", "schedule", "my tasks", "today's pl
 CURATE_KEYWORDS  = ["curate", "video title", "spilledcoffee", "overnight content", "generate titles"]
 YOUTUBE_KEYWORDS = ["play ", "youtube ", "play song", "play music", "play video"]
 BROWSE_KEYWORDS  = ["go to ", "browse ", "navigate ", "open website", "open url", "visit "]
+FILESYS_KEYWORDS = ["find file", "search file", "read file", "open folder", "search folder"]
 LAUNCH_KEYWORDS  = ["open ", "launch ", "start app"]
 
 @app.get("/api/dexter/status")
@@ -125,7 +141,18 @@ def process_chat(req: ChatRequest):
         reply = f"Opening {url_target} in your browser now."
         return {"reply": reply, "action": "browse_url", "details": browse_res, "speechUrl": _speech_url(reply)}
 
-    # ── 5. App Launching (checked AFTER planner & YouTube to avoid false positives) ──
+    # ── 5. File System Commands ──
+    if any(k in msg for k in FILESYS_KEYWORDS):
+        file_query = msg
+        for strip_word in ["find file ", "search file ", "read file ", "open folder ", "search folder "]:
+            file_query = file_query.replace(strip_word, "")
+        file_query = file_query.strip()
+        fs_res = FileSystemTool.search_files(file_query)
+        count = fs_res.get("count", 0)
+        reply = f"Found {count} files matching '{file_query}' on your system." if count > 0 else f"No files matching '{file_query}' were found."
+        return {"reply": reply, "action": "search_files", "details": fs_res, "speechUrl": _speech_url(reply)}
+
+    # ── 6. App Launching ──
     if any(k in msg for k in LAUNCH_KEYWORDS):
         app_target = msg
         for strip_word in ["open ", "launch ", "start ", "app"]:
@@ -136,16 +163,16 @@ def process_chat(req: ChatRequest):
             reply = f"I have launched {launch_res.get('appName', app_target)} for you on your desktop!"
             return {"reply": reply, "action": "launch_app", "details": launch_res, "speechUrl": _speech_url(reply)}
 
-    # ── 6. Check learned skills for a matching trigger ──
+    # ── 7. Check learned skills for a matching trigger ──
     matched_skill = skill_engine.match_skill(msg)
     if matched_skill:
         skill_reply = f"I found a learned skill '{matched_skill['name']}' that matches your request. Executing steps: {', '.join(matched_skill.get('steps', [])[:3])}"
         return {"reply": skill_reply, "action": "skill_match", "details": matched_skill, "speechUrl": _speech_url(skill_reply)}
 
-    # ── 7. Hybrid LLM Reasoning Engine (fallback) ──
+    # ── 8. Hybrid LLM Reasoning Engine (fallback) ──
     system_prompt = (
         "You are Dexter, an intelligent, ultra-smart personal AI super assistant. "
-        "You assist the user with planning their day, curating viral YouTube video scripts, launching apps, and answering questions. "
+        "You assist the user with planning their day, curating viral YouTube video scripts, launching apps, accessing local desktop files, and answering questions. "
         "Speak warmly, with high intelligence and enthusiasm."
     )
     llm_reply = llm_router.generate(req.message, system_prompt=system_prompt, provider=req.provider, model=req.model)
@@ -189,6 +216,22 @@ def launch_system_app(req: LaunchAppRequest):
 @app.post("/api/dexter/browser/navigate")
 def browse_url(req: BrowseRequest):
     return PlaywrightBrowserTool.browse_url(req.url)
+
+@app.post("/api/dexter/filesystem/search")
+def search_files(req: FileSearchRequest):
+    return FileSystemTool.search_files(req.query, req.path)
+
+@app.post("/api/dexter/filesystem/read")
+def read_file(req: FileReadRequest):
+    return FileSystemTool.read_file(req.path)
+
+@app.post("/api/dexter/filesystem/write")
+def write_file(req: FileWriteRequest):
+    return FileSystemTool.write_file(req.path, req.content)
+
+@app.post("/api/dexter/filesystem/open")
+def open_file_path(req: FileOpenRequest):
+    return FileSystemTool.open_local_path(req.path)
 
 @app.get("/api/dexter/playlists")
 def get_playlists():

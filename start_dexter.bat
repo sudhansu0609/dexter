@@ -27,22 +27,18 @@ if not exist "%PYTHON_EXE%" (
     set "PYTHON_EXE=python"
 )
 
-echo Starting Dexter Frontend Studio on port %FRONTEND_PORT%...
-start "Dexter Voice Studio" cmd /k "cd /d "%DEXTER_DIR%" && npm run dev"
+echo Starting Dexter Native Desktop App on port %FRONTEND_PORT%...
+start "Dexter Desktop Window" cmd /k "cd /d "%DEXTER_DIR%" && npm run desktop"
 
 echo Starting Dexter FastAPI Backend Engine on port %BACKEND_PORT%...
 start "Dexter Backend Engine" cmd /k "cd /d "%DEXTER_DIR%" && set PYTHONIOENCODING=utf-8 && "%PYTHON_EXE%" -X utf8 -m uvicorn backend.main:app --host 0.0.0.0 --port %BACKEND_PORT% --reload"
 
 echo.
 echo ===================================================
-echo Dexter Super Assistant Started Successfully!
+echo Dexter Desktop Super Assistant Started Successfully!
 echo.
-echo Visualizer Web Studio : http://localhost:%FRONTEND_PORT%
-echo FastAPI Intelligence Engine: http://localhost:%BACKEND_PORT%
+echo Native Desktop App    : Electron Window Active
+echo FastAPI Backend Engine: http://localhost:%BACKEND_PORT%
 echo ===================================================
-echo.
-echo Launching Dexter Web Interface in your default browser...
-timeout /t 2 /nobreak >nul
-start http://localhost:%FRONTEND_PORT%
 echo.
 pause

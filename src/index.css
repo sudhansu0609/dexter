@@ -68,6 +68,13 @@ input:focus, textarea:focus, select:focus {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), inset 0 0 15px rgba(56, 189, 248, 0.05);
 }
 
+[style*="appRegion: drag"], .drag-handle {
+  -webkit-app-region: drag;
+}
+[style*="appRegion: no-drag"], button, input, select, textarea, .no-drag {
+  -webkit-app-region: no-drag;
+}
+
 .dexter-glow-border {
   border: 1px solid rgba(168, 85, 247, 0.4);
   box-shadow: 0 0 20px rgba(168, 85, 247, 0.15);
