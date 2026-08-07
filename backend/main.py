@@ -250,3 +250,12 @@ def generate_expressive_tts(req: TTSRequest):
 @app.get("/api/dexter/playlists")
 def get_playlists():
     return youtube_tool.get_playlists()
+
+dist_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist")
+if os.path.exists(dist_dir):
+    app.mount("/", StaticFiles(directory=dist_dir, html=True), name="static")
+
+if __name__ == "__main__":
+    import uvicorn
+    print("Starting Dexter Engine on port 8098...")
+    uvicorn.run(app, host="0.0.0.0", port=8098)
