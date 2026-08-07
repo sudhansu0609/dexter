@@ -231,18 +231,39 @@ export default function App() {
         if (Date.now() - lastSpeechEndTimeRef.current < 1500) return;
 
         if (lastResult.isFinal) {
-          const transcript = lastResult[0].transcript.trim();
-          if (transcript.length < 3) return;
+          const rawText = lastResult[0].transcript.trim();
+          if (rawText.length < 3) return;
 
-          // Self-Echo / Deduplication Filter
-          const cleanTranscript = transcript.toLowerCase();
-          const cleanLastSpoken = lastSpokenTextRef.current.toLowerCase();
-          if (cleanLastSpoken && cleanLastSpoken.includes(cleanTranscript)) {
-            console.log('[Mic Filter] Ignored self-echo transcript:', transcript);
+          const lowerText = rawText.toLowerCase();
+
+          // ── Wake Word Filtering: Must include "Dexter" ──
+          const WAKE_WORDS = ["dexter", "hey dexter", "ok dexter", "okay dexter", "hi dexter"];
+          const hasWakeWord = WAKE_WORDS.some(w => lowerText.includes(w));
+
+          if (!hasWakeWord) {
+            console.log('[Wake Word Filter] Ignored ambient speech (no "Dexter" detected):', rawText);
             return;
           }
 
-          handleSendMessage(transcript);
+          // Extract clean command by stripping wake word prefixes/suffixes
+          let cleanCommand = rawText.replace(/^(hey|ok|okay|hi)?\s*dexter[,!:]?\s*/i, '');
+          cleanCommand = cleanCommand.replace(/\s*dexter[,!:]?\s*$/i, '').trim();
+
+          // Self-Echo / Deduplication Filter
+          const cleanTranscript = (cleanCommand || rawText).toLowerCase();
+          const cleanLastSpoken = lastSpokenTextRef.current.toLowerCase();
+          if (cleanLastSpoken && cleanLastSpoken.includes(cleanTranscript)) {
+            console.log('[Mic Filter] Ignored self-echo transcript:', cleanTranscript);
+            return;
+          }
+
+          // If the user just said "Dexter" or "Hey Dexter" with no extra command
+          if (!cleanCommand || cleanCommand.length < 2) {
+            speakText("Yes? I am listening.");
+            return;
+          }
+
+          handleSendMessage(cleanCommand);
         }
       };
 
@@ -575,7 +596,7 @@ export default function App() {
             title={isVoiceMuted ? 'Unmute Voice' : 'Disable/Mute Voice'}
           >
             {isVoiceMuted ? <MicOff size={14} /> : <Radio className="brain-active-pulse" size={14} />}
-            {isVoiceMuted ? 'Muted' : 'Hands-Free On'}
+            {isVoiceMuted ? 'Muted' : 'Say "Dexter..."'}
           </button>
 
           {/* Window Expand / Compact Toggle */}
