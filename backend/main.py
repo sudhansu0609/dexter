@@ -23,7 +23,7 @@ from typing import Optional, List, Dict, Any
 from hybrid_llm import HybridLLMRouter
 from spilled_coffee_controller import SpilledCoffeeAIController
 from skill_engine import DexterSkillEngine
-from dexter_tools import DayPlannerTool, YouTubeMusicTool, AppLauncherTool, PlaywrightBrowserTool
+from dexter_tools import DayPlannerTool, YouTubeMusicTool, AppLauncherTool, PlaywrightBrowserTool, StickyNotesTool
 from fastapi.responses import FileResponse
 from filesystem_tool import FileSystemTool
 from voice_engine import DexterVoiceEngine
@@ -44,6 +44,7 @@ skill_engine = DexterSkillEngine(llm_router)
 day_planner = DayPlannerTool()
 youtube_tool = YouTubeMusicTool()
 voice_engine = DexterVoiceEngine()
+sticky_notes = StickyNotesTool()
 
 class ChatRequest(BaseModel):
     message: str
@@ -90,12 +91,14 @@ def _speech_url(text: str) -> str:
     return f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(clean)}&tl=en&client=tw-ob"
 
 # ───────── Intent keywords (ordered specific → broad) ─────────
-PLANNER_KEYWORDS = ["plan my day", "agenda", "schedule", "my tasks", "today's plan", "daily plan"]
-CURATE_KEYWORDS  = ["curate", "video title", "spilledcoffee", "overnight content", "generate titles"]
-YOUTUBE_KEYWORDS = ["play ", "youtube", "search for", "play song", "play music", "play video"]
-BROWSE_KEYWORDS  = ["go to ", "browse ", "navigate ", "open website", "open url", "visit "]
-FILESYS_KEYWORDS = ["find file", "search file", "read file", "open folder", "search folder"]
-LAUNCH_KEYWORDS  = ["open ", "launch ", "start app"]
+STICKY_NOTE_KEYWORDS = ["sticky note", "add note", "create note", "take a note", "write note", "my notes", "notes"]
+CALENDAR_KEYWORDS    = ["calendar", "schedule my day", "add task", "schedule event", "add event", "book time", "schedule"]
+PLANNER_KEYWORDS     = ["plan my day", "agenda", "schedule", "my tasks", "today's plan", "daily plan"]
+CURATE_KEYWORDS      = ["curate", "video title", "spilledcoffee", "overnight content", "generate titles"]
+YOUTUBE_KEYWORDS     = ["play ", "youtube", "search for", "play song", "play music", "play video"]
+BROWSE_KEYWORDS      = ["go to ", "browse ", "navigate ", "open website", "open url", "visit "]
+FILESYS_KEYWORDS     = ["find file", "search file", "read file", "open folder", "search folder"]
+LAUNCH_KEYWORDS      = ["open ", "launch ", "start app"]
 
 @app.get("/api/dexter/status")
 def get_status():
@@ -103,6 +106,7 @@ def get_status():
     skills = skill_engine.list_skills()
     planner = day_planner.get_agenda()
     overnight = spilled_coffee.get_overnight_content()
+    notes = sticky_notes.list_notes()
     
     return {
         "status": "online",
@@ -110,14 +114,44 @@ def get_status():
         "providers": providers,
         "skillsCount": len(skills),
         "tasksCount": len(planner.get("tasks", [])),
-        "overnightQueueCount": len(overnight)
+        "overnightQueueCount": len(overnight),
+        "notesCount": len(notes)
     }
 
 @app.post("/api/dexter/chat")
 def process_chat(req: ChatRequest):
     msg = req.message.strip().lower()
 
-    # ── 1. Day Planning & Agenda (check FIRST — avoids "start my day" hitting app launcher) ──
+    # ── 1. Sticky Notes Integration ──
+    if any(k in msg for k in STICKY_NOTE_KEYWORDS):
+        import re
+        note_content = re.sub(r'^(dexter\s+)?(add note|create note|take a note|write note|sticky note)\s*(to|that|saying)?\s*', '', msg, flags=re.IGNORECASE).strip()
+        if not note_content or note_content in ["my notes", "sticky notes", "show notes", "open notes"]:
+            notes = sticky_notes.list_notes()
+            AppLauncherTool.launch_app("sticky notes")
+            reply = f"You have {len(notes)} sticky notes. Opened Windows Sticky Notes for you." if notes else "Opened Windows Sticky Notes."
+            return {"reply": reply, "action": "list_notes", "details": notes, "speechUrl": _speech_url(reply)}
+        else:
+            new_note = sticky_notes.create_note(note_content)
+            reply = f"Created sticky note: '{note_content}' and launched Sticky Notes!"
+            return {"reply": reply, "action": "create_note", "details": new_note, "speechUrl": _speech_url(reply)}
+
+    # ── 2. Calendar & Day Scheduling ──
+    if any(k in msg for k in CALENDAR_KEYWORDS):
+        import re
+        if "open calendar" in msg or "show calendar" in msg:
+            AppLauncherTool.launch_app("calendar")
+            reply = "Opened Windows Calendar for you."
+            return {"reply": reply, "action": "open_calendar", "speechUrl": _speech_url(reply)}
+        
+        task_title = re.sub(r'^(dexter\s+)?(schedule|add task|add event|book time|calendar)\s*(to|that|saying)?\s*', '', msg, flags=re.IGNORECASE).strip()
+        if task_title:
+            new_task = day_planner.add_task(task_title)
+            AppLauncherTool.launch_app("calendar")
+            reply = f"Scheduled '{task_title}' in your day planner and opened Windows Calendar!"
+            return {"reply": reply, "action": "schedule_event", "details": new_task, "speechUrl": _speech_url(reply)}
+
+    # ── 3. Day Planning & Agenda ──
     if any(k in msg for k in PLANNER_KEYWORDS):
         agenda = day_planner.get_agenda()
         task_list = [f"{t['time']} - {t['title']}" for t in agenda.get("tasks", [])]
@@ -261,6 +295,22 @@ def open_file_path(req: FileOpenRequest):
 def generate_expressive_tts(req: TTSRequest):
     file_path = voice_engine.generate_speech(req.text, req.voiceKey or "christopher")
     return FileResponse(file_path, media_type="audio/mpeg")
+
+class CreateNoteRequest(BaseModel):
+    content: str
+    title: Optional[str] = "Sticky Note"
+
+@app.get("/api/dexter/notes")
+def get_sticky_notes():
+    return sticky_notes.list_notes()
+
+@app.post("/api/dexter/notes/add")
+def create_sticky_note(req: CreateNoteRequest):
+    return sticky_notes.create_note(req.content, req.title or "Sticky Note")
+
+@app.post("/api/dexter/notes/delete/{note_id}")
+def delete_sticky_note(note_id: str):
+    return {"success": sticky_notes.delete_note(note_id)}
 
 @app.get("/api/dexter/playlists")
 def get_playlists():

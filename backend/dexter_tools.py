@@ -112,6 +112,55 @@ class YouTubeMusicTool:
         return self._load_playlists()
 
 
+class StickyNotesTool:
+    def __init__(self):
+        os.makedirs(DATA_DIR, exist_ok=True)
+        if not os.path.exists(NOTES_FILE):
+            self._save_notes([
+                {"id": "n1", "title": "Welcome Note", "content": "Dexter AI Super Assistant Quick Note", "color": "#fef08a", "created": time.strftime("%Y-%m-%d %H:%M")}
+            ])
+
+    def _load_notes(self) -> List[Dict[str, Any]]:
+        try:
+            with open(NOTES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+    def _save_notes(self, data: List[Dict[str, Any]]):
+        with open(NOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def create_note(self, content: str, title: str = "Sticky Note", color: str = "#fef08a") -> Dict[str, Any]:
+        notes = self._load_notes()
+        note = {
+            "id": f"n-{int(time.time())}",
+            "title": title,
+            "content": content,
+            "color": color,
+            "created": time.strftime("%Y-%m-%d %H:%M")
+        }
+        notes.insert(0, note)
+        self._save_notes(notes)
+        # Open Windows Sticky Notes app
+        try:
+            subprocess.Popen("start ms-stk:", shell=True)
+        except Exception:
+            pass
+        return note
+
+    def list_notes(self) -> List[Dict[str, Any]]:
+        return self._load_notes()
+
+    def delete_note(self, note_id: str) -> bool:
+        notes = self._load_notes()
+        new_notes = [n for n in notes if n["id"] != note_id]
+        if len(new_notes) < len(notes):
+            self._save_notes(new_notes)
+            return True
+        return False
+
+
 class AppLauncherTool:
     APP_COMMANDS = {
         "edge": "start msedge:",
@@ -119,6 +168,11 @@ class AppLauncherTool:
         "msedge": "start msedge:",
         "microsoft edge": "start msedge:",
         "browser": "start msedge:",
+        "calendar": "start outlookcal:",
+        "windows calendar": "start outlookcal:",
+        "sticky notes": "start ms-stk:",
+        "sticky note": "start ms-stk:",
+        "notes": "start ms-stk:",
         "chrome": "start chrome",
         "google chrome": "start chrome",
         "notepad": "notepad.exe",
