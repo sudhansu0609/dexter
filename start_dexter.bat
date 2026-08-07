@@ -14,7 +14,7 @@ echo ===================================================
 
 REM Stop processes using the configured ports if they exist
 echo Clearing ports %FRONTEND_PORT% and %BACKEND_PORT%...
-powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort %FRONTEND_PORT%,%BACKEND_PORT% -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }" >nul 2>&1
+powershell -NoProfile -Command "Get-Process -Id (Get-NetTCPConnection -LocalPort %FRONTEND_PORT%,%BACKEND_PORT% -ErrorAction SilentlyContinue).OwningProcess -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue" >nul 2>&1
 
 REM Get current directory of the batch file
 set "DEXTER_DIR=%~dp0"
