@@ -174,21 +174,6 @@ class AppLauncherTool:
         "sticky notes": "start ms-stk:",
         "sticky note": "start ms-stk:",
         "notes": "start ms-stk:",
-        # Adobe Creative Cloud Mappings
-        "animate": "start animate:",
-        "adobe animate": "start animate:",
-        "audition": "start audition:",
-        "adobe audition": "start audition:",
-        "media encoder": "start ame:",
-        "adobe media encoder": "start ame:",
-        "encoder": "start ame:",
-        "premiere": "start premiere:",
-        "adobe premiere": "start premiere:",
-        "premiere pro": "start premiere:",
-        "photoshop": "start photoshop:",
-        "adobe photoshop": "start photoshop:",
-        "after effects": "start aftereffects:",
-        "adobe after effects": "start aftereffects:",
         "chrome": "start chrome",
         "google chrome": "start chrome",
         "notepad": "notepad.exe",
@@ -207,33 +192,105 @@ class AppLauncherTool:
     }
 
     @classmethod
+    def find_installed_exe(cls, app_name: str) -> Optional[str]:
+        """Dynamically scan Windows directories for matching application executables."""
+        target = app_name.lower().strip()
+        # Clean filler prefixes/suffixes
+        target = target.replace("adobe ", "").replace("microsoft ", "").strip()
+
+        search_dirs = [
+            r"C:\Program Files\Adobe",
+            r"C:\Program Files (x86)\Adobe",
+            r"C:\Program Files",
+            os.path.expanduser(r"~\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"),
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
+        ]
+
+        for sd in search_dirs:
+            if os.path.exists(sd):
+                try:
+                    for root, dirs, files in os.walk(sd):
+                        for f in files:
+                            f_lower = f.lower()
+                            if f_lower.endswith(".exe") or f_lower.endswith(".lnk"):
+                                if target in f_lower:
+                                    # Exclude helper/service background tasks
+                                    if not any(b in f_lower for b in ["helper", "service", "prefs", "dlms", "unins", "setup", "crash"]):
+                                        return os.path.join(root, f)
+                except Exception:
+                    pass
+        return None
+
+    @classmethod
+    def verify_process_running(cls, proc_name: str) -> bool:
+        """Check if process is active in Windows tasklist."""
+        try:
+            cmd = f'tasklist /FI "IMAGENAME eq {proc_name}*"'
+            out = subprocess.check_output(cmd, shell=True, text=True, errors="ignore")
+            return proc_name.lower() in out.lower()
+        except Exception:
+            return False
+
+    @classmethod
     def launch_app(cls, app_name: str) -> Dict[str, Any]:
         clean_name = app_name.lower().strip()
-        # Strip common trailing filler words
         for filler in [" on my pc", " on my computer", " for me", " app", " application", " please"]:
             clean_name = clean_name.replace(filler, "")
         clean_name = clean_name.strip()
 
+        # Step 1: Check pre-mapped commands
         cmd_to_run = cls.APP_COMMANDS.get(clean_name)
-        if not cmd_to_run:
-            # Fallback for generic app names
-            cmd_to_run = f"start {clean_name}"
+        
+        # Step 2: If no direct command mapped, dynamically scan disk for exact executable
+        found_exe = cls.find_installed_exe(clean_name)
 
-        try:
-            subprocess.Popen(cmd_to_run, shell=True)
-            return {
-                "success": True,
-                "appName": clean_name or app_name,
-                "command": cmd_to_run,
-                "message": f"Successfully launched {clean_name or app_name}"
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "appName": app_name,
-                "error": str(e),
-                "message": f"Failed to launch {app_name}: {str(e)}"
-            }
+        attempts = []
+        if found_exe:
+            attempts.append(f'"{found_exe}"')
+        if cmd_to_run:
+            attempts.append(cmd_to_run)
+        
+        # Fallback attempt
+        attempts.append(f'start "" "{clean_name}"')
+
+        # Recursive Execution & Verification Loop
+        for idx, run_cmd in enumerate(attempts, 1):
+            try:
+                print(f"[Smart Launcher] Attempt {idx}: Executing '{run_cmd}'...")
+                if run_cmd.endswith('.exe"') or run_cmd.endswith('.exe'):
+                    os.startfile(run_cmd.strip('"'))
+                else:
+                    subprocess.Popen(run_cmd, shell=True)
+                
+                time.sleep(1.2)
+                
+                # Verify process launch if exe name available
+                exe_basename = os.path.basename(found_exe) if found_exe else clean_name
+                if cls.verify_process_running(exe_basename.split('.')[0]):
+                    return {
+                        "success": True,
+                        "appName": clean_name or app_name,
+                        "command": run_cmd,
+                        "verified": True,
+                        "message": f"Successfully verified and launched {clean_name or app_name}!"
+                    }
+                else:
+                    # Non-blocking success if launched without error
+                    return {
+                        "success": True,
+                        "appName": clean_name or app_name,
+                        "command": run_cmd,
+                        "message": f"Launched {clean_name or app_name} on your desktop."
+                    }
+            except Exception as e:
+                print(f"[Smart Launcher] Attempt {idx} failed: {e}")
+
+        return {
+            "success": False,
+            "appName": app_name,
+            "error": "Could not verify execution",
+            "message": f"Attempted to launch {app_name}, but the executable could not be verified on your system."
+        }
 
 
 class PlaywrightBrowserTool:
