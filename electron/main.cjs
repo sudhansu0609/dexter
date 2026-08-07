@@ -1,12 +1,13 @@
 const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
+const fs = require('fs');
 
 let mainWindow = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 450,
-    height: 660,
+    width: 460,
+    height: 680,
     minWidth: 380,
     minHeight: 500,
     title: 'Dexter AI Super Assistant',
@@ -16,18 +17,18 @@ function createWindow() {
     resizable: true,
     show: true,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
+      preload: path.join(__dirname, 'preload.cjs'),
       nodeIntegration: false,
       contextIsolation: true
     }
   });
 
-  const fs = require('fs');
   const distPath = path.join(__dirname, '../dist/index.html');
   const devUrl = 'http://localhost:3006';
 
   if (fs.existsSync(distPath)) {
-    mainWindow.loadFile(distPath).catch(() => {
+    mainWindow.loadFile(distPath).catch((err) => {
+      console.log('Error loading dist file, loading devUrl:', err);
       mainWindow.loadURL(devUrl);
     });
   } else {
@@ -63,7 +64,7 @@ ipcMain.on('window-toggle-maximize', () => {
   if (!mainWindow) return;
   if (mainWindow.isMaximized()) {
     mainWindow.unmaximize();
-    mainWindow.setSize(440, 640);
+    mainWindow.setSize(460, 680);
   } else {
     mainWindow.maximize();
   }
@@ -74,7 +75,7 @@ ipcMain.on('window-set-compact', () => {
   if (mainWindow.isMaximized()) {
     mainWindow.unmaximize();
   }
-  mainWindow.setSize(440, 640);
+  mainWindow.setSize(460, 680);
 });
 
 ipcMain.on('window-set-expanded', () => {
