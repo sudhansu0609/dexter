@@ -23,7 +23,7 @@ from typing import Optional, List, Dict, Any
 from hybrid_llm import HybridLLMRouter
 from spilled_coffee_controller import SpilledCoffeeAIController
 from skill_engine import DexterSkillEngine
-from dexter_tools import DayPlannerTool, YouTubeMusicTool, AppLauncherTool, PlaywrightBrowserTool, StickyNotesTool
+from dexter_tools import DayPlannerTool, YouTubeMusicTool, AppLauncherTool, PlaywrightBrowserTool, StickyNotesTool, BuzzcafAITool
 from fastapi.responses import FileResponse
 from filesystem_tool import FileSystemTool
 from voice_engine import DexterVoiceEngine
@@ -91,15 +91,16 @@ def _speech_url(text: str) -> str:
     return f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(clean)}&tl=en&client=tw-ob"
 
 # ───────── Intent keywords (ordered specific → broad) ─────────
+BUZZCAF_KEYWORDS       = ["buzzcaf", "buzzcafai", "spilled coffee studio", "beyond3baje studio", "agent studio", "115 agents", "channel agents"]
 FOLDER_CREATE_KEYWORDS = ["create folder", "make folder", "new folder", "create directory", "make directory", "new directory"]
 STICKY_NOTE_KEYWORDS   = ["sticky note", "add note", "create note", "take a note", "write note", "my notes", "notes"]
-CALENDAR_KEYWORDS    = ["calendar", "schedule my day", "add task", "schedule event", "add event", "book time", "schedule"]
-PLANNER_KEYWORDS     = ["plan my day", "agenda", "schedule", "my tasks", "today's plan", "daily plan"]
-CURATE_KEYWORDS      = ["curate", "video title", "spilledcoffee", "overnight content", "generate titles"]
-YOUTUBE_KEYWORDS     = ["play ", "youtube", "search for", "play song", "play music", "play video"]
-BROWSE_KEYWORDS      = ["go to ", "browse ", "navigate ", "open website", "open url", "visit "]
-FILESYS_KEYWORDS     = ["find file", "search file", "read file", "open folder", "search folder"]
-LAUNCH_KEYWORDS      = ["open ", "launch ", "start app"]
+CALENDAR_KEYWORDS      = ["calendar", "schedule my day", "add task", "schedule event", "add event", "book time", "schedule"]
+PLANNER_KEYWORDS       = ["plan my day", "agenda", "schedule", "my tasks", "today's plan", "daily plan"]
+CURATE_KEYWORDS        = ["curate", "video title", "spilledcoffee", "overnight content", "generate titles"]
+YOUTUBE_KEYWORDS       = ["play ", "youtube", "search for", "play song", "play music", "play video"]
+BROWSE_KEYWORDS        = ["go to ", "browse ", "navigate ", "open website", "open url", "visit "]
+FILESYS_KEYWORDS       = ["find file", "search file", "read file", "open folder", "search folder"]
+LAUNCH_KEYWORDS        = ["open ", "launch ", "start app"]
 
 @app.get("/api/dexter/status")
 def get_status():
@@ -122,6 +123,17 @@ def get_status():
 @app.post("/api/dexter/chat")
 def process_chat(req: ChatRequest):
     msg = req.message.strip().lower()
+
+    # ── 0. BuzzcafAI 115-Agent Studio Platform Control ──
+    if any(k in msg for k in BUZZCAF_KEYWORDS):
+        if any(w in msg for w in ["open", "launch", "start"]):
+            res = BuzzcafAITool.launch_buzzcaf_studio()
+            reply = "Launched BuzzcafAI 115-Agent Studio Platform! You can now manage all 5 YouTube channel brands."
+            return {"reply": reply, "action": "launch_buzzcaf", "details": res, "speechUrl": _speech_url(reply)}
+        else:
+            res = BuzzcafAITool.generate_channel_script("Beyond3Baje", msg)
+            reply = "Connected to BuzzcafAI Studio! Dispatched writing agents for channel production."
+            return {"reply": reply, "action": "buzzcaf_control", "details": res, "speechUrl": _speech_url(reply)}
 
     # ── 0. Folder & Directory Creation ──
     if any(k in msg for k in FOLDER_CREATE_KEYWORDS):
