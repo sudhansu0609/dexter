@@ -10,6 +10,26 @@ AUDIO_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 KOKORO_MODEL_PATH = r"B:\youtubeProjects\Buzzcaf Media\MidnightBuzz\backend\kokoro-v1.0.onnx"
 KOKORO_VOICES_PATH = r"B:\youtubeProjects\Buzzcaf Media\MidnightBuzz\backend\voices-v1.0.bin"
 
+import re
+
+def clean_text_for_speech(text: str) -> str:
+    if not text:
+        return "Hello!"
+    # 1. Remove stage directions / actions in asterisks e.g. *waves hand*, *smiles*, **bold**
+    text = re.sub(r'\*[^*]+\*', '', text)
+    # 2. Remove actions in brackets/parentheses e.g. [laughs], (chuckles)
+    text = re.sub(r'\[[^\]]+\]', '', text)
+    text = re.sub(r'\([^\)]+\)', '', text)
+    # 3. Remove URLs
+    text = re.sub(r'https?://\S+', '', text)
+    # 4. Remove leftover markdown symbols (*, _, #, `, ~, >)
+    text = re.sub(r'[*_#`~>]', '', text)
+    # 5. Filter out emojis & non-standard symbols while preserving normal punctuation
+    text = ''.join(c for c in text if ord(c) < 128 or c.isalnum() or c in ' .,!?\'\"-')
+    # 6. Normalize whitespace
+    clean = re.sub(r'\s+', ' ', text).strip()
+    return clean[:400] if clean else "I understand."
+
 class DexterVoiceEngine:
     VOICE_PROFILES = {
         "christopher": "en-US-ChristopherNeural",
@@ -46,9 +66,7 @@ class DexterVoiceEngine:
             return None
         try:
             import soundfile as sf
-            clean_text = text[:450].strip()
-            if not clean_text:
-                clean_text = "Hello! I am Dexter."
+            clean_text = clean_text_for_speech(text)
             
             samples, sample_rate = self.kokoro_instance.create(clean_text, voice=voice_name, speed=1.0, lang="en-us")
             filename = f"speech_kokoro_{int(time.time() * 1000)}.wav"
@@ -71,9 +89,7 @@ class DexterVoiceEngine:
         filename = f"speech_{int(time.time() * 1000)}.mp3"
         file_path = os.path.join(AUDIO_DIR, filename)
         
-        clean_text = text[:400].strip()
-        if not clean_text:
-            clean_text = "Hello! I am Dexter."
+        clean_text = clean_text_for_speech(text)
 
         communicate = edge_tts.Communicate(clean_text, voice, rate=rate, pitch=pitch)
         await communicate.save(file_path)

@@ -72,10 +72,17 @@ export default function App() {
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const isSpeakingRef = useRef(false);
   const isVoiceMutedRef = useRef(false);
+  const isThinkingRef = useRef(false);
+  const lastSpeechEndTimeRef = useRef<number>(0);
+  const lastSpokenTextRef = useRef<string>('');
 
   useEffect(() => {
     isSpeakingRef.current = isSpeaking;
   }, [isSpeaking]);
+
+  useEffect(() => {
+    isThinkingRef.current = isThinking;
+  }, [isThinking]);
 
   useEffect(() => {
     isVoiceMutedRef.current = isVoiceMuted;
@@ -184,27 +191,41 @@ export default function App() {
       rec.lang = 'en-US';
 
       rec.onresult = (e: any) => {
-        if (isVoiceMutedRef.current || isSpeakingRef.current) return;
+        // LAYER 1: Mute, speaking, or thinking checks
+        if (isVoiceMutedRef.current || isSpeakingRef.current || isThinkingRef.current) return;
+
+        // LAYER 2: 2.0 Second Post-Speech Cooldown check
+        if (Date.now() - lastSpeechEndTimeRef.current < 2000) return;
+
         const lastResult = e.results[e.results.length - 1];
         if (lastResult && lastResult.isFinal) {
           const transcript = lastResult[0].transcript.trim();
-          if (transcript.length > 2) {
-            handleSendMessage(transcript);
+          
+          if (transcript.length < 3) return;
+
+          // LAYER 3: Self-Echo / Deduplication Filter
+          const cleanTranscript = transcript.toLowerCase();
+          const cleanLastSpoken = lastSpokenTextRef.current.toLowerCase();
+          if (cleanLastSpoken && cleanLastSpoken.includes(cleanTranscript)) {
+            console.log('[Mic Filter] Ignored self-echo transcript:', transcript);
+            return;
           }
+
+          handleSendMessage(transcript);
         }
       };
 
       rec.onerror = (err: any) => {
-        // Silently restart on timeout
+        // Silently handle error
       };
 
       rec.onend = () => {
         setIsListening(false);
-        // Auto-restart continuous listening if not muted and not speaking
-        if (!isVoiceMutedRef.current && !isSpeakingRef.current) {
+        // Only restart if idle, not muted, not speaking, not thinking, and past cooldown
+        if (!isVoiceMutedRef.current && !isSpeakingRef.current && !isThinkingRef.current && Date.now() - lastSpeechEndTimeRef.current >= 2000) {
           setTimeout(() => {
             startListening();
-          }, 300);
+          }, 500);
         }
       };
 
@@ -329,6 +350,9 @@ export default function App() {
       return;
     }
 
+    // Save spoken text ref for deduplication filtering
+    lastSpokenTextRef.current = text;
+
     // 1. Immediately abort mic recognition & set speaking flags
     stopListening();
     if (recognitionRef.current) {
@@ -361,15 +385,19 @@ export default function App() {
       audio.onended = () => {
         setIsSpeaking(false);
         isSpeakingRef.current = false;
-        // Resume listening after 600ms buffer so mic doesn't catch echo tail
+        lastSpeechEndTimeRef.current = Date.now();
+        // Resume listening after 1.5s cooldown so mic doesn't catch lingering room echo
         setTimeout(() => {
-          if (!isVoiceMutedRef.current) startListening();
-        }, 600);
+          if (!isVoiceMutedRef.current && !isSpeakingRef.current && !isThinkingRef.current) {
+            startListening();
+          }
+        }, 1500);
       };
 
       audio.onerror = () => {
         setIsSpeaking(false);
         isSpeakingRef.current = false;
+        lastSpeechEndTimeRef.current = Date.now();
         if (!isVoiceMutedRef.current) startListening();
       };
 
@@ -383,17 +411,20 @@ export default function App() {
         utterance.onend = () => {
           setIsSpeaking(false);
           isSpeakingRef.current = false;
-          setTimeout(() => { if (!isVoiceMutedRef.current) startListening(); }, 600);
+          lastSpeechEndTimeRef.current = Date.now();
+          setTimeout(() => { if (!isVoiceMutedRef.current) startListening(); }, 1500);
         };
         utterance.onerror = () => {
           setIsSpeaking(false);
           isSpeakingRef.current = false;
+          lastSpeechEndTimeRef.current = Date.now();
           if (!isVoiceMutedRef.current) startListening();
         };
         window.speechSynthesis.speak(utterance);
       } else {
         setIsSpeaking(false);
         isSpeakingRef.current = false;
+        lastSpeechEndTimeRef.current = Date.now();
         startListening();
       }
     }
