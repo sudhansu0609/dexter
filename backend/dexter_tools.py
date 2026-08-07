@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 PLANNER_FILE = os.path.join(DATA_DIR, "day_planner.json")
 PLAYLIST_FILE = os.path.join(DATA_DIR, "playlists.json")
+NOTES_FILE = os.path.join(DATA_DIR, "sticky_notes.json")
 
 class DayPlannerTool:
     def __init__(self):
