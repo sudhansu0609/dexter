@@ -92,7 +92,7 @@ def _speech_url(text: str) -> str:
 # ───────── Intent keywords (ordered specific → broad) ─────────
 PLANNER_KEYWORDS = ["plan my day", "agenda", "schedule", "my tasks", "today's plan", "daily plan"]
 CURATE_KEYWORDS  = ["curate", "video title", "spilledcoffee", "overnight content", "generate titles"]
-YOUTUBE_KEYWORDS = ["play ", "youtube ", "play song", "play music", "play video"]
+YOUTUBE_KEYWORDS = ["play ", "youtube", "search for", "play song", "play music", "play video"]
 BROWSE_KEYWORDS  = ["go to ", "browse ", "navigate ", "open website", "open url", "visit "]
 FILESYS_KEYWORDS = ["find file", "search file", "read file", "open folder", "search folder"]
 LAUNCH_KEYWORDS  = ["open ", "launch ", "start app"]
@@ -132,13 +132,22 @@ def process_chat(req: ChatRequest):
 
     # ── 3. YouTube & Music Playback ──
     if any(k in msg for k in YOUTUBE_KEYWORDS):
+        import re
         song_query = msg
-        for strip_word in ["play ", "on youtube", "song ", "music ", "video "]:
-            song_query = song_query.replace(strip_word, "")
-        song_query = song_query.strip()
-        yt_res = youtube_tool.search_and_play(song_query)
-        reply = f"Searching and playing '{song_query}' on YouTube now!"
-        return {"reply": reply, "action": "play_youtube", "details": yt_res, "speechUrl": _speech_url(reply)}
+        # Clean leading action words
+        song_query = re.sub(r'^(i asked it to |please |can you |could you |search for |search |play |find |show me |look up |open |watch )+(the )?(channel )?(video )?(song )?', '', song_query, flags=re.IGNORECASE).strip()
+        # Clean trailing YouTube / platform phrases
+        song_query = re.sub(r'\s+(on youtube|youtube channel|youtube video|youtube|channel|video|song|music|please).*$', '', song_query, flags=re.IGNORECASE).strip()
+        
+        # Phonetic auto-correction for Hinglish / STT mishearings (e.g. 'beyond teen bajaj' / 'beyond 3 baje' -> 'beyond3baje')
+        clean_check = song_query.lower()
+        if "beyond" in clean_check and ("teen" in clean_check or "3" in clean_check or "bajaj" in clean_check or "baje" in clean_check):
+            song_query = "beyond3baje"
+
+        if song_query:
+            yt_res = youtube_tool.search_and_play(song_query)
+            reply = f"Searching and playing '{song_query}' on YouTube now!"
+            return {"reply": reply, "action": "play_youtube", "details": yt_res, "speechUrl": _speech_url(reply)}
 
     # ── 4. Web Browsing via Playwright ──
     if any(k in msg for k in BROWSE_KEYWORDS):
