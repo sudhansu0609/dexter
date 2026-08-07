@@ -27,18 +27,12 @@ if not exist "%PYTHON_EXE%" (
     set "PYTHON_EXE=python"
 )
 
-echo Starting Dexter Native Desktop App Window...
-start "Dexter Desktop Window" cmd /k "cd /d "%DEXTER_DIR%" && ".\node_modules\electron\dist\electron.exe" ."
-
-echo Starting Dexter FastAPI Backend Engine on port %BACKEND_PORT%...
-start "Dexter Backend Engine" cmd /k "cd /d "%DEXTER_DIR%" && set PYTHONIOENCODING=utf-8 && "%PYTHON_EXE%" -X utf8 -m uvicorn backend.main:app --host 0.0.0.0 --port %BACKEND_PORT% --reload"
+echo Launching Dexter Native Windows Desktop Application...
+"%PYTHON_EXE%" backend\desktop_app.py
 
 echo.
 echo ===================================================
-echo Dexter Desktop Super Assistant Started Successfully!
-echo.
-echo Native Desktop App    : Electron Window Active
-echo FastAPI Backend Engine: http://localhost:%BACKEND_PORT%
+echo Dexter Desktop Super Assistant Closed.
 echo ===================================================
 echo.
 pause

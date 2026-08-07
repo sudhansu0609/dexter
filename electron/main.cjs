@@ -2,6 +2,11 @@ const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
+// Disable GPU hardware acceleration to prevent invisible/black window issues on Windows
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('no-sandbox');
+
 let mainWindow = null;
 
 function createWindow() {
