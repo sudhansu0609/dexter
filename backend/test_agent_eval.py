@@ -68,9 +68,12 @@ CHAT_CASES = [
 
 
 class _ToolCaptured(Exception):
-    def __init__(self, name, args):
+    # NB: not stored as `.args` - BaseException.args coerces a dict to a tuple
+    # of its keys, which silently destroys the captured arguments.
+    def __init__(self, name, tool_args):
+        super().__init__(name)
         self.name = name
-        self.args = args
+        self.tool_args = tool_args
 
 
 def _capture_run_tool(tool_name, args, confirmed=False, on_event=None, session="default"):
@@ -119,7 +122,7 @@ def run_eval(verbose: bool = True):
             except _ToolCaptured as call:
                 spec = get_tool(call.name)
                 if spec:
-                    args_valid, cleaned, _err = validate_args(spec, call.args)
+                    args_valid, cleaned, _err = validate_args(spec, call.tool_args)
                 else:
                     args_valid, cleaned = False, {}
                 rows.append({
