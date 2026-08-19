@@ -31,6 +31,7 @@ AUDIO_DIR = os.path.join(DATA_DIR, "audio")
 
 AUDIO_MAX_AGE_SECONDS = 2 * 3600
 PLANNER_LEAD_MINUTES = 5
+REMINDER_RETENTION_DAYS = 7
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -204,6 +205,7 @@ class DexterScheduler:
                     if datetime.fromisoformat(reminder["at"]) <= now:
                         # Missed while Dexter was down - surface it once, now.
                         reminder["fired"] = True
+                        reminder["firedAt"] = now.isoformat(timespec="seconds")
                         changed = True
                         self._deliver(reminder, missed=True)
                         continue
@@ -335,9 +337,38 @@ class DexterScheduler:
             id="maint-brief", replace_existing=True,
         )
         self._scheduler.add_job(
-            self.rearm_planner, CronTrigger(hour=0, minute=5),
+            self._prune_reminders, CronTrigger(hour=3, minute=40),
+            id="maint-reminders", replace_existing=True,
+        )
+        self._scheduler.add_job(
+            self._roll_and_rearm_planner, CronTrigger(hour=0, minute=5),
             id="maint-rearm", replace_existing=True,
         )
+
+    def _prune_reminders(self) -> int:
+        """Fired one-shot reminders accumulated forever in reminders.json."""
+        reminders = self._load()
+        cutoff = datetime.now() - timedelta(days=REMINDER_RETENTION_DAYS)
+        kept = []
+        for reminder in reminders:
+            if reminder.get("fired") and not reminder.get("cron"):
+                stamp = reminder.get("firedAt") or reminder.get("at") or reminder.get("createdAt")
+                try:
+                    if stamp and datetime.fromisoformat(stamp) < cutoff:
+                        continue
+                except Exception:
+                    pass
+            kept.append(reminder)
+        removed = len(reminders) - len(kept)
+        if removed:
+            self._save(kept)
+            print(f"[Scheduler] Pruned {removed} fired reminder(s).")
+        return removed
+
+    def _roll_and_rearm_planner(self) -> None:
+        # get_agenda() rolls the planner onto today's date as a side effect,
+        # so calling it just after midnight both rolls and re-arms.
+        self.rearm_planner()
 
     def _cleanup_audio(self) -> int:
         """Generated TTS files accumulated forever; nothing ever removed them."""

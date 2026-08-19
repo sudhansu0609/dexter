@@ -16,6 +16,7 @@ accurate than sending everything to the model.
 import math
 import re
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -221,7 +222,9 @@ def fast_path(message: str) -> Optional[Tuple[str, Dict[str, Any]]]:
             continue
         args = build_args(match)
         if args is None:
-            return None
+            # This rule matched but could not build usable args - a later rule
+            # or tier may still handle the phrase, so keep going.
+            continue
 
         # "open github.com" is a website, not an application.
         if tool_name == "launch_app":
@@ -606,21 +609,34 @@ def _extract_slots(tool_name: str, message: str) -> Optional[Dict[str, Any]]:
 
 # ───────────────────────── confirmation for risky tools ─────────────────────────
 
-_pending: Dict[str, Any] = {}
+# Keyed by session so one user's stale "yes" can never fire another session's
+# forgotten destructive call; entries expire so an answer given minutes later
+# does not trigger an action the user no longer remembers being asked about.
+_PENDING_TTL_SECONDS = 120
+_pending: Dict[str, Dict[str, Any]] = {}
 _AFFIRMATIVE = re.compile(r"^\s*(yes|yeah|yep|yup|sure|ok|okay|do it|go ahead|confirm|please do)\b", re.I)
 _NEGATIVE = re.compile(r"^\s*(no|nope|cancel|stop|don'?t|nevermind|never mind)\b", re.I)
 
 
-def _remember_pending(tool_name: str, args: Dict[str, Any]) -> None:
-    _pending["tool"] = tool_name
-    _pending["args"] = args
+def _remember_pending(tool_name: str, args: Dict[str, Any], session: str = "default") -> None:
+    _pending[session] = {"tool": tool_name, "args": args, "ts": time.time()}
 
 
-def _take_pending() -> Optional[Tuple[str, Dict[str, Any]]]:
-    if "tool" not in _pending:
+def _has_pending(session: str = "default") -> bool:
+    entry = _pending.get(session)
+    if not entry:
+        return False
+    if time.time() - entry["ts"] > _PENDING_TTL_SECONDS:
+        _pending.pop(session, None)
+        return False
+    return True
+
+
+def _take_pending(session: str = "default") -> Optional[Tuple[str, Dict[str, Any]]]:
+    entry = _pending.pop(session, None)
+    if not entry or time.time() - entry["ts"] > _PENDING_TTL_SECONDS:
         return None
-    pair = (_pending.pop("tool"), _pending.pop("args", {}))
-    return pair
+    return entry["tool"], entry.get("args", {})
 
 
 def _describe_call(tool_name: str, args: Dict[str, Any]) -> str:
@@ -635,11 +651,12 @@ def _run_tool(
     args: Dict[str, Any],
     confirmed: bool = False,
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    session: str = "default",
 ) -> Tuple[ToolResult, bool]:
     """Execute, unless the tool is marked confirm and the user has not agreed yet."""
     spec = get_tool(tool_name)
     if spec and spec.confirm and not confirmed:
-        _remember_pending(tool_name, args)
+        _remember_pending(tool_name, args, session=session)
         return (
             ToolResult(
                 ok=True,
@@ -715,6 +732,7 @@ def agent_loop(
     model: Optional[str] = None,
     context_note: str = "",
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    session: str = "default",
 ) -> RouteResult:
     """
     ReAct-style loop, deliberately constrained for small local models:
@@ -790,7 +808,7 @@ def agent_loop(
             )
 
         tool_name, tool_args = call
-        result, awaiting = _run_tool(tool_name, tool_args, on_event=on_event)
+        result, awaiting = _run_tool(tool_name, tool_args, on_event=on_event, session=session)
         last_result = result
 
         if awaiting:
@@ -849,6 +867,7 @@ def route(
     model: Optional[str] = None,
     context_note: str = "",
     on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    session: str = "default",
 ) -> RouteResult:
     """Route a user message through the three tiers and return a reply."""
     text = (message or "").strip()
@@ -856,9 +875,9 @@ def route(
         return RouteResult(reply="I didn't catch that.", action="empty", tier=0)
 
     # Resolve an outstanding confirmation before anything else.
-    if "tool" in _pending:
+    if _has_pending(session):
         if _AFFIRMATIVE.match(text):
-            pair = _take_pending()
+            pair = _take_pending(session)
             if pair:
                 result = execute(pair[0], pair[1])
                 return RouteResult(
@@ -868,7 +887,7 @@ def route(
                     data=result.data,
                 )
         elif _NEGATIVE.match(text):
-            _take_pending()
+            _take_pending(session)
             return RouteResult(reply="Cancelled.", action="cancelled", tier=0)
 
     # ── Tier 0 ──
@@ -879,7 +898,7 @@ def route(
     hit = fast_path(text)
     if hit:
         tool_name, args = hit
-        result, awaiting = _run_tool(tool_name, args, on_event=on_event)
+        result, awaiting = _run_tool(tool_name, args, on_event=on_event, session=session)
         return RouteResult(
             reply=result.summary,
             action="confirm" if awaiting else "fast_path",
@@ -897,7 +916,7 @@ def route(
         tool_name, score = match
         args = _extract_slots(tool_name, text)
         if args is not None:
-            result, awaiting = _run_tool(tool_name, args, on_event=on_event)
+            result, awaiting = _run_tool(tool_name, args, on_event=on_event, session=session)
             return RouteResult(
                 reply=result.summary,
                 action="confirm" if awaiting else "semantic",
@@ -911,4 +930,4 @@ def route(
 
     # ── Tier 2 ──
     return agent_loop(text, history=history, provider=provider, model=model,
-                      context_note=context_note, on_event=on_event)
+                      context_note=context_note, on_event=on_event, session=session)

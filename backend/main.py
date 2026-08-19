@@ -270,6 +270,7 @@ def _run_route(req: ChatRequest, on_event=None) -> Dict[str, Any]:
         model=req.model,
         context_note=context,
         on_event=on_event,
+        session=session,
     )
 
     memory.add_turn("user", req.message, session=session)

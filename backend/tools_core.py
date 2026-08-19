@@ -374,14 +374,18 @@ def play_on_youtube(query: str) -> ToolResult:
     category="content",
 )
 def curate_video_ideas(niche: Optional[str] = None, count: Optional[int] = None) -> ToolResult:
-    items = spilled_coffee.run_overnight_curation(
+    # run_overnight_curation returns {"success", "count", "generatedAt", "items"}
+    result = spilled_coffee.run_overnight_curation(
         niche_topic=niche or "AI Tech & Viral Trends",
         count=count or 3,
     )
-    titles = "; ".join(i.get("title", "") for i in (items or [])[:3])
+    items = result.get("items", []) if isinstance(result, dict) else list(result or [])
+    if not items:
+        return ToolResult.fail("Curation ran but produced no video concepts.")
+    titles = "; ".join(i.get("title", "") for i in items[:3])
     return ToolResult(
         ok=True,
-        summary=f"Generated {len(items or [])} video concept(s): {titles}",
+        summary=f"Generated {len(items)} video concept(s): {titles}",
         data={"items": items},
     )
 

@@ -191,14 +191,24 @@ def create_calendar_event(
         return ToolResult.fail(f"I couldn't work out when '{when}' is.")
     end = start + timedelta(minutes=duration_minutes or 60)
 
+    tz_name = _local_timezone()
+    if tz_name:
+        start_body = {"dateTime": start.isoformat(), "timeZone": tz_name}
+        end_body = {"dateTime": end.isoformat(), "timeZone": tz_name}
+    else:
+        # No IANA name available (tzlocal missing) - send explicit UTC offsets
+        # instead of a zone name so the times still land correctly.
+        start_body = {"dateTime": start.astimezone().isoformat()}
+        end_body = {"dateTime": end.astimezone().isoformat()}
+
     try:
         event = service.events().insert(
             calendarId="primary",
             body={
                 "summary": title,
                 "description": description or "Created by Dexter",
-                "start": {"dateTime": start.isoformat(), "timeZone": _local_timezone()},
-                "end": {"dateTime": end.isoformat(), "timeZone": _local_timezone()},
+                "start": start_body,
+                "end": end_body,
             },
         ).execute()
         return ToolResult(
@@ -259,11 +269,17 @@ def list_calendar_events(days: Optional[int] = None) -> ToolResult:
         return ToolResult.fail(f"Could not read your calendar: {exc}")
 
 
-def _local_timezone() -> str:
+def _local_timezone() -> Optional[str]:
+    """
+    The Calendar API expects an IANA zone like 'Asia/Kolkata'. tzname() returns
+    abbreviations like 'IST', which the API rejects or - worse - maps to a
+    different zone, silently shifting event times.
+    """
     try:
-        return datetime.now().astimezone().tzname() or "UTC"
+        from tzlocal import get_localzone_name
+        return get_localzone_name() or None
     except Exception:
-        return "UTC"
+        return None
 
 
 # ───────────────────────── gmail ─────────────────────────

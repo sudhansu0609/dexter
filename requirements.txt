@@ -40,6 +40,7 @@ winsdk; sys_platform == "win32"
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
+tzlocal  # IANA timezone name for Calendar events ("Asia/Kolkata", not "IST")
 
 # ── Tests ──
 pytest

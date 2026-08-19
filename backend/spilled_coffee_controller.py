@@ -3,6 +3,7 @@ import json
 import time
 from typing import List, Dict, Any
 from hybrid_llm import HybridLLMRouter
+from jsonstore import load_json, save_json
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 OVERNIGHT_FILE = os.path.join(DATA_DIR, "overnight_content.json")
@@ -15,15 +16,11 @@ class SpilledCoffeeAIController:
             self._save_queue([])
 
     def _load_queue(self) -> List[Dict[str, Any]]:
-        try:
-            with open(OVERNIGHT_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
+        items = load_json(OVERNIGHT_FILE, [])
+        return items if isinstance(items, list) else []
 
     def _save_queue(self, items: List[Dict[str, Any]]):
-        with open(OVERNIGHT_FILE, "w", encoding="utf-8") as f:
-            json.dump(items, f, indent=2, ensure_ascii=False)
+        save_json(OVERNIGHT_FILE, items)
 
     def get_overnight_content(self) -> List[Dict[str, Any]]:
         return self._load_queue()
@@ -94,7 +91,9 @@ class SpilledCoffeeAIController:
 
         current_queue = self._load_queue()
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        
+
+        # Re-runs kept appending identical concepts; skip titles already queued.
+        seen_titles = {(rec.get("title") or "").strip().lower() for rec in current_queue}
         new_records = []
         for idx, item in enumerate(parsed_items):
             record = {
@@ -108,9 +107,13 @@ class SpilledCoffeeAIController:
                 "ctrScore": item.get("ctrScore", "9.0%"),
                 "status": "Ready For Review"
             }
+            title_key = record["title"].strip().lower()
+            if title_key in seen_titles:
+                continue
+            seen_titles.add(title_key)
             new_records.append(record)
             current_queue.insert(0, record)
-            
+
         self._save_queue(current_queue[:50])  # cap at 50 items to prevent unbounded growth
         return {
             "success": True,

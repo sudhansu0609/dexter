@@ -72,10 +72,18 @@ class DayPlannerTool:
         planner = self._load_planner()
         today = time.strftime("%Y-%m-%d")
         if planner.get("date") != today:
-            # Carry over incomplete tasks, mark date as today
-            incomplete = [t for t in planner.get("tasks", []) if not t.get("completed", False)]
+            # Carry over incomplete tasks, dropping their stale 'at' datetimes so
+            # _migrate re-derives them against today - otherwise the scheduler
+            # sees times days in the past and never fires them again.
+            incomplete = []
+            for t in planner.get("tasks", []):
+                if t.get("completed", False):
+                    continue
+                t.pop("at", None)
+                incomplete.append(t)
             planner = {"date": today, "tasks": incomplete}
             self._save_planner(planner)
+            planner = self._migrate(planner)
         return planner
 
     def add_task(self, title: str, task_time: str = "12:00 PM") -> Dict[str, Any]:
