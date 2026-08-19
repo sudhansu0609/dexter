@@ -159,28 +159,30 @@ a confirmation issued in session A cannot be consumed in session B.
 **Goal:** local models feel instant and never dead-end. Highest-leverage phase
 for the Jarvis feel.
 
-- [ ] **2.1 True token streaming** (M): wire up the dead
-      `HybridLLMRouter.stream()` in `hybrid_llm.py`; new SSE event types in
-      `events.py` (`token`, `tool_call`, `tool_result`, `tts_chunk`,
-      `provider_switched`, `done`); rework the chat endpoint to interleave —
-      tokens to the UI immediately, completed sentences into the existing
-      prosody chunker so speech starts before generation finishes. Frontend
-      renders incremental tokens. Streams must be **cancellable** (Phase 4
-      barge-in depends on this).
-- [ ] **2.2 Mid-request fallback** (M): on stall/connection-reset from LM
-      Studio/Ollama mid-generation, retry against the next provider in the
-      chain; emit `provider_switched`. Gemini path: give it tool-calling parity
-      or explicitly mark it chat-only in provider selection.
-- [ ] **2.3 Neural Tier 1** (S): `pip install sentence-transformers`
-      (**Decision D1: approved**) — `router.py` auto-upgrades from lexical to
-      `all-MiniLM-L6-v2`. Shared with Phase 3 memory embeddings.
-- [ ] **2.4 Function-calling eval harness** (M): `backend/test_agent_eval.py`
-      modeled on `test_router.py`'s parametrized style — N prompts → expected
-      tool + args, run against the live local model, score exact-tool /
-      valid-args / iterations-used. Compare Qwen2.5-7B vs alternatives
-      objectively.
-- [ ] **2.5 Cleanup** (S): remove now-dead imports (`split_sentences` in
-      `main.py`, `inspect` in `tool_registry.py`).
+- [x] **2.1 True token streaming** (M): *(done 2026-08-19)* `chat(on_token=…)`
+      in `hybrid_llm.py` supersedes the dead `stream()` (removed); the agent
+      loop forwards deltas through a `_TokenGate` that suppresses text-protocol
+      JSON tool calls; the stream endpoint emits `token` events and feeds
+      completed sentences to a dedicated TTS thread so speech starts before
+      generation finishes; frontend renders the live token stream and finalizes
+      on `reply`. Reasoning models' `reasoning_content` deltas are correctly
+      not streamed as answer text. *Cancellation is cooperative at sentence
+      granularity today — full cancel lands with Phase 4 barge-in.*
+- [x] **2.2 Mid-request fallback** (M): *(done 2026-08-19)* `_provider_chain`
+      retries the whole request on the next healthy provider when one fails
+      (including mid-stream drops — partial text is discarded, the UI clears it
+      via `provider_switched`); an explicit provider choice is honoured without
+      fallback. Gemini is **chat-only**: skipped whenever tools are required.
+- [x] **2.3 Neural Tier 1** (S): *(done 2026-08-19)* sentence-transformers
+      installed; router runs `all-MiniLM-L6-v2` (257 phrases over 46 tools);
+      all routing tests pass in neural mode.
+- [x] **2.4 Function-calling eval harness** (M): *(done 2026-08-19)*
+      `backend/test_agent_eval.py` — 15 tool prompts + 2 chat-restraint
+      prompts, first tool call captured (nothing executes), scores exact-tool /
+      valid-args / restraint / latency. Skipped unless `DEXTER_RUN_EVALS=1`;
+      also runs standalone via `python backend/test_agent_eval.py`.
+- [x] **2.5 Cleanup** (S): *(done 2026-08-19)* dead `stream()` method and
+      unused `split_sentences` / `inspect` imports removed.
 
 **Acceptance:** first visible token <1s and first audio <1.5s for a local
 chitchat prompt · killing LM Studio mid-response still completes the answer via
