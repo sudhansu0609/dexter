@@ -65,6 +65,12 @@ class HybridLLMRouter:
         self.lm_studio_model = os.getenv("LM_STUDIO_MODEL", "")
         self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
 
+        # Preferred local backend for "auto" requests. Set to "ollama" to run
+        # Dexter on Ollama and keep LM Studio free for other work (it stays a
+        # fallback if Ollama is down); "lmstudio" forces the reverse. "auto"
+        # (default) keeps the original local-first order.
+        self.default_provider = (os.getenv("DEXTER_LLM_PROVIDER", "auto").strip().lower() or "auto")
+
         self.session = requests.Session()
         self._health_cache: Optional[Dict[str, Any]] = None
         self._health_checked_at = 0.0
@@ -108,6 +114,44 @@ class HybridLLMRouter:
         with self._lock:
             self._health_cache = None
 
+    def _list_models_at(self, base_url: str) -> List[str]:
+        """All model ids a local OpenAI-compatible server currently exposes."""
+        try:
+            res = self.session.get(f"{base_url}/models", timeout=_PROBE_TIMEOUT)
+            if res.status_code == 200:
+                data = res.json().get("data") or []
+                return [d.get("id", "") for d in data if d.get("id")]
+        except Exception:
+            pass
+        return []
+
+    def list_models(self) -> Dict[str, Any]:
+        """
+        Per-provider online state + available model ids, plus the current
+        selection - everything the UI needs to render a provider/model picker.
+        """
+        health = self.get_available_providers(force=True)
+        providers = {}
+        for key, prov, url in (
+            ("lmStudio", "lmstudio", self.lm_studio_url),
+            ("ollama", "ollama", self.ollama_url),
+        ):
+            online = bool(health[key]["online"])
+            providers[prov] = {
+                "online": online,
+                "url": url,
+                "models": self._list_models_at(url) if online else [],
+            }
+        return {
+            "providers": providers,
+            "preferred": self.default_provider,
+            # The model each provider defaults to when none is picked explicitly.
+            "defaultModel": {
+                "lmstudio": self.lm_studio_model or None,
+                "ollama": self.ollama_model or None,
+            },
+        }
+
     # ───────────────────────── model discovery ─────────────────────────
 
     def _discover_model(self, base_url: str) -> str:
@@ -141,18 +185,29 @@ class HybridLLMRouter:
             return "gpt-4o"
         return "local-model"
 
+    def _is_available(self, provider: str, providers: Dict[str, Any]) -> bool:
+        if provider == "lmstudio":
+            return bool(providers["lmStudio"]["online"])
+        if provider == "ollama":
+            return bool(providers["ollama"]["online"])
+        if provider == "gemini":
+            return bool(providers["gemini"]["configured"])
+        if provider == "openai":
+            return bool(providers["openai"]["configured"])
+        return False
+
     def resolve_provider(self, provider: str = "auto") -> str:
         if provider and provider != "auto":
             return provider
         providers = self.get_available_providers()
-        if providers["lmStudio"]["online"]:
-            return "lmstudio"
-        if providers["ollama"]["online"]:
-            return "ollama"
-        if providers["gemini"]["configured"]:
-            return "gemini"
-        if providers["openai"]["configured"]:
-            return "openai"
+        # Configured preference wins when it is actually up; otherwise fall back
+        # to the original local-first order.
+        order = ["lmstudio", "ollama", "gemini", "openai"]
+        if self.default_provider != "auto":
+            order = [self.default_provider] + [p for p in order if p != self.default_provider]
+        for prov in order:
+            if self._is_available(prov, providers):
+                return prov
         return "lmstudio"
 
     def _base_url_for(self, provider: str) -> str:
@@ -178,6 +233,11 @@ class HybridLLMRouter:
             chain.append("openai")
         if health["gemini"]["configured"] and not needs_tools:
             chain.append("gemini")
+        # Honour the configured default: move it to the front so it is tried
+        # first, while the others remain as graceful fallbacks. Frees the
+        # non-preferred local backend (e.g. LM Studio) for other work.
+        if self.default_provider != "auto" and self.default_provider in chain:
+            chain = [self.default_provider] + [p for p in chain if p != self.default_provider]
         return chain or ["lmstudio"]
 
     # ───────────────────────── chat ─────────────────────────

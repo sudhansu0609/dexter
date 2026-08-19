@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type MutableRefObject } from 'react';
 import { chatStream } from '../api';
+import { getLlmChoice } from './useLlmChoice';
 import type { ChatMessage, StreamEvent } from '../types';
 import type { VoiceApi } from './useVoice';
 
@@ -58,8 +59,10 @@ export function useChat({ voice, isThinkingRef, commandHandlerRef, onTurnComplet
     try {
       // Streaming endpoint: the reply lands as soon as it is ready and each
       // spoken chunk follows as it finishes synthesising, so audio starts in a
-      // few hundred ms instead of after the whole response is voiced.
-      const res = await chatStream(textToSend, speakEnabled);
+      // few hundred ms instead of after the whole response is voiced. The
+      // user's picked provider/model (or 'auto') rides along on every turn.
+      const choice = getLlmChoice();
+      const res = await chatStream(textToSend, speakEnabled, choice.provider, choice.model);
 
       if (!res.ok || !res.body) throw new Error(`Chat failed: ${res.status}`);
 

@@ -169,14 +169,38 @@ export async function generateTts(
 // Absolute URL for a streamed audio clip (the backend returns a relative path).
 export const audioUrl = (url: string) => (url.startsWith('http') ? url : `${API_BASE}${url}`);
 
+// ─────────────────────── LLM provider / models ─────────────────
+
+export interface LlmProviderInfo {
+  online: boolean;
+  url: string;
+  models: string[];
+}
+
+export interface LlmModelsResponse {
+  providers: Record<string, LlmProviderInfo>; // keyed 'lmstudio' | 'ollama'
+  preferred: string; // configured default: 'auto' | 'lmstudio' | 'ollama'
+  defaultModel: Record<string, string | null>;
+}
+
+// Which providers are up and what models each exposes - drives the UI picker.
+export const getModels = () => getJson<LlmModelsResponse>('/llm/models');
+
 // ─────────────────────── streaming chat ────────────────────────
 
 // Returns the raw streaming Response; the caller decodes the SSE body itself so
-// tokens/audio can be rendered as they arrive.
-export function chatStream(message: string, voiceEnabled: boolean): Promise<Response> {
+// tokens/audio can be rendered as they arrive. `provider`/`model` let the UI
+// route a turn to a specific backend; 'auto' + null falls back to the server's
+// configured preference (DEXTER_LLM_PROVIDER).
+export function chatStream(
+  message: string,
+  voiceEnabled: boolean,
+  provider: string = 'auto',
+  model: string | null = null,
+): Promise<Response> {
   return apiFetch(`${DEXTER}/chat/stream`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ message, provider: 'auto', voiceEnabled }),
+    body: JSON.stringify({ message, provider: provider || 'auto', model: model || null, voiceEnabled }),
   });
 }

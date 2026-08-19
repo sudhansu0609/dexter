@@ -308,6 +308,7 @@ async def get_status():
         "assistantName": "Dexter Super Assistant",
         "version": "2.0.0",
         "providers": providers,
+        "preferredProvider": llm_router.default_provider,
         "toolCount": len(all_tools()),
         "intentMode": intent_router._embedder.mode,
         "appsIndexed": app_index.size(),
@@ -332,6 +333,12 @@ async def get_status():
             "totalProjects": buzzcaf_status.get("total_projects", 0),
         },
     }
+
+
+@app.get("/api/dexter/llm/models")
+async def get_llm_models():
+    """Providers, their online state, and available models - for the UI picker."""
+    return await run_in_threadpool(llm_router.list_models)
 
 
 @app.get("/api/dexter/tools")

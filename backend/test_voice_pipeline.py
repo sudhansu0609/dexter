@@ -99,13 +99,18 @@ class Clock:
         return self.t
 
 
-def make_session(session="test", stt=None, clock=None):
+def make_session(session="test", stt=None, clock=None, barge_in=True, echo_guard_s=0.0):
+    # Tests default to barge_in=True and no echo guard so the wake/record/barge
+    # mechanics stay deterministic; the anti-echo defaults are covered explicitly
+    # in test_barge_in_disabled_* / test_echo_guard_* below.
     return VoiceSession(
         session=session,
         wake=FakeWake(),
         vad=FakeVad(),
         stt=stt or FakeStt(),
         time_fn=clock or Clock(),
+        barge_in=barge_in,
+        echo_guard_s=echo_guard_s,
     )
 
 
@@ -167,6 +172,43 @@ def test_barge_in_during_speech_interrupts_and_cancels():
     events = vs.feed(speech(BARGE_CHUNKS + 2))
     assert "interrupt" in types(events)
     assert cancellation.is_cancelled("barge")
+
+
+def test_barge_in_disabled_ignores_own_tts_echo():
+    """Default half-duplex: mic input while Dexter speaks is neither an interrupt
+    nor a captured command, so its own echoed output can't drive a reply loop."""
+    cancellation.clear("echo")
+    vs = make_session(session="echo", barge_in=False)
+    vs.set_speaking(True)
+
+    events = vs.feed(speech(BARGE_CHUNKS + 10))  # "Dexter's own voice" over TTS
+    events += vs.feed(silence(END_SILENCE_CHUNKS + 2))
+
+    assert "interrupt" not in types(events)
+    assert "transcript" not in types(events)
+    assert not cancellation.is_cancelled("echo")
+
+
+def test_echo_guard_blocks_followup_until_elapsed():
+    """The reverb tail right after Dexter stops speaking is ignored; a genuine
+    follow-up once the guard elapses is still captured."""
+    clock = Clock()
+    stt = FakeStt("answering my own echo")
+    vs = make_session(stt=stt, clock=clock, echo_guard_s=0.8)
+
+    vs.set_speaking(True)
+    vs.set_speaking(False)  # echo guard now runs until t = 0.8
+
+    early = vs.feed(speech(4))  # echo tail arrives immediately
+    early += vs.feed(silence(END_SILENCE_CHUNKS + 2))
+    assert "speech_start" not in types(early)
+    assert "transcript" not in types(early)
+
+    clock.t = 1.0  # past the guard, still inside the follow-up window
+    late = vs.feed(speech(4))
+    assert "speech_start" in types(late)
+    tail = vs.feed(silence(END_SILENCE_CHUNKS + 2))
+    assert any(e["type"] == "transcript" for e in tail)
 
 
 def test_wake_prefix_is_stripped_from_transcript():

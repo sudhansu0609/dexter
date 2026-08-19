@@ -13,6 +13,7 @@ import { useServerEvents } from './hooks/useServerEvents';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 
 import { Header } from './components/Header';
+import ProviderSelector from './components/ProviderSelector';
 import { ReminderBanners } from './components/ReminderBanners';
 import { TaskTray } from './components/TaskTray';
 import { VoiceVisualizer } from './components/VoiceVisualizer';
@@ -112,6 +113,9 @@ export default function App() {
         onToggleExpand={toggleExpandWindow}
         online={online}
       />
+
+      {/* Pick the LLM backend + model (or leave on Auto). */}
+      <ProviderSelector />
 
       {/* Main grid: compact by default, three columns when expanded. */}
       <div style={{ display: 'grid', gridTemplateColumns: isExpanded ? '340px 1fr 340px' : '1fr', gap: '16px' }}>

@@ -49,6 +49,24 @@ PRE_ROLL_SAMPLES = SAMPLE_RATE * 300 // 1000          # 300ms kept before captur
 
 FOLLOWUP_WINDOW = float(os.getenv("DEXTER_FOLLOWUP_WINDOW", "9"))
 
+# Voice barge-in (talking over Dexter to cut it off) needs the mic NOT to pick up
+# Dexter's own TTS. Played through speakers, that output leaks back into the mic,
+# reads as "speech over TTS", and Dexter interrupts itself and answers its own
+# echo in a loop. VAD cannot tell that echo from a real interruption without echo
+# cancellation, so barge-in is OFF by default: while Dexter speaks the mic is
+# ignored entirely (half-duplex). Enable it only with headphones or reliable AEC.
+BARGE_IN_ENABLED = os.getenv("DEXTER_VOICE_BARGE_IN", "0").strip().lower() not in (
+    "",
+    "0",
+    "false",
+    "no",
+    "off",
+)
+# Grace period after Dexter stops speaking during which the mic is still ignored,
+# so the trailing echo / room reverb of its last words cannot open a follow-up
+# capture and get answered as if it were a command.
+ECHO_GUARD_MS = float(os.getenv("DEXTER_ECHO_GUARD_MS", "800"))
+
 
 def capabilities() -> Dict[str, Any]:
     """Snapshot for /status so the UI knows whether the local pipeline is usable."""
@@ -68,16 +86,21 @@ class VoiceSession:
         vad: Optional[VadGate] = None,
         stt: Any = stt_engine,
         time_fn: Callable[[], float] = time.monotonic,
+        barge_in: Optional[bool] = None,
+        echo_guard_s: Optional[float] = None,
     ) -> None:
         self.session = session
         self._wake = wake if wake is not None else WakeWordDetector()
         self._vad = vad if vad is not None else VadGate()
         self._stt = stt
         self._now = time_fn
+        self._barge_in = BARGE_IN_ENABLED if barge_in is None else barge_in
+        self._echo_guard_s = (ECHO_GUARD_MS / 1000.0) if echo_guard_s is None else echo_guard_s
 
         self._state = "idle"  # "idle" | "recording"
         self._speaking = False
         self._armed_until = 0.0  # follow-up window: capture without a wake word until then
+        self._ignore_until = 0.0  # echo guard: ignore the mic until then (post-TTS reverb)
 
         self._wake_buf = np.zeros(0, dtype=np.int16)
         self._vad_buf = np.zeros(0, dtype=np.int16)
@@ -108,7 +131,11 @@ class VoiceSession:
             self._state = "idle"
             self._barge_run = 0
         elif was and not speaking:
-            self._armed_until = self._now() + FOLLOWUP_WINDOW
+            now = self._now()
+            # Swallow the trailing echo/reverb of Dexter's own words before the
+            # follow-up window starts listening, so it never answers itself.
+            self._ignore_until = now + self._echo_guard_s
+            self._armed_until = now + FOLLOWUP_WINDOW
 
     def reset(self) -> None:
         self._reset_capture()
@@ -178,6 +205,11 @@ class VoiceSession:
             speech = self._vad.is_speech(chunk)
 
             if self._speaking:
+                if not self._barge_in:
+                    # Half-duplex (default): ignore the mic entirely while Dexter
+                    # speaks so its own output, leaking in through the speakers,
+                    # is never heard as a command or a barge-in.
+                    continue
                 self._barge_run = self._barge_run + 1 if speech else 0
                 if self._barge_run >= BARGE_CHUNKS:
                     events.append({"type": "interrupt"})
@@ -190,8 +222,9 @@ class VoiceSession:
 
             if self._state == "idle":
                 # Inside the follow-up window a confirmed speech onset starts a
-                # command with no wake word required.
-                if self._in_followup():
+                # command with no wake word required - but not during the echo
+                # guard, when the mic is still hearing the tail of Dexter's reply.
+                if self._in_followup() and not self._in_echo_guard():
                     self._speech_run = self._speech_run + 1 if speech else 0
                     if self._speech_run >= SPEECH_START_CHUNKS:
                         self._begin_recording()
@@ -218,6 +251,9 @@ class VoiceSession:
 
     def _in_followup(self) -> bool:
         return self._now() < self._armed_until
+
+    def _in_echo_guard(self) -> bool:
+        return self._now() < self._ignore_until
 
     def _begin_recording(self) -> None:
         self._state = "recording"
