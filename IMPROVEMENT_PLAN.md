@@ -298,20 +298,20 @@ quiet hours.
 
 ---
 
-## Phase 6 — Frontend Triage (M–L) — scheduled alongside 1 / 2 / 5
+## Phase 6 — Frontend Triage (M–L) — ✅ done 2026-08-19
 
 Triage of the former OPTIMIZATION_PLAN.md's 19 items against the Jarvis vision:
 
 | Old # | Item | Verdict |
 |---|---|---|
-| 11 | Centralize API into `src/api.ts` (+ auth token from 1.1, SSE client) | **Do first** (S) — prerequisite for everything else |
-| 1 | Split `App.tsx` monolith → `src/components/` (Chat, VoiceOrb, TaskTray, Settings, Reminders, Planner, Buzzcaf) | **Do** (M) |
-| 3 | TS interfaces for API responses | **Do** with 11 (S) |
-| 8 | Fix empty catch blocks | **Do** during split (S) |
-| 9 | Extract custom hooks | **Do** during split (S) |
-| 10 | Error boundary | **Do** (S) |
-| 17 | Offline detection / SSE reconnect | **Finish** (partially done: 4s auto-reconnect) (S) |
-| 15 | Loading states | **Do** where tasks/tools run (S) |
+| 11 | Centralize API into `src/api.ts` (+ auth token from 1.1, SSE client) | **✅ Done** — every endpoint is a typed fn in `src/api.ts`; nothing else builds a URL or names the port |
+| 1 | Split `App.tsx` monolith → `src/components/` (Chat, VoiceOrb, TaskTray, Settings, Reminders, Planner, Buzzcaf) | **✅ Done** — 11 components; `App.tsx` is now 205 lines of composition |
+| 3 | TS interfaces for API responses | **✅ Done** — all shapes in `src/types.ts`, shared by hooks + components |
+| 8 | Fix empty catch blocks | **✅ Done** — no `catch (e) {}` remains in `src/` |
+| 9 | Extract custom hooks | **✅ Done** — `src/hooks/`: useVoice, useChat, useServerEvents, usePlanner, useOvernight, useSkills, useBuzzcaf, useFileSearch, useOnlineStatus |
+| 10 | Error boundary | **✅ Done** — `ErrorBoundary` wraps `<App/>` in `main.tsx` |
+| 17 | Offline detection / SSE reconnect | **✅ Done** — `useOnlineStatus` + offline badge in header; SSE keeps the 4s reconnect and now tracks `connected` |
+| 15 | Loading states | **✅ Done** — planner-add, curate, buzzcaf step/start, file search, and the thinking/tool-activity label all surface progress |
 | — | Token-stream rendering | **Do** — Phase 2.1 counterpart (S) |
 | — | Task tray + confirmation dialogs | **Done** with Phase 5 (2026-08-19) |
 | — | DPR-aware canvas, remove dead `provider`/`modelsStatus` state | **Do** — bug 8, Phase 0 (S) |
@@ -327,6 +327,19 @@ Triage of the former OPTIMIZATION_PLAN.md's 19 items against the Jarvis vision:
 
 **Acceptance:** no component over ~300 lines · `:8098` appears in exactly one
 place (`src/api.ts`) · UI shows live token stream and background-task progress.
+
+*(done 2026-08-19)* The 1,516-line `App.tsx` is gone: every panel is a
+presentational component in `src/components/` (largest is `VoiceVisualizer`, 183
+lines) and every unit of behaviour is a hook in `src/hooks/`. `App.tsx` is 205
+lines of pure composition; two shared refs (`isThinkingRef`,
+`commandHandlerRef`) break the voice↔chat cycle without a god-object.
+`tsc --strict` + `vite build` are green. **Deliberate exception to the ~300-line
+rule:** `useVoice.ts` is 384 lines. The hands-free loop (continuous recognition,
+wake word, follow-up window, echo suppression, barge-in, TTS + streamed-audio
+queue) is one irreducibly-coupled state machine over ~8 shared refs, has no
+frontend tests yet (see 7.4), and was extracted verbatim to guarantee zero
+behaviour change; splitting it would add cross-module ref plumbing and real
+regression risk for a cosmetic win. Revisit once 7.4 gives it test coverage.
 
 ---
 
