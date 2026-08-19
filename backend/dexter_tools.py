@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import time
 import subprocess
 import webbrowser
@@ -191,7 +192,7 @@ class StickyNotesTool:
         self._save_notes(notes)
         # Open Windows Sticky Notes app
         try:
-            subprocess.Popen("start ms-stk:", shell=True)
+            os.startfile("ms-stk:")
         except Exception:
             pass
         return note
@@ -249,6 +250,30 @@ class AppLauncherTool:
         return app_index.lookup(app_name)
 
     @classmethod
+    def _launch_target(cls, target: str) -> None:
+        """
+        Launch without a shell. os.startfile drives ShellExecute, which already
+        resolves protocol URIs (ms-stk:), App Paths names (chrome), and PATH
+        executables - everything `start` did, minus the injection surface of
+        interpolating a user-derived name into a command line.
+        """
+        target = target.strip().strip('"')
+        if target.lower().startswith("start "):
+            target = target[6:].strip().strip('"')
+        if not target:
+            raise OSError("empty launch target")
+        try:
+            os.startfile(target)
+        except OSError:
+            # ShellExecute misses PATHEXT scripts like code.cmd; which() finds them.
+            resolved = shutil.which(target)
+            if not resolved:
+                raise
+            subprocess.Popen(
+                [resolved], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            )
+
+    @classmethod
     def verify_process_running(cls, proc_name: str) -> bool:
         """Check if process is active in Windows tasklist."""
         try:
@@ -277,21 +302,14 @@ class AppLauncherTool:
         if cmd_to_run:
             attempts.append(cmd_to_run)
         if found_exe:
-            attempts.append(f'"{found_exe}"')
-        attempts.append(f'start "" "{clean_name}"')
+            attempts.append(found_exe)
+        attempts.append(clean_name)
 
         errors: List[str] = []
         for idx, run_cmd in enumerate(attempts, 1):
             try:
                 print(f"[Smart Launcher] Attempt {idx}: '{run_cmd}'")
-                target = run_cmd.strip('"')
-                if target.lower().endswith((".exe", ".lnk")) and os.path.exists(target):
-                    os.startfile(target)
-                else:
-                    subprocess.Popen(
-                        run_cmd, shell=True,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    )
+                cls._launch_target(run_cmd)
                 # No sleep + tasklist poll here: that cost 1.2s on the request
                 # thread and the result was discarded anyway. Popen raising is
                 # the real failure signal; a silent no-op is rare and cheap.
@@ -338,7 +356,10 @@ class PlaywrightBrowserTool:
             }
 
 
-BUZZCAF_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "BuzzcafAI")
+BUZZCAF_DIR = os.getenv(
+    "BUZZCAF_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "BuzzcafAI"),
+)
 
 class BuzzcafAITool:
     """
@@ -355,7 +376,7 @@ class BuzzcafAITool:
 
         if os.path.exists(bat_file):
             try:
-                subprocess.Popen(f'cmd /c "{bat_file}"', cwd=BUZZCAF_DIR, shell=True)
+                subprocess.Popen(["cmd", "/c", bat_file], cwd=BUZZCAF_DIR)
                 launched_backend = True
             except Exception:
                 pass

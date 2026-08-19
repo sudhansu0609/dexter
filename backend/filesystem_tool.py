@@ -3,13 +3,21 @@ import glob
 import subprocess
 from typing import List, Dict, Any, Optional
 
+import pathguard
+
 class FileSystemTool:
     @classmethod
     def search_files(cls, query: str, search_path: Optional[str] = None) -> Dict[str, Any]:
         if not search_path:
             # Default to current project or user home
             search_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            
+        else:
+            allowed = pathguard.resolve(search_path)
+            if not allowed:
+                return {"success": False, "query": query,
+                        "error": pathguard.denial(search_path), "results": []}
+            search_path = allowed
+
         matches = []
         base_depth = search_path.rstrip(os.sep).count(os.sep)
         try:
@@ -51,9 +59,13 @@ class FileSystemTool:
 
     @classmethod
     def read_file(cls, file_path: str, max_chars: int = 4000) -> Dict[str, Any]:
+        allowed = pathguard.resolve(file_path)
+        if not allowed:
+            return {"success": False, "error": pathguard.denial(file_path)}
+        file_path = allowed
         if not os.path.exists(file_path):
             return {"success": False, "error": f"File '{file_path}' not found."}
-            
+
         try:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read(max_chars)
@@ -69,6 +81,10 @@ class FileSystemTool:
 
     @classmethod
     def write_file(cls, file_path: str, content: str) -> Dict[str, Any]:
+        allowed = pathguard.resolve(file_path)
+        if not allowed:
+            return {"success": False, "error": pathguard.denial(file_path)}
+        file_path = allowed
         try:
             os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
@@ -93,12 +109,17 @@ class FileSystemTool:
             else:
                 target_dir = clean_path
 
+            allowed = pathguard.resolve(target_dir)
+            if not allowed:
+                return {"success": False, "error": pathguard.denial(target_dir)}
+            target_dir = allowed
+
             os.makedirs(target_dir, exist_ok=True)
             # Automatically open folder in Windows File Explorer
             try:
                 os.startfile(target_dir)
             except Exception:
-                subprocess.Popen(f'explorer "{target_dir}"', shell=True)
+                subprocess.Popen(["explorer", target_dir])
 
             return {
                 "success": True,
@@ -110,9 +131,13 @@ class FileSystemTool:
 
     @classmethod
     def open_local_path(cls, target_path: str) -> Dict[str, Any]:
+        allowed = pathguard.resolve(target_path)
+        if not allowed:
+            return {"success": False, "error": pathguard.denial(target_path)}
+        target_path = allowed
         if not os.path.exists(target_path):
             return {"success": False, "error": f"Path '{target_path}' does not exist."}
-            
+
         try:
             os.startfile(target_path)
             return {

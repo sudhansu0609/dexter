@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MicOff, Radio, Sparkles, Play, Plus, CheckCircle, Cpu, Zap, Layers, RefreshCw, ExternalLink, Tv, Calendar, Maximize2, Minimize2, X, FolderSearch, Search, FileText, Bell } from 'lucide-react';
+import { API_BASE, apiFetch, eventsUrl } from './api';
 
 interface Task {
   id: string;
@@ -46,8 +47,6 @@ interface ReminderBanner {
   text: string;
   missed?: boolean;
 }
-
-const API_BASE = 'http://localhost:8098';
 
 export default function App() {
   // Desktop Window State
@@ -150,9 +149,12 @@ export default function App() {
     let retry: ReturnType<typeof setTimeout> | null = null;
     let closed = false;
 
-    const connect = () => {
+    const connect = async () => {
       if (closed) return;
-      source = new EventSource(`${API_BASE}/api/dexter/events`);
+      // The stream URL carries the auth token (EventSource cannot send headers).
+      const url = await eventsUrl();
+      if (closed) return;
+      source = new EventSource(url);
       eventSourceRef.current = source;
 
       source.addEventListener('reminder', (evt: MessageEvent) => {
@@ -196,7 +198,7 @@ export default function App() {
   const snoozeReminder = async (reminder: ReminderBanner) => {
     dismissReminder(reminder.id);
     try {
-      await fetch(`${API_BASE}/api/dexter/reminders`, {
+      await apiFetch(`${API_BASE}/api/dexter/reminders`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text: reminder.text, when: 'in 10 minutes' }),
@@ -445,7 +447,7 @@ export default function App() {
 
   const fetchPlanner = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/dexter/planner`);
+      const res = await apiFetch(`${API_BASE}/api/dexter/planner`);
       const data = await res.json();
       setTasks(data.tasks || []);
     } catch (e) {}
@@ -453,7 +455,7 @@ export default function App() {
 
   const fetchOvernightQueue = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/dexter/spilledcoffee/overnight-queue`);
+      const res = await apiFetch(`${API_BASE}/api/dexter/spilledcoffee/overnight-queue`);
       const data = await res.json();
       setOvernightItems(data);
     } catch (e) {}
@@ -461,7 +463,7 @@ export default function App() {
 
   const fetchSkills = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/dexter/skills`);
+      const res = await apiFetch(`${API_BASE}/api/dexter/skills`);
       const data = await res.json();
       setSkills(data);
     } catch (e) {}
@@ -469,12 +471,12 @@ export default function App() {
 
   const fetchBuzzcafProjects = async () => {
     try {
-      const statusRes = await fetch(`${API_BASE}/api/dexter/buzzcaf/health`);
+      const statusRes = await apiFetch(`${API_BASE}/api/dexter/buzzcaf/health`);
       const statusData = await statusRes.json();
       setBuzzcafOnline(statusData.online || false);
 
       if (statusData.online) {
-        const res = await fetch(`${API_BASE}/api/dexter/buzzcaf/projects`);
+        const res = await apiFetch(`${API_BASE}/api/dexter/buzzcaf/projects`);
         const data = await res.json();
         setBuzzcafProjects(data || []);
       }
@@ -486,7 +488,7 @@ export default function App() {
   const handleExecuteBuzzcafStep = async (projectId: string) => {
     setIsExecutingStep(true);
     try {
-      const res = await fetch(`${API_BASE}/api/dexter/buzzcaf/projects/${projectId}/execute`, {
+      const res = await apiFetch(`${API_BASE}/api/dexter/buzzcaf/projects/${projectId}/execute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({})
@@ -519,7 +521,7 @@ export default function App() {
     }]);
 
     try {
-      const res = await fetch(`${API_BASE}/api/dexter/buzzcaf/start`, {
+      const res = await apiFetch(`${API_BASE}/api/dexter/buzzcaf/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       });
@@ -572,7 +574,7 @@ export default function App() {
       // Streaming endpoint: the reply lands as soon as it is ready and each
       // spoken chunk follows as it finishes synthesising, so audio starts in a
       // few hundred ms instead of after the whole response is voiced.
-      const res = await fetch(`${API_BASE}/api/dexter/chat/stream`, {
+      const res = await apiFetch(`${API_BASE}/api/dexter/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: textToSend, provider: 'auto', voiceEnabled: speakEnabled }),
@@ -722,7 +724,7 @@ export default function App() {
 
     try {
       // 2. Fetch Kokoro ONNX audio from backend endpoint
-      const res = await fetch(`${API_BASE}/api/dexter/tts/generate`, {
+      const res = await apiFetch(`${API_BASE}/api/dexter/tts/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, voiceKey: 'michael', emotion, isReminder }),
@@ -798,7 +800,7 @@ export default function App() {
     e.preventDefault();
     if (!newTaskTitle.trim()) return;
     try {
-      await fetch(`${API_BASE}/api/dexter/planner/add`, {
+      await apiFetch(`${API_BASE}/api/dexter/planner/add`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: newTaskTitle })
@@ -810,7 +812,7 @@ export default function App() {
 
   const handleToggleTask = async (taskId: string) => {
     try {
-      await fetch(`${API_BASE}/api/dexter/planner/toggle/${taskId}`, { method: 'POST' });
+      await apiFetch(`${API_BASE}/api/dexter/planner/toggle/${taskId}`, { method: 'POST' });
       fetchPlanner();
     } catch (e) {}
   };
@@ -818,7 +820,7 @@ export default function App() {
   const handleRunCurate = async () => {
     setIsCurating(true);
     try {
-      await fetch(`${API_BASE}/api/dexter/spilledcoffee/curate`, {
+      await apiFetch(`${API_BASE}/api/dexter/spilledcoffee/curate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ niche: 'AI Tech & Viral Trends', count: 3 })
@@ -832,7 +834,7 @@ export default function App() {
 
   const handleLaunchApp = async (appName: string) => {
     try {
-      await fetch(`${API_BASE}/api/dexter/system/launch`, {
+      await apiFetch(`${API_BASE}/api/dexter/system/launch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ appName })
@@ -846,7 +848,7 @@ export default function App() {
     if (!fileQuery.trim()) return;
     setIsSearchingFiles(true);
     try {
-      const res = await fetch(`${API_BASE}/api/dexter/filesystem/search`, {
+      const res = await apiFetch(`${API_BASE}/api/dexter/filesystem/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: fileQuery })
@@ -859,7 +861,7 @@ export default function App() {
 
   const handleOpenFile = async (path: string) => {
     try {
-      await fetch(`${API_BASE}/api/dexter/filesystem/open`, {
+      await apiFetch(`${API_BASE}/api/dexter/filesystem/open`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path })

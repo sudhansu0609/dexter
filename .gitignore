@@ -22,6 +22,7 @@ Thumbs.db
 !.env.example
 data/google_credentials.json
 data/google_token.json
+data/.session_token
 
 # Generated runtime state
 data/audio/

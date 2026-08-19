@@ -22,6 +22,19 @@ import requests
 
 BASE_URL = "http://127.0.0.1:8098"
 
+# Every /api/ endpoint requires the per-run session token; fetch it once from
+# the bootstrap endpoint and carry it on a shared session.
+_session = requests.Session()
+
+
+def _authenticate() -> None:
+    try:
+        tok = _session.get(f"{BASE_URL}/api/dexter/auth/token", timeout=5).json().get("token")
+        if tok:
+            _session.headers["X-Dexter-Token"] = tok
+    except Exception:
+        pass
+
 # Tier 2 falls through to a local model, which can take a minute on consumer
 # hardware. Short timeouts here were reporting slowness as failure.
 FAST_TIMEOUT = 15
@@ -43,7 +56,7 @@ def check(name, fn):
 
 
 def chat(message, timeout=FAST_TIMEOUT):
-    res = requests.post(
+    res = _session.post(
         f"{BASE_URL}/api/dexter/chat", json={"message": message}, timeout=timeout
     )
     res.raise_for_status()
@@ -65,10 +78,11 @@ def run_tests():
     print("=" * 60)
     print("Dexter Super Assistant - Verification Suite")
     print("=" * 60)
+    _authenticate()
 
     # ── core endpoints ──
     def status():
-        data = requests.get(f"{BASE_URL}/api/dexter/status", timeout=FAST_TIMEOUT).json()
+        data = _session.get(f"{BASE_URL}/api/dexter/status", timeout=FAST_TIMEOUT).json()
         assert data["status"] == "online"
         assert data["toolCount"] > 0, "no tools registered"
         return (
@@ -80,16 +94,16 @@ def run_tests():
     check("Status endpoint", status)
 
     check("Tool registry", lambda: (
-        f"{len(requests.get(f'{BASE_URL}/api/dexter/tools', timeout=FAST_TIMEOUT).json())} tools exposed"
+        f"{len(_session.get(f'{BASE_URL}/api/dexter/tools', timeout=FAST_TIMEOUT).json())} tools exposed"
     ))
 
     # ── planner ──
     check("Planner read", lambda: (
-        f"{len(requests.get(f'{BASE_URL}/api/dexter/planner', timeout=FAST_TIMEOUT).json().get('tasks', []))} tasks"
+        f"{len(_session.get(f'{BASE_URL}/api/dexter/planner', timeout=FAST_TIMEOUT).json().get('tasks', []))} tasks"
     ))
 
     def add_task():
-        res = requests.post(
+        res = _session.post(
             f"{BASE_URL}/api/dexter/planner/add",
             json={"title": "Verification run", "time": "09:00 PM"}, timeout=FAST_TIMEOUT,
         )
@@ -102,12 +116,12 @@ def run_tests():
     check("Planner add (ISO timestamp)", add_task)
 
     def toggle_task():
-        planner = requests.get(f"{BASE_URL}/api/dexter/planner", timeout=FAST_TIMEOUT).json()
+        planner = _session.get(f"{BASE_URL}/api/dexter/planner", timeout=FAST_TIMEOUT).json()
         tasks = planner.get("tasks", [])
         if not tasks:
             return "skipped - no tasks"
         tid = tasks[-1]["id"]
-        res = requests.post(f"{BASE_URL}/api/dexter/planner/toggle/{tid}", timeout=FAST_TIMEOUT)
+        res = _session.post(f"{BASE_URL}/api/dexter/planner/toggle/{tid}", timeout=FAST_TIMEOUT)
         assert res.json()["success"]
         return f"toggled {tid}"
 
@@ -134,11 +148,11 @@ def run_tests():
     def reminder_lifecycle():
         data = chat("remind me to run the verification in 3 hours")
         assert "create_reminder" in tools_used(data), f"ran {tools_used(data)}"
-        pending = requests.get(f"{BASE_URL}/api/dexter/reminders", timeout=FAST_TIMEOUT).json()
+        pending = _session.get(f"{BASE_URL}/api/dexter/reminders", timeout=FAST_TIMEOUT).json()
         match = next((r for r in pending if "verification" in r["text"].lower()), None)
         assert match, "reminder was not persisted"
         assert match["at"], "reminder has no fire time"
-        requests.delete(f"{BASE_URL}/api/dexter/reminders/{match['id']}", timeout=FAST_TIMEOUT)
+        _session.delete(f"{BASE_URL}/api/dexter/reminders/{match['id']}", timeout=FAST_TIMEOUT)
         return f"created and cancelled, fire at {match['at']}"
 
     check("Reminder create / list / cancel", reminder_lifecycle)
@@ -148,13 +162,13 @@ def run_tests():
         chat("remember that my test project is dexter-rebuild")
         data = chat("what do you remember about my test project")
         assert "dexter-rebuild" in data["reply"], f"recall failed: {data['reply']}"
-        requests.delete(f"{BASE_URL}/api/dexter/memory/my test project", timeout=FAST_TIMEOUT)
+        _session.delete(f"{BASE_URL}/api/dexter/memory/my test project", timeout=FAST_TIMEOUT)
         return "stored and recalled"
 
     check("Memory store / recall", memory_roundtrip)
 
     def conversation_history():
-        stats = requests.get(f"{BASE_URL}/api/dexter/memory", timeout=FAST_TIMEOUT).json()
+        stats = _session.get(f"{BASE_URL}/api/dexter/memory", timeout=FAST_TIMEOUT).json()
         assert stats["stats"]["turns"] > 0, "no conversation turns recorded"
         return f"{stats['stats']['turns']} turns stored"
 
@@ -166,7 +180,7 @@ def run_tests():
         first_audio = None
         chunks = 0
         reply = ""
-        res = requests.post(
+        res = _session.post(
             f"{BASE_URL}/api/dexter/chat/stream",
             json={"message": "what is on my agenda", "voiceEnabled": True},
             stream=True, timeout=LLM_TIMEOUT,
@@ -189,16 +203,16 @@ def run_tests():
 
     # ── remaining endpoints ──
     check("Skills", lambda: (
-        f"{len(requests.get(f'{BASE_URL}/api/dexter/skills', timeout=FAST_TIMEOUT).json())} skills"
+        f"{len(_session.get(f'{BASE_URL}/api/dexter/skills', timeout=FAST_TIMEOUT).json())} skills"
     ))
-    check("Direct browse endpoint", lambda: requests.post(
+    check("Direct browse endpoint", lambda: _session.post(
         f"{BASE_URL}/api/dexter/browser/navigate", json={"url": "example.com"},
         timeout=FAST_TIMEOUT).json()["url"])
     check("Filesystem search", lambda: (
-        f"{requests.post(f'{BASE_URL}/api/dexter/filesystem/search', json={'query': 'dexter'}, timeout=FAST_TIMEOUT).json()['count']} results"
+        f"{_session.post(f'{BASE_URL}/api/dexter/filesystem/search', json={'query': 'dexter'}, timeout=FAST_TIMEOUT).json()['count']} results"
     ))
     check("SpilledCoffee curate", lambda: (
-        f"{len(requests.post(f'{BASE_URL}/api/dexter/spilledcoffee/curate', json={'niche': 'AI', 'count': 2}, timeout=LLM_TIMEOUT).json())} ideas"
+        f"{len(_session.post(f'{BASE_URL}/api/dexter/spilledcoffee/curate', json={'niche': 'AI', 'count': 2}, timeout=LLM_TIMEOUT).json())} ideas"
     ))
 
     print("=" * 60)
@@ -209,7 +223,7 @@ def run_tests():
 
 if __name__ == "__main__":
     try:
-        requests.get(f"{BASE_URL}/api/dexter/status", timeout=FAST_TIMEOUT)
+        _session.get(f"{BASE_URL}/api/dexter/status", timeout=FAST_TIMEOUT)
     except Exception:
         print(f"Dexter is not running at {BASE_URL}. Start it with: python backend/main.py")
         sys.exit(2)

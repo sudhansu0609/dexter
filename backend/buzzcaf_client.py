@@ -9,6 +9,7 @@ BuzzcafAI API runs on http://localhost:8095 and provides:
 """
 
 import os
+import shutil
 import sys
 import time
 import subprocess
@@ -17,8 +18,11 @@ from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
 BUZZCAF_BASE_URL = os.getenv("BUZZCAF_API_URL", "http://localhost:8095")
-BUZZCAF_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "BuzzcafAI")
-MIDNIGHTBUZZ_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "MidnightBuzz")
+# Sibling-project locations default to directories next to the Dexter checkout
+# but can be pointed anywhere via .env.
+_SIBLING_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BUZZCAF_DIR = os.getenv("BUZZCAF_DIR", os.path.join(_SIBLING_ROOT, "BuzzcafAI"))
+MIDNIGHTBUZZ_DIR = os.getenv("MIDNIGHTBUZZ_DIR", os.path.join(_SIBLING_ROOT, "MidnightBuzz"))
 
 
 @dataclass
@@ -123,10 +127,12 @@ class BuzzcafAIClient:
 
         try:
             # Start uvicorn in background
+            # Loopback only: Dexter is the sole consumer, and 0.0.0.0 exposed
+            # the studio API to the whole LAN regardless of Dexter's own bind.
             cmd = [
                 venv_python, "-m", "uvicorn",
                 "app.main:app",
-                "--host", "0.0.0.0",
+                "--host", "127.0.0.1",
                 "--port", "8095"
             ]
 
@@ -158,23 +164,16 @@ class BuzzcafAIClient:
             return {"success": False, "error": f"Frontend directory not found"}
 
         try:
-            # Start npm dev server in background
-            if sys.platform == "win32":
-                process = subprocess.Popen(
-                    "npm run dev",
-                    cwd=frontend_dir,
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NEW_CONSOLE
-                )
-            else:
-                process = subprocess.Popen(
-                    ["npm", "run", "dev"],
-                    cwd=frontend_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+            # Start npm dev server in background. which() resolves npm.cmd on
+            # Windows, so no shell is needed on either platform.
+            npm = shutil.which("npm") or "npm"
+            process = subprocess.Popen(
+                [npm, "run", "dev"],
+                cwd=frontend_dir,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
+            )
 
             return {
                 "success": True,

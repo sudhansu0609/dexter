@@ -9,6 +9,7 @@ this module is only transport: endpoints, lifecycle, and streaming.
 
 import asyncio
 import os
+import secrets
 import sys
 import threading
 from contextlib import asynccontextmanager
@@ -29,7 +30,7 @@ except ImportError:
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -93,16 +94,80 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Dexter AI Super Assistant Engine", version="2.0.0", lifespan=lifespan)
 
+# ───────────────────────── local auth ─────────────────────────
+
+# A fresh token per server run. Any process on this machine can obtain it (via
+# the bootstrap endpoint or the token file), which matches the trust model: the
+# defense is against *remote* callers - a LAN peer if the bind ever changes,
+# or a malicious web page driving the browser at localhost.
+SESSION_TOKEN = secrets.token_urlsafe(32)
+TOKEN_FILE = os.path.join(ROOT_DIR, "data", ".session_token")
+try:
+    os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+    with open(TOKEN_FILE, "w", encoding="utf-8") as _handle:
+        _handle.write(SESSION_TOKEN)
+except Exception as _exc:
+    print(f"[Auth] Could not persist session token: {_exc}")
+
+# Reachable without the token: the health probe, the token bootstrap itself,
+# and generated TTS clips - those are played through Audio()/EventSource-style
+# APIs that cannot attach headers, and contain only Dexter's own speech.
+_TOKEN_EXEMPT = ("/api/dexter/health", "/api/dexter/auth/token", "/api/dexter/audio/")
+_ALLOWED_HOSTNAMES = {"127.0.0.1", "localhost", "::1", os.getenv("DEXTER_HOST", "127.0.0.1")}
+
+
+@app.middleware("http")
+async def require_local_token(request: Request, call_next):
+    # The Host check defeats DNS rebinding: a page on evil.com resolving to
+    # 127.0.0.1 reaches this socket, but its Host header still names evil.com.
+    hostname = (request.url.hostname or "").lower()
+    if hostname and hostname not in _ALLOWED_HOSTNAMES:
+        return JSONResponse({"detail": "Forbidden host"}, status_code=403)
+
+    path = request.url.path
+    if (
+        request.method != "OPTIONS"  # CORS preflight cannot carry custom headers
+        and path.startswith("/api/")
+        and not path.startswith(_TOKEN_EXEMPT)
+    ):
+        supplied = request.headers.get("x-dexter-token") or request.query_params.get("token")
+        if not supplied or not secrets.compare_digest(supplied, SESSION_TOKEN):
+            return JSONResponse(
+                {"detail": "Missing or invalid X-Dexter-Token"}, status_code=401
+            )
+    return await call_next(request)
+
+
 # The frontend is served from three different shells (Vite dev server, the
 # backend's own static mount, and Electron's file:// origin which reports
-# "null"). Wide-open CORS is unnecessary now that the origins are known.
+# "null"). Explicit origins only - a page's origin is never an arbitrary
+# file:// URL, just the literal "file://" or "null" markers.
+# Added after the auth middleware so CORS runs first and error responses
+# still carry the headers the browser needs to surface them.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|null|file://.*)$",
-    allow_credentials=True,
+    allow_origins=[
+        "http://localhost:3006",
+        "http://127.0.0.1:3006",
+        "http://localhost:8098",
+        "http://127.0.0.1:8098",
+        "null",
+        "file://",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/api/dexter/health")
+async def health():
+    return {"ok": True}
+
+
+@app.get("/api/dexter/auth/token")
+async def get_session_token():
+    """Token bootstrap for the local UI shells (guarded by the Host check)."""
+    return {"token": SESSION_TOKEN}
 
 
 # ───────────────────────── models ─────────────────────────
@@ -706,8 +771,9 @@ if os.path.exists(dist_dir):
 if __name__ == "__main__":
     import uvicorn
 
-    # Bound to loopback: the filesystem endpoints are unauthenticated, so
-    # listening on 0.0.0.0 exposed arbitrary file writes to the whole LAN.
+    # Loopback by default. Endpoints require the per-run session token and file
+    # paths pass through pathguard, but there is still no TLS or per-user auth -
+    # keep it off untrusted networks.
     host = os.getenv("DEXTER_HOST", "127.0.0.1")
     print(f"Starting Dexter Engine on http://{host}:8098")
     uvicorn.run(app, host=host, port=8098)
