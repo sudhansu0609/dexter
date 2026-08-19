@@ -121,24 +121,32 @@ fix references its row above.
 **Goal:** safe-by-default even if the loopback assumption ever breaks;
 destructive actions session-scoped and confirmed.
 
-- [ ] **1.1 Localhost token auth** (S–M): random token generated at startup,
+- [x] **1.1 Localhost token auth** (S–M): random token generated at startup,
       required as `X-Dexter-Token` on every endpoint except health; frontend
       obtains it via Electron preload / bootstrap. Pairs with the `src/api.ts`
-      extraction (Phase 6) — do together.
-- [ ] **1.2 Path allowlist** (M): new `backend/pathguard.py` — canonicalized
+      extraction (Phase 6) — do together. *(done 2026-08-19: per-run token +
+      Host-header check middleware in `main.py`; minimal `src/api.ts` with token
+      bootstrap, 401-retry, and SSE query-param auth; TTS audio clips exempt
+      because `Audio()` cannot send headers)*
+- [x] **1.2 Path allowlist** (M): new `backend/pathguard.py` — canonicalized
       allowlist roots (Documents, Desktop, configured project dirs; `.env`
       configurable) applied to the file **tools** and the raw
       `/api/dexter/filesystem/*` **endpoints**. Denials return an explanatory
-      `ToolResult` so the agent can tell the user why.
-- [ ] **1.3 Remove `shell=True`** (S): sweep `tools_core.py`,
+      `ToolResult` so the agent can tell the user why. *(done 2026-08-19:
+      enforced inside `FileSystemTool`, the choke point both paths share)*
+- [x] **1.3 Remove `shell=True`** (S): sweep `tools_core.py`,
       `dexter_tools.py`, `windows_tools.py`; use arg lists / `os.startfile`.
-- [ ] **1.4 Sibling spawn fix** (S): `buzzcaf_client.py` spawns the sibling
+      *(done 2026-08-19 — launcher rebuilt on `os.startfile`/ShellExecute with a
+      `shutil.which` fallback; bat/npm spawns use arg lists)*
+- [x] **1.4 Sibling spawn fix** (S): `buzzcaf_client.py` spawns the sibling
       uvicorn on `127.0.0.1` (not `0.0.0.0`); sibling paths via env vars.
+      *(done 2026-08-19: `BUZZCAF_DIR` / `MIDNIGHTBUZZ_DIR` in `.env`)*
 - [x] **1.5 Per-session confirmations + TTL** (S): completes bug 3 — key
       `_pending` by session id, expire after ~120s, support explicit cancel.
       *(done 2026-08-19 as part of the Phase 0 bug fixes)*
-- [ ] **1.6 CORS tightening** (S): drop the any-`file://` origin allowance;
-      restrict to the Vite dev origin + Electron origin.
+- [x] **1.6 CORS tightening** (S): drop the any-`file://` origin allowance;
+      restrict to the Vite dev origin + Electron origin. *(done 2026-08-19:
+      explicit origin list, credentials disabled)*
 
 **Acceptance:** token-less request → 401 · `read_file` on a system path →
 polite denial · `grep -r "shell=True" backend/` empty · sibling binds loopback ·
