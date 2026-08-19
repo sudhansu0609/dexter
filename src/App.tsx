@@ -105,6 +105,8 @@ export default function App() {
   // SpeechRecognition handlers are registered once on mount, so calling
   // handleSendMessage directly captured the first render's closure forever.
   const handleSendRef = useRef<(text?: string) => void>(() => {});
+  // Chat message currently receiving streamed LLM tokens, if any.
+  const streamMsgIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     isSpeakingRef.current = isSpeaking;
@@ -567,6 +569,7 @@ export default function App() {
     setIsThinking(true);
     setToolActivity('');
     audioQueueRef.current = [];
+    streamMsgIdRef.current = null;
 
     const speakEnabled = !isVoiceMutedRef.current;
 
@@ -609,17 +612,43 @@ export default function App() {
 
           if (evt.type === 'tool_start') {
             setToolActivity(String(evt.payload?.name || '').replace(/_/g, ' '));
+          } else if (evt.type === 'token') {
+            // Live LLM output - render it as it is generated.
+            setIsThinking(false);
+            const piece = String(evt.payload?.text || '');
+            if (!streamMsgIdRef.current) {
+              const newId = `d-${Date.now()}`;
+              streamMsgIdRef.current = newId;
+              setChatLog(prev => [...prev, { id: newId, sender: 'dexter' as const, text: piece }]);
+            } else {
+              const sid = streamMsgIdRef.current;
+              setChatLog(prev => prev.map(m => (m.id === sid ? { ...m, text: m.text + piece } : m)));
+            }
+          } else if (evt.type === 'provider_switched') {
+            // The reply restarts on a fallback provider; clear the partial text.
+            const sid = streamMsgIdRef.current;
+            if (sid) setChatLog(prev => prev.map(m => (m.id === sid ? { ...m, text: '' } : m)));
+            setToolActivity(`retrying on ${evt.payload?.to || 'fallback'}`);
           } else if (evt.type === 'reply') {
             gotReply = true;
             setIsThinking(false);
             setToolActivity('');
             lastSpokenTextRef.current = evt.payload.reply || '';
-            setChatLog(prev => [...prev, {
-              id: `d-${Date.now()}`,
-              sender: 'dexter' as const,
-              text: evt.payload.reply,
-              action: evt.payload.action,
-            }]);
+            const sid = streamMsgIdRef.current;
+            streamMsgIdRef.current = null;
+            if (sid) {
+              // Finalize the streamed message with the authoritative reply.
+              setChatLog(prev => prev.map(m => (
+                m.id === sid ? { ...m, text: evt.payload.reply, action: evt.payload.action } : m
+              )));
+            } else {
+              setChatLog(prev => [...prev, {
+                id: `d-${Date.now()}`,
+                sender: 'dexter' as const,
+                text: evt.payload.reply,
+                action: evt.payload.action,
+              }]);
+            }
             fetchPlanner();
             fetchOvernightQueue();
             fetchSkills();

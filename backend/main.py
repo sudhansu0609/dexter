@@ -9,6 +9,8 @@ this module is only transport: endpoints, lifecycle, and streaming.
 
 import asyncio
 import os
+import queue as sync_queue
+import re
 import secrets
 import sys
 import threading
@@ -50,7 +52,7 @@ from scheduler import scheduler
 from skill_engine import DexterSkillEngine
 from tool_registry import all_tools
 from tools_core import day_planner, spilled_coffee, sticky_notes, youtube_tool
-from voice_engine import DexterVoiceEngine, split_sentences
+from voice_engine import DexterVoiceEngine
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIO_DIR = os.path.join(ROOT_DIR, "data", "audio")
@@ -355,14 +357,22 @@ async def process_chat(req: ChatRequest):
     return await run_in_threadpool(_run_route, req)
 
 
+# A sentence is speakable once its terminator is followed by whitespace; the
+# minimum offset keeps abbreviations and tiny fragments from triggering a chunk.
+_SENTENCE_END = re.compile(r"[.!?][\"'\)\]]*\s")
+_MIN_STREAM_SENTENCE = 12
+
+
 @app.post("/api/dexter/chat/stream")
 async def process_chat_stream(req: ChatRequest):
     """
     Chat with incremental delivery.
 
-    The reply is split into sentences and each one is synthesised as it becomes
-    available, so the first audio starts playing while the rest is still being
-    generated instead of after the whole response is complete.
+    LLM tokens stream to the UI as they are generated (`token` events), and
+    completed sentences are synthesised while later ones are still being
+    written - so speech starts before the model has finished the reply, not
+    after. Fast-path replies (no LLM, so no tokens) fall back to synthesising
+    the finished reply sentence by sentence as before.
     """
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -370,49 +380,107 @@ async def process_chat_stream(req: ChatRequest):
     def emit(event_type: str, payload: Any) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, (event_type, payload))
 
-    async def worker() -> None:
-        try:
-            result = await run_in_threadpool(_run_route, req, emit)
-            emit("reply", result)
+    # Synthesis runs on its own thread so a 300ms Kokoro call never stalls the
+    # token stream. Sentences go in; audio events come out.
+    tts_queue: "sync_queue.Queue[Optional[str]]" = sync_queue.Queue()
+    state = {"pending": "", "spoke_stream": False, "emotion": None}
 
-            if req.voiceEnabled:
-                calls = result.get("toolCalls") or []
-                # A failed tool should sound apologetic, not chirpy.
-                tool_ok = all(c.get("ok", True) for c in calls) if calls else None
-                reply_text = result.get("reply", "")
-
-                # A tool can ask for a specific delivery - read_aloud wants the
-                # narrator register rather than the clipped confirmation tone.
-                requested = (result.get("details") or {}).get("speechEmotion")
-                if not requested:
-                    requested = next(
-                        (c.get("speechEmotion") for c in calls if c.get("speechEmotion")), None
-                    )
-
-                delivery, chunks = await run_in_threadpool(
-                    voice_engine.plan_speech,
-                    reply_text,
-                    result.get("action", ""),
-                    tool_ok,
-                    False,
-                    len(reply_text) > 600,
-                    requested,
+    def tts_worker() -> None:
+        while True:
+            sentence = tts_queue.get()
+            if sentence is None:
+                return
+            try:
+                delivery, chunks = voice_engine.plan_speech(
+                    sentence, "", None, False, False, state["emotion"]
                 )
-                emit("delivery", {"emotion": delivery.emotion, "speed": delivery.speed})
-
+                if state["emotion"] is None:
+                    # Lock the register decided for the first sentence so the
+                    # reply does not change mood halfway through.
+                    state["emotion"] = delivery.emotion
+                    emit("delivery", {"emotion": delivery.emotion, "speed": delivery.speed})
                 for chunk in chunks:
-                    path = await run_in_threadpool(
-                        voice_engine.synthesize_chunk, chunk, delivery, req.voiceKey or "michael"
-                    )
+                    path = voice_engine.synthesize_chunk(chunk, delivery, req.voiceKey or "michael")
                     if path:
                         emit("audio", {
                             "text": chunk,
                             "emotion": delivery.emotion,
                             "url": f"/api/dexter/audio/{os.path.basename(path)}",
                         })
+            except Exception as exc:
+                print(f"[Stream] Incremental TTS failed: {exc}")
+
+    def routed_emit(event_type: str, payload: Any) -> None:
+        """Pass events through, feeding completed sentences to the TTS thread."""
+        if event_type == "token" and req.voiceEnabled:
+            state["pending"] += payload.get("text", "")
+            while True:
+                match = _SENTENCE_END.search(state["pending"], _MIN_STREAM_SENTENCE)
+                if not match:
+                    break
+                sentence = state["pending"][: match.end()].strip()
+                state["pending"] = state["pending"][match.end():]
+                if sentence:
+                    state["spoke_stream"] = True
+                    tts_queue.put(sentence)
+        elif event_type == "provider_switched":
+            # The retry regenerates the reply from scratch; drop the partial.
+            state["pending"] = ""
+        emit(event_type, payload)
+
+    async def worker() -> None:
+        tts_thread = threading.Thread(target=tts_worker, daemon=True, name="dexter-stream-tts")
+        tts_thread.start()
+        try:
+            result = await run_in_threadpool(_run_route, req, routed_emit)
+            emit("reply", result)
+
+            if req.voiceEnabled:
+                if state["spoke_stream"]:
+                    # Streamed sentences are already voiced; finish the tail.
+                    tail = state["pending"].strip()
+                    if tail:
+                        tts_queue.put(tail)
+                else:
+                    calls = result.get("toolCalls") or []
+                    # A failed tool should sound apologetic, not chirpy.
+                    tool_ok = all(c.get("ok", True) for c in calls) if calls else None
+                    reply_text = result.get("reply", "")
+
+                    # A tool can ask for a specific delivery - read_aloud wants
+                    # narration rather than the clipped confirmation tone.
+                    requested = (result.get("details") or {}).get("speechEmotion")
+                    if not requested:
+                        requested = next(
+                            (c.get("speechEmotion") for c in calls if c.get("speechEmotion")), None
+                        )
+
+                    delivery, chunks = await run_in_threadpool(
+                        voice_engine.plan_speech,
+                        reply_text,
+                        result.get("action", ""),
+                        tool_ok,
+                        False,
+                        len(reply_text) > 600,
+                        requested,
+                    )
+                    emit("delivery", {"emotion": delivery.emotion, "speed": delivery.speed})
+
+                    for chunk in chunks:
+                        path = await run_in_threadpool(
+                            voice_engine.synthesize_chunk, chunk, delivery, req.voiceKey or "michael"
+                        )
+                        if path:
+                            emit("audio", {
+                                "text": chunk,
+                                "emotion": delivery.emotion,
+                                "url": f"/api/dexter/audio/{os.path.basename(path)}",
+                            })
         except Exception as exc:
             emit("error", {"message": str(exc)})
         finally:
+            tts_queue.put(None)
+            await run_in_threadpool(tts_thread.join)
             emit("done", {})
 
     async def generate():

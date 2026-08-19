@@ -20,7 +20,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
@@ -41,6 +41,9 @@ class LLMResponse:
     provider: str = ""
     model: str = ""
     error: Optional[str] = None
+    # Set when the answering provider is not the one first selected - the
+    # request was completed by a fallback after the primary failed mid-flight.
+    fallback_from: Optional[str] = None
 
     @property
     def ok(self) -> bool:
@@ -151,6 +154,28 @@ class HybridLLMRouter:
     def _base_url_for(self, provider: str) -> str:
         return self.ollama_url if provider == "ollama" else self.lm_studio_url
 
+    def _provider_chain(self, provider: str, needs_tools: bool = False) -> List[str]:
+        """
+        Ordered providers to try for one request. An explicit choice is honoured
+        exactly; "auto" is local-first with cloud fallback so a local server
+        dying mid-request degrades to a configured key instead of an apology.
+        Gemini is chat-only here (its path has no tool calling), so it is
+        skipped whenever tools are required.
+        """
+        if provider and provider != "auto":
+            return [provider]
+        health = self.get_available_providers()
+        chain: List[str] = []
+        if health["lmStudio"]["online"]:
+            chain.append("lmstudio")
+        if health["ollama"]["online"]:
+            chain.append("ollama")
+        if health["openai"]["configured"]:
+            chain.append("openai")
+        if health["gemini"]["configured"] and not needs_tools:
+            chain.append("gemini")
+        return chain or ["lmstudio"]
+
     # ───────────────────────── chat ─────────────────────────
 
     def chat(
@@ -162,25 +187,77 @@ class HybridLLMRouter:
         max_tokens: int = 768,
         tools: Optional[List[Dict[str, Any]]] = None,
         timeout: int = 90,
+        on_token: Optional[Callable[[str], None]] = None,
+        on_fallback: Optional[Callable[[str, str], None]] = None,
     ) -> LLMResponse:
-        """Full multi-turn chat with optional native tool calling."""
-        resolved = self.resolve_provider(provider)
-        model_name = self._model_for(resolved, model)
+        """
+        Full multi-turn chat with optional native tool calling.
 
-        if resolved == "gemini" and self.gemini_api_key:
+        `on_token` streams content deltas as they arrive (the request is made
+        with stream=True); the returned LLMResponse still carries the complete
+        content and parsed tool calls either way.
+
+        `on_fallback(failed, next)` fires before each retry against the next
+        provider in the chain, so callers can reset any tokens already shown.
+        """
+        chain = self._provider_chain(provider, needs_tools=bool(tools))
+        last: Optional[LLMResponse] = None
+        for idx, prov in enumerate(chain):
+            if idx > 0:
+                print(f"[HybridLLM] {chain[idx - 1]} failed mid-request; trying {prov}.")
+                if on_fallback:
+                    try:
+                        on_fallback(chain[idx - 1], prov)
+                    except Exception:
+                        pass
+            response = self._chat_one(
+                prov, messages, model, temperature, max_tokens, tools, timeout, on_token
+            )
+            if response.ok:
+                if idx > 0:
+                    response.fallback_from = chain[0]
+                return response
+            last = response
+            # The failed probe result is stale now; let the next request re-probe.
+            self.invalidate_health()
+        return last or LLMResponse(
+            provider=chain[0] if chain else "none",
+            error="No LLM provider is available.",
+        )
+
+    def _chat_one(
+        self,
+        prov: str,
+        messages: List[Dict[str, Any]],
+        model: Optional[str],
+        temperature: float,
+        max_tokens: int,
+        tools: Optional[List[Dict[str, Any]]],
+        timeout: int,
+        on_token: Optional[Callable[[str], None]],
+    ) -> LLMResponse:
+        model_name = self._model_for(prov, model)
+
+        if prov == "gemini":
+            if not self.gemini_api_key:
+                return LLMResponse(provider=prov, model=model_name,
+                                   error="Gemini API key not configured")
             return self._chat_gemini(messages, model_name, temperature, max_tokens)
 
-        if resolved == "openai" and self.openai_api_key:
+        if prov == "openai":
+            if not self.openai_api_key:
+                return LLMResponse(provider=prov, model=model_name,
+                                   error="OpenAI API key not configured")
             return self._chat_openai_compat(
                 "https://api.openai.com/v1", messages, model_name, temperature,
                 max_tokens, tools, timeout,
                 headers={"Authorization": f"Bearer {self.openai_api_key}"},
-                provider_label="openai",
+                provider_label="openai", on_token=on_token,
             )
 
         return self._chat_openai_compat(
-            self._base_url_for(resolved), messages, model_name, temperature,
-            max_tokens, tools, timeout, provider_label=resolved,
+            self._base_url_for(prov), messages, model_name, temperature,
+            max_tokens, tools, timeout, provider_label=prov, on_token=on_token,
         )
 
     def _chat_openai_compat(
@@ -194,7 +271,9 @@ class HybridLLMRouter:
         timeout: int,
         headers: Optional[Dict[str, str]] = None,
         provider_label: str = "lmstudio",
+        on_token: Optional[Callable[[str], None]] = None,
     ) -> LLMResponse:
+        streaming = on_token is not None
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -204,6 +283,8 @@ class HybridLLMRouter:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if streaming:
+            payload["stream"] = True
 
         try:
             res = self.session.post(
@@ -211,6 +292,7 @@ class HybridLLMRouter:
                 json=payload,
                 headers=headers or {},
                 timeout=timeout,
+                stream=streaming,
             )
         except Exception as exc:
             return LLMResponse(
@@ -225,12 +307,15 @@ class HybridLLMRouter:
                 print(f"[HybridLLM] Server rejected native tools ({res.status_code}); retrying without.")
                 return self._chat_openai_compat(
                     base_url, messages, model, temperature, max_tokens,
-                    None, timeout, headers, provider_label,
+                    None, timeout, headers, provider_label, on_token,
                 )
             return LLMResponse(
                 provider=provider_label, model=model,
                 error=f"Model server returned {res.status_code}: {body}",
             )
+
+        if streaming:
+            return self._consume_stream(res, provider_label, model, on_token)
 
         try:
             choice = res.json()["choices"][0]["message"]
@@ -239,10 +324,80 @@ class HybridLLMRouter:
                 provider=provider_label, model=model,
                 error=f"Malformed response from model server: {exc}",
             )
+        return LLMResponse(
+            content=choice.get("content") or "",
+            tool_calls=self._parse_tool_calls(choice.get("tool_calls") or []),
+            provider=provider_label, model=model,
+        )
 
-        content = choice.get("content") or ""
+    def _consume_stream(
+        self,
+        res: requests.Response,
+        provider_label: str,
+        model: str,
+        on_token: Callable[[str], None],
+    ) -> LLMResponse:
+        """
+        Accumulate an SSE completion stream into a normal LLMResponse, calling
+        on_token for each content delta. A connection dropped mid-stream is
+        reported as an error so chat() can retry the whole request on the next
+        provider - the partial text is discarded rather than stitched.
+        """
+        content_parts: List[str] = []
+        # Tool-call fragments arrive keyed by index; the name lands once, the
+        # arguments accumulate as string fragments.
+        calls_acc: Dict[int, Dict[str, str]] = {}
+        try:
+            with res:
+                for line in res.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        delta = json.loads(data)["choices"][0].get("delta", {})
+                    except Exception:
+                        continue
+                    piece = delta.get("content")
+                    if piece:
+                        content_parts.append(piece)
+                        try:
+                            on_token(piece)
+                        except Exception:
+                            pass
+                    for tc in delta.get("tool_calls") or []:
+                        acc = calls_acc.setdefault(
+                            tc.get("index", 0), {"id": "", "name": "", "args": ""}
+                        )
+                        if tc.get("id"):
+                            acc["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            acc["name"] = acc["name"] or fn["name"]
+                        if fn.get("arguments"):
+                            acc["args"] += fn["arguments"]
+        except Exception as exc:
+            return LLMResponse(
+                provider=provider_label, model=model,
+                error=f"Stream dropped mid-response: {exc}",
+            )
+
+        raw_calls = [
+            {"id": acc["id"], "function": {"name": acc["name"], "arguments": acc["args"]}}
+            for _, acc in sorted(calls_acc.items())
+            if acc["name"]
+        ]
+        return LLMResponse(
+            content="".join(content_parts),
+            tool_calls=self._parse_tool_calls(raw_calls),
+            provider=provider_label, model=model,
+        )
+
+    @staticmethod
+    def _parse_tool_calls(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         calls: List[Dict[str, Any]] = []
-        for tc in choice.get("tool_calls") or []:
+        for tc in raw:
             fn = tc.get("function", {})
             raw_args = fn.get("arguments", "{}")
             if isinstance(raw_args, str):
@@ -253,15 +408,11 @@ class HybridLLMRouter:
             else:
                 parsed_args = raw_args or {}
             calls.append({
-                "id": tc.get("id", f"call_{len(calls)}"),
+                "id": tc.get("id") or f"call_{len(calls)}",
                 "name": fn.get("name", ""),
                 "arguments": parsed_args,
             })
-
-        return LLMResponse(
-            content=content, tool_calls=calls,
-            provider=provider_label, model=model,
-        )
+        return calls
 
     def _chat_gemini(
         self, messages: List[Dict[str, Any]], model: str,
@@ -281,71 +432,6 @@ class HybridLLMRouter:
             return LLMResponse(content=response.text, provider="gemini", model=model)
         except Exception as exc:
             return LLMResponse(provider="gemini", model=model, error=f"Gemini error: {exc}")
-
-    # ───────────────────────── streaming ─────────────────────────
-
-    def stream(
-        self,
-        messages: List[Dict[str, Any]],
-        provider: str = "auto",
-        model: Optional[str] = None,
-        temperature: float = 0.5,
-        max_tokens: int = 768,
-        timeout: int = 90,
-    ) -> Iterator[str]:
-        """
-        Yield content deltas as they arrive. Falls back to yielding the whole
-        reply in one chunk for providers without a streaming path.
-        """
-        resolved = self.resolve_provider(provider)
-        model_name = self._model_for(resolved, model)
-
-        if resolved in ("gemini",) or (resolved == "openai" and not self.openai_api_key):
-            response = self.chat(messages, provider, model, temperature, max_tokens)
-            yield response.content if response.ok else (response.error or "")
-            return
-
-        base_url = (
-            "https://api.openai.com/v1" if resolved == "openai"
-            else self._base_url_for(resolved)
-        )
-        headers = (
-            {"Authorization": f"Bearer {self.openai_api_key}"}
-            if resolved == "openai" else {}
-        )
-
-        try:
-            with self.session.post(
-                f"{base_url}/chat/completions",
-                json={
-                    "model": model_name,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "stream": True,
-                },
-                headers=headers,
-                timeout=timeout,
-                stream=True,
-            ) as res:
-                if res.status_code != 200:
-                    yield f"[Model server error {res.status_code}]"
-                    return
-                for line in res.iter_lines(decode_unicode=True):
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        delta = json.loads(data)["choices"][0].get("delta", {})
-                    except Exception:
-                        continue
-                    piece = delta.get("content")
-                    if piece:
-                        yield piece
-        except Exception as exc:
-            yield f"[Streaming failed: {exc}]"
 
     # ───────────────────────── back-compat ─────────────────────────
 

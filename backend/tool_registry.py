@@ -15,7 +15,6 @@ language model, deliberately kept short: a small local model drowns if you hand
 it a raw JSON blob, so the tool itself decides what is worth saying.
 """
 
-import inspect
 import json
 import time
 import traceback

@@ -725,6 +725,40 @@ def _parse_text_answer(text: str) -> Optional[str]:
     return None
 
 
+class _TokenGate:
+    """
+    Forward LLM content deltas to the event stream - unless the reply turns out
+    to be a text-protocol tool call. A small model may answer with raw JSON
+    ({"tool": ...} or {"answer": ...}); streaming that to the UI and voice
+    would leak protocol, so emission is deferred until the first non-space
+    character shows the reply is prose.
+    """
+
+    def __init__(self, on_event: Callable[[str, Dict[str, Any]], None]) -> None:
+        self._on_event = on_event
+        self.reset()
+
+    def reset(self) -> None:
+        self._buffer = ""
+        self._decided: Optional[bool] = None  # None undecided, True prose, False JSON
+
+    def feed(self, piece: str) -> None:
+        if self._decided is False:
+            return
+        if self._decided is True:
+            self._on_event("token", {"text": piece})
+            return
+        self._buffer += piece
+        head = self._buffer.lstrip()
+        if not head:
+            return
+        if head[0] in "{[`":
+            self._decided = False
+            return
+        self._decided = True
+        self._on_event("token", {"text": self._buffer})
+
+
 def agent_loop(
     message: str,
     history: Optional[List[Dict[str, str]]] = None,
@@ -760,7 +794,19 @@ def agent_loop(
     last_result: Optional[ToolResult] = None
     repair_used = False
 
+    gate = _TokenGate(on_event) if on_event else None
+
+    def _on_fallback(failed: str, next_provider: str) -> None:
+        # Tokens already shown came from a stream that died; the retry starts
+        # the reply over, so the UI must clear what it has.
+        if gate:
+            gate.reset()
+        if on_event:
+            on_event("provider_switched", {"from": failed, "to": next_provider})
+
     for iteration in range(MAX_ITERATIONS):
+        if gate:
+            gate.reset()
         response = llm_router.chat(
             messages,
             provider=provider,
@@ -768,6 +814,8 @@ def agent_loop(
             temperature=0.1 if tool_schemas else 0.5,
             max_tokens=1024,
             tools=tool_schemas or None,
+            on_token=gate.feed if gate else None,
+            on_fallback=_on_fallback,
         )
 
         if not response.ok:
