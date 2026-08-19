@@ -8,9 +8,31 @@ dist/
 __pycache__/
 *.pyc
 *.log
+.pytest_cache/
 
 # IDE & OS
 .DS_Store
 Thumbs.db
 .vscode/
 .idea/
+
+# Secrets - .env was previously tracked; keys added to it would have been committed
+.env
+.env.*
+!.env.example
+data/google_credentials.json
+data/google_token.json
+
+# Generated runtime state
+data/audio/
+data/screenshots/
+data/app_index.json
+data/dexter_memory.db
+data/dexter_memory.db-*
+data/day_planner.json
+data/overnight_content.json
+data/playlists.json
+data/reminders.json
+data/sticky_notes.json
+*.corrupt
+test_kokoro_dexter.wav
