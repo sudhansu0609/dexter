@@ -194,24 +194,31 @@ fallback · eval harness produces a per-model scoreboard.
 
 **Goal:** Dexter remembers everything relevant and recalls it semantically.
 
-- [ ] **3.1 Vector store** (**Decision D2: sqlite-vec**): loadable extension on
-      the existing SQLite DB — zero services, one file. Fallback if the Windows
-      wheel misbehaves: numpy brute-force cosine over an embeddings BLOB column
-      (fine at this scale).
-- [ ] **3.2 Semantic recall** (M): embeddings column for facts + conversation
-      summaries in `memory.py`; shared embedding singleton extracted to
-      `backend/embeddings.py` (used by router Tier 1 **and** memory); recall =
-      vector top-k blended with the existing exact/LIKE path.
-- [ ] **3.3 Auto-fact extraction** (M): nightly/idle local-LLM pass over recent
-      turns → candidate facts, deduped against existing facts by embedding
-      similarity, stored with source-turn provenance. Hooked into
-      `scheduler.py`.
-- [ ] **3.4 Daily/weekly summaries** (S–M): scheduler crons summarizing each
-      day's conversations into dated rows; weekly rollup — the retrievable
-      episodic memory, feeding the 06:00 morning brief.
-- [ ] **3.5 Document ingestion** (M): `remember_document(path)` tool — chunk,
-      embed, store with source path (pathguard applies); recall cites the
-      source. Start with `.txt`/`.md`; PDFs later.
+- [x] **3.1 Vector store** (**Decision D2: sqlite-vec**): *(done 2026-08-19)*
+      sqlite-vec v0.1.9 loads on this machine; distances computed SQL-side via
+      `vec_distance_cosine` over a plain BLOB column, with a numpy scan
+      fallback over the same column when the extension fails to load. One
+      schema, two search paths.
+- [x] **3.2 Semantic recall** (M): *(done 2026-08-19)* new
+      `backend/embeddings.py` shared MiniLM singleton (router Tier 1 + memory
+      use one model instance); `memory.py` embeds facts, summaries, and
+      document chunks; `recall()` blends exact → LIKE → semantic → token
+      overlap; `semantic_context()` injects request-relevant memories into
+      every agent prompt (~6ms on the live DB); startup backfill embeds
+      pre-existing rows.
+- [x] **3.3 Auto-fact extraction** (M): *(done 2026-08-19)* new
+      `backend/reflection.py` — LLM pass over recent turns promotes durable
+      facts with `auto:YYYY-MM-DD` provenance, deduped by embedding similarity
+      (threshold 0.82, calibrated on MiniLM). Runs nightly at 23:40 and
+      backfills at startup for machines asleep at night. Live test: 4 genuine
+      facts extracted, ~1 duplicate on re-run.
+- [x] **3.4 Daily/weekly summaries** (S–M): *(done 2026-08-19)* day summaries
+      (23:40 cron + startup catch-up, idempotent per date), Sunday weekly
+      rollup, both embedded for episodic recall; the 06:00 morning brief now
+      opens with yesterday's summary.
+- [x] **3.5 Document ingestion** (M): *(done 2026-08-19)* `remember_document`
+      tool — pathguard-checked, text-like files up to 400KB, paragraph-packed
+      ~1000-char chunks, recalled with the file cited as source. PDFs later.
 
 **Acceptance:** "what did I say about X last week" retrieves semantically ·
 facts accumulate without duplicates · retrieval adds <150ms to routing.
@@ -336,7 +343,7 @@ place (`src/api.ts`) · UI shows live token stream and background-task progress.
 | # | Decision | Resolution (2026-08-19) |
 |---|---|---|
 | D1 | Install sentence-transformers (~2.5 GB torch) | **Yes** — powers neural Tier-1 routing AND memory embeddings; silero-vad reuses torch |
-| D2 | Vector store | **sqlite-vec** (extension of existing SQLite, zero services); numpy brute-force fallback |
+| D2 | Vector store | **sqlite-vec** (extension of existing SQLite, zero services); numpy brute-force fallback. *Confirmed working (v0.1.9) 2026-08-19.* |
 | D3 | Voice input | **Full local pipeline**: faster-whisper + **openWakeWord** (Apache-2.0, no account) + silero-vad; Porcupine only if accuracy demands |
 | D4 | Runtime `data/*.json` in git | **Gitignore** runtime data, keep seeds |
 | D5 | i18n | **Dropped from roadmap** |
