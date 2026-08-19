@@ -4,7 +4,14 @@ import time
 import subprocess
 import webbrowser
 import urllib.parse
+from datetime import datetime
 from typing import List, Dict, Any, Optional
+
+import requests
+
+import app_index
+from jsonstore import load_json, save_json
+from timeparse import parse_when
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 PLANNER_FILE = os.path.join(DATA_DIR, "day_planner.json")
@@ -26,15 +33,40 @@ class DayPlannerTool:
             })
 
     def _load_planner(self) -> Dict[str, Any]:
-        try:
-            with open(PLANNER_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {"date": time.strftime("%Y-%m-%d"), "tasks": []}
+        planner = load_json(PLANNER_FILE, {"date": time.strftime("%Y-%m-%d"), "tasks": []})
+        return self._migrate(planner)
+
+    def _migrate(self, planner: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Backfill the ISO 'at' timestamp on legacy rows.
+
+        Tasks used to store only a display string like "09:00 AM", which nothing
+        could ever schedule against. Existing data is preserved - we just derive
+        a real datetime alongside it so the scheduler has something to fire on.
+        """
+        changed = False
+        date_str = planner.get("date") or time.strftime("%Y-%m-%d")
+        for task in planner.get("tasks", []):
+            if task.get("at"):
+                continue
+            display = task.get("time", "")
+            parsed = None
+            try:
+                base = datetime.strptime(date_str, "%Y-%m-%d")
+                parsed = datetime.combine(
+                    base.date(), datetime.strptime(display.strip(), "%I:%M %p").time()
+                )
+            except Exception:
+                parsed = parse_when(display) if display else None
+            if parsed:
+                task["at"] = parsed.isoformat(timespec="seconds")
+                changed = True
+        if changed:
+            save_json(PLANNER_FILE, planner)
+        return planner
 
     def _save_planner(self, data: Dict[str, Any]):
-        with open(PLANNER_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        save_json(PLANNER_FILE, data)
 
     def get_agenda(self) -> Dict[str, Any]:
         planner = self._load_planner()
@@ -49,14 +81,30 @@ class DayPlannerTool:
     def add_task(self, title: str, task_time: str = "12:00 PM") -> Dict[str, Any]:
         planner = self._load_planner()
         new_task = {
-            "id": f"t-{int(time.time())}",
+            "id": f"t-{int(time.time() * 1000)}",
             "time": task_time,
             "title": title,
             "completed": False
         }
-        planner["tasks"].append(new_task)
+        planner.setdefault("tasks", []).append(new_task)
         self._save_planner(planner)
         return new_task
+
+    def update_task(self, task_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Merge fields into an existing task. Used to attach ISO 'at' timestamps."""
+        planner = self._load_planner()
+        for t in planner.get("tasks", []):
+            if t.get("id") == task_id:
+                t.update(patch)
+                self._save_planner(planner)
+                return t
+        return None
+
+    def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        for t in self._load_planner().get("tasks", []):
+            if t.get("id") == task_id:
+                return t
+        return None
 
     def toggle_task(self, task_id: str) -> bool:
         planner = self._load_planner()
@@ -83,15 +131,10 @@ class YouTubeMusicTool:
             ])
 
     def _load_playlists(self) -> List[Dict[str, Any]]:
-        try:
-            with open(PLAYLIST_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
+        return load_json(PLAYLIST_FILE, [])
 
     def _save_playlists(self, data: List[Dict[str, Any]]):
-        with open(PLAYLIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        save_json(PLAYLIST_FILE, data)
 
     def search_and_play(self, query: str) -> Dict[str, Any]:
         encoded_query = urllib.parse.quote(query)
@@ -122,15 +165,10 @@ class StickyNotesTool:
             ])
 
     def _load_notes(self) -> List[Dict[str, Any]]:
-        try:
-            with open(NOTES_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
+        return load_json(NOTES_FILE, [])
 
     def _save_notes(self, data: List[Dict[str, Any]]):
-        with open(NOTES_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        save_json(NOTES_FILE, data)
 
     def create_note(self, content: str, title: str = "Sticky Note", color: str = "#fef08a") -> Dict[str, Any]:
         notes = self._load_notes()
@@ -193,40 +231,24 @@ class AppLauncherTool:
 
     @classmethod
     def find_installed_exe(cls, app_name: str) -> Optional[str]:
-        """Dynamically scan Windows directories for matching application executables."""
-        target = app_name.lower().strip()
-        # Clean filler prefixes/suffixes
-        target = target.replace("adobe ", "").replace("microsoft ", "").strip()
+        """
+        Resolve an app name to a path using the prebuilt index.
 
-        search_dirs = [
-            r"C:\Program Files\Adobe",
-            r"C:\Program Files (x86)\Adobe",
-            r"C:\Program Files",
-            os.path.expanduser(r"~\AppData\Roaming\Microsoft\Windows\Start Menu\Programs"),
-            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
-        ]
-
-        for sd in search_dirs:
-            if os.path.exists(sd):
-                try:
-                    for root, dirs, files in os.walk(sd):
-                        for f in files:
-                            f_lower = f.lower()
-                            if f_lower.endswith(".exe") or f_lower.endswith(".lnk"):
-                                if target in f_lower:
-                                    # Exclude helper/service background tasks
-                                    if not any(b in f_lower for b in ["helper", "service", "prefs", "dlms", "unins", "setup", "crash"]):
-                                        return os.path.join(root, f)
-                except Exception:
-                    pass
-        return None
+        This used to os.walk all of Program Files on every miss, which blocked
+        the request thread for seconds. app_index does that scan once, in the
+        background, and caches it to disk.
+        """
+        return app_index.lookup(app_name)
 
     @classmethod
     def verify_process_running(cls, proc_name: str) -> bool:
         """Check if process is active in Windows tasklist."""
         try:
-            cmd = f'tasklist /FI "IMAGENAME eq {proc_name}*"'
-            out = subprocess.check_output(cmd, shell=True, text=True, errors="ignore")
+            out = subprocess.check_output(
+                ["tasklist", "/FI", f"IMAGENAME eq {proc_name}*"],
+                text=True, errors="ignore",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             return proc_name.lower() in out.lower()
         except Exception:
             return False
@@ -238,58 +260,52 @@ class AppLauncherTool:
             clean_name = clean_name.replace(filler, "")
         clean_name = clean_name.strip()
 
-        # Step 1: Check pre-mapped commands
+        # Mapped protocol/shell commands win: they handle UWP apps (ms-stk:,
+        # outlookcal:) that have no plain executable on disk.
         cmd_to_run = cls.APP_COMMANDS.get(clean_name)
-        
-        # Step 2: If no direct command mapped, dynamically scan disk for exact executable
-        found_exe = cls.find_installed_exe(clean_name)
+        found_exe = None if cmd_to_run else cls.find_installed_exe(clean_name)
 
-        attempts = []
-        if found_exe:
-            attempts.append(f'"{found_exe}"')
+        attempts: List[str] = []
         if cmd_to_run:
             attempts.append(cmd_to_run)
-        
-        # Fallback attempt
+        if found_exe:
+            attempts.append(f'"{found_exe}"')
         attempts.append(f'start "" "{clean_name}"')
 
-        # Recursive Execution & Verification Loop
+        errors: List[str] = []
         for idx, run_cmd in enumerate(attempts, 1):
             try:
-                print(f"[Smart Launcher] Attempt {idx}: Executing '{run_cmd}'...")
-                if run_cmd.endswith('.exe"') or run_cmd.endswith('.exe'):
-                    os.startfile(run_cmd.strip('"'))
+                print(f"[Smart Launcher] Attempt {idx}: '{run_cmd}'")
+                target = run_cmd.strip('"')
+                if target.lower().endswith((".exe", ".lnk")) and os.path.exists(target):
+                    os.startfile(target)
                 else:
-                    subprocess.Popen(run_cmd, shell=True)
-                
-                time.sleep(1.2)
-                
-                # Verify process launch if exe name available
-                exe_basename = os.path.basename(found_exe) if found_exe else clean_name
-                if cls.verify_process_running(exe_basename.split('.')[0]):
-                    return {
-                        "success": True,
-                        "appName": clean_name or app_name,
-                        "command": run_cmd,
-                        "verified": True,
-                        "message": f"Successfully verified and launched {clean_name or app_name}!"
-                    }
-                else:
-                    # Non-blocking success if launched without error
-                    return {
-                        "success": True,
-                        "appName": clean_name or app_name,
-                        "command": run_cmd,
-                        "message": f"Launched {clean_name or app_name} on your desktop."
-                    }
+                    subprocess.Popen(
+                        run_cmd, shell=True,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                # No sleep + tasklist poll here: that cost 1.2s on the request
+                # thread and the result was discarded anyway. Popen raising is
+                # the real failure signal; a silent no-op is rare and cheap.
+                return {
+                    "success": True,
+                    "appName": clean_name or app_name,
+                    "command": run_cmd,
+                    "resolvedPath": found_exe,
+                    "message": f"Opening {clean_name or app_name}.",
+                }
             except Exception as e:
+                errors.append(f"{run_cmd}: {e}")
                 print(f"[Smart Launcher] Attempt {idx} failed: {e}")
 
         return {
             "success": False,
             "appName": app_name,
-            "error": "Could not verify execution",
-            "message": f"Attempted to launch {app_name}, but the executable could not be verified on your system."
+            "error": "; ".join(errors) or "Could not execute",
+            "message": (
+                f"I couldn't find '{app_name}' on this PC. "
+                f"It may not be installed, or try the exact program name."
+            ),
         }
 
 
@@ -317,47 +333,44 @@ class PlaywrightBrowserTool:
 BUZZCAF_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "BuzzcafAI")
 
 class BuzzcafAITool:
+    """
+    Legacy tool for launching BuzzcafAI Studio.
+    For full API integration, use buzzcaf_client.py instead.
+    """
     BUZZCAF_API = "http://localhost:8095"
 
     @classmethod
     def launch_buzzcaf_studio(cls) -> Dict[str, Any]:
+        """Launch the BuzzcafAI Studio application and web dashboard."""
         bat_file = os.path.join(BUZZCAF_DIR, "start_spilledCoffeeAi.bat")
+        launched_backend = False
+
         if os.path.exists(bat_file):
             try:
                 subprocess.Popen(f'cmd /c "{bat_file}"', cwd=BUZZCAF_DIR, shell=True)
-                webbrowser.open("http://localhost:3005")
+                launched_backend = True
             except Exception:
                 pass
-            return {
-                "success": True,
-                "message": "Successfully launched BuzzcafAI 115-Agent Studio Platform!"
-            }
-        else:
-            # Fallback open browser URL
-            try:
-                webbrowser.open("http://localhost:3005")
-            except Exception:
-                pass
-            return {
-                "success": True,
-                "message": "Opened BuzzcafAI Web Studio Dashboard."
-            }
 
-    @classmethod
-    def generate_channel_script(cls, channel_name: str, topic: str) -> Dict[str, Any]:
+        # Open the web dashboard
         try:
-            url = f"{cls.BUZZCAF_API}/api/v1/curate"
-            res = requests.post(url, json={"channel": channel_name, "topic": topic}, timeout=3)
-            if res.status_code == 200:
-                return res.json()
+            webbrowser.open("http://localhost:3005")
         except Exception:
             pass
 
-        # Fallback launch studio platform
-        cls.launch_buzzcaf_studio()
         return {
             "success": True,
-            "channel": channel_name,
-            "topic": topic,
-            "message": f"Dispatched BuzzcafAI 115-Agent Workforce for channel '{channel_name}' on topic '{topic}'!"
+            "launched_backend": launched_backend,
+            "dashboard_url": "http://localhost:3005",
+            "api_url": cls.BUZZCAF_API,
+            "message": "Launched BuzzcafAI 115-Agent Studio Platform!"
         }
+
+    @classmethod
+    def check_online(cls) -> bool:
+        """Check if BuzzcafAI API is online."""
+        try:
+            res = requests.get(f"{cls.BUZZCAF_API}/health", timeout=2)
+            return res.status_code == 200
+        except Exception:
+            return False

@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, MicOff, Radio, Volume2, VolumeX, Sparkles, Play, Plus, CheckCircle, Cpu, Shield, Zap, Layers, RefreshCw, ExternalLink, Activity, Tv, Calendar, Terminal, Maximize2, Minimize2, X, FolderSearch, Search, FileText } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { MicOff, Radio, Sparkles, Play, Plus, CheckCircle, Cpu, Zap, Layers, RefreshCw, ExternalLink, Tv, Calendar, Maximize2, Minimize2, X, FolderSearch, Search, FileText, Bell } from 'lucide-react';
 
 interface Task {
   id: string;
@@ -30,6 +30,21 @@ interface FileResult {
   fileName: string;
   path: string;
   sizeBytes: number;
+}
+
+interface BuzzcafProject {
+  id: string;
+  name: string;
+  brand: string;
+  current_step: string;
+  status: string;
+  workflow_name: string;
+}
+
+interface ReminderBanner {
+  id: string;
+  text: string;
+  missed?: boolean;
 }
 
 const API_BASE = 'http://localhost:8098';
@@ -66,6 +81,16 @@ export default function App() {
   const [fileResults, setFileResults] = useState<FileResult[]>([]);
   const [isSearchingFiles, setIsSearchingFiles] = useState(false);
 
+  // BuzzcafAI State
+  const [buzzcafProjects, setBuzzcafProjects] = useState<BuzzcafProject[]>([]);
+  const [buzzcafOnline, setBuzzcafOnline] = useState(false);
+  const [isExecutingStep, setIsExecutingStep] = useState(false);
+
+  // Reminders pushed from the backend scheduler over SSE
+  const [reminders, setReminders] = useState<ReminderBanner[]>([]);
+  // Live tool activity during a turn, so the user sees what Dexter is doing
+  const [toolActivity, setToolActivity] = useState<string>('');
+
   // Refs
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const recognitionRef = useRef<any>(null);
@@ -75,6 +100,16 @@ export default function App() {
   const isThinkingRef = useRef(false);
   const lastSpeechEndTimeRef = useRef<number>(0);
   const lastSpokenTextRef = useRef<string>('');
+  // Sentence-chunked audio arrives faster than it plays, so it queues up.
+  const audioQueueRef = useRef<string[]>([]);
+  const isPlayingQueueRef = useRef(false);
+  const eventSourceRef = useRef<EventSource | null>(null);
+  // Grace period after Dexter speaks during which no wake word is needed, so a
+  // follow-up ("and close it") works the way a conversation actually goes.
+  const followUpUntilRef = useRef<number>(0);
+  // SpeechRecognition handlers are registered once on mount, so calling
+  // handleSendMessage directly captured the first render's closure forever.
+  const handleSendRef = useRef<(text?: string) => void>(() => {});
 
   useEffect(() => {
     isSpeakingRef.current = isSpeaking;
@@ -99,13 +134,82 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatLog, isThinking]);
 
+  // Keep the voice handler pointing at the current render's closure.
+  useEffect(() => {
+    handleSendRef.current = handleSendMessage;
+  });
+
   useEffect(() => {
     fetchStatus();
     fetchPlanner();
     fetchOvernightQueue();
     fetchSkills();
+    fetchBuzzcafProjects();
     initSpeechRecognition();
   }, []);
+
+  // Push channel. Until this existed the backend had no way to reach the user,
+  // which is why reminders were impossible - nothing could arrive unprompted.
+  useEffect(() => {
+    let source: EventSource | null = null;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    let closed = false;
+
+    const connect = () => {
+      if (closed) return;
+      source = new EventSource(`${API_BASE}/api/dexter/events`);
+      eventSourceRef.current = source;
+
+      source.addEventListener('reminder', (evt: MessageEvent) => {
+        try {
+          const { payload } = JSON.parse(evt.data);
+          if (payload?.banner !== false) {
+            setReminders(prev => [
+              ...prev,
+              { id: payload.id || `rem-${Date.now()}`, text: payload.text, missed: payload.missed },
+            ]);
+          }
+          if (payload?.speak && !isVoiceMutedRef.current) {
+            // Flagged as a reminder so it is delivered in the urgent register.
+            speakText(payload.spoken || payload.text, 'urgent', true);
+          }
+          fetchPlanner();
+        } catch (e) {
+          console.warn('Malformed reminder event', e);
+        }
+      });
+
+      source.onerror = () => {
+        source?.close();
+        if (!closed) retry = setTimeout(connect, 4000);
+      };
+    };
+
+    connect();
+    return () => {
+      closed = true;
+      if (retry) clearTimeout(retry);
+      source?.close();
+      eventSourceRef.current = null;
+    };
+  }, []);
+
+  const dismissReminder = (id: string) => {
+    setReminders(prev => prev.filter(r => r.id !== id));
+  };
+
+  const snoozeReminder = async (reminder: ReminderBanner) => {
+    dismissReminder(reminder.id);
+    try {
+      await fetch(`${API_BASE}/api/dexter/reminders`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: reminder.text, when: 'in 10 minutes' }),
+      });
+    } catch (e) {
+      console.warn('Could not snooze reminder', e);
+    }
+  };
 
   // Futuristic Canvas Particle Brain Animation Loop
   useEffect(() => {
@@ -182,8 +286,14 @@ export default function App() {
   }, [isSpeaking, isThinking]);
 
   const stopSpeaking = () => {
+    // Drop anything still queued, otherwise "stop" only silences the current
+    // chunk and the next one starts playing a moment later.
+    audioQueueRef.current = [];
+    isPlayingQueueRef.current = false;
     if (audioRef.current) {
       try {
+        audioRef.current.onended = null;
+        audioRef.current.onerror = null;
         audioRef.current.pause();
         audioRef.current.currentTime = 0;
       } catch (e) {}
@@ -236,11 +346,15 @@ export default function App() {
 
           const lowerText = rawText.toLowerCase();
 
-          // ── Wake Word Filtering: Must include "Dexter" ──
+          // ── Wake word, with a conversational follow-up window ──
           const WAKE_WORDS = ["dexter", "hey dexter", "ok dexter", "okay dexter", "hi dexter"];
           const hasWakeWord = WAKE_WORDS.some(w => lowerText.includes(w));
+          // Right after Dexter finishes speaking, accept a follow-up without the
+          // wake word. Saying "Dexter" before every single sentence is the main
+          // thing that made this feel like a command line rather than a chat.
+          const inFollowUp = Date.now() < followUpUntilRef.current;
 
-          if (!hasWakeWord) {
+          if (!hasWakeWord && !inFollowUp) {
             console.log('[Wake Word Filter] Ignored ambient speech (no "Dexter" detected):', rawText);
             return;
           }
@@ -263,7 +377,9 @@ export default function App() {
             return;
           }
 
-          handleSendMessage(cleanCommand);
+          // Consumed - a follow-up must be earned by Dexter replying again.
+          followUpUntilRef.current = 0;
+          handleSendRef.current(cleanCommand);
         }
       };
 
@@ -355,6 +471,91 @@ export default function App() {
     } catch (e) {}
   };
 
+  const fetchBuzzcafProjects = async () => {
+    try {
+      const statusRes = await fetch(`${API_BASE}/api/dexter/buzzcaf/health`);
+      const statusData = await statusRes.json();
+      setBuzzcafOnline(statusData.online || false);
+
+      if (statusData.online) {
+        const res = await fetch(`${API_BASE}/api/dexter/buzzcaf/projects`);
+        const data = await res.json();
+        setBuzzcafProjects(data || []);
+      }
+    } catch (e) {
+      setBuzzcafOnline(false);
+    }
+  };
+
+  const handleExecuteBuzzcafStep = async (projectId: string) => {
+    setIsExecutingStep(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/dexter/buzzcaf/projects/${projectId}/execute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      });
+      const data = await res.json();
+      fetchBuzzcafProjects();
+      setChatLog(prev => [...prev, {
+        id: `bz-${Date.now()}`,
+        sender: 'dexter',
+        text: `Executed step on "${data.name || projectId}". Current step: ${data.current_step || 'Unknown'}`
+      }]);
+    } catch (e) {
+      setChatLog(prev => [...prev, {
+        id: `bz-err-${Date.now()}`,
+        sender: 'dexter',
+        text: 'Failed to execute BuzzcafAI step.'
+      }]);
+    }
+    setIsExecutingStep(false);
+  };
+
+  const [isStartingBuzzcaf, setIsStartingBuzzcaf] = useState(false);
+
+  const handleStartBuzzcaf = async () => {
+    setIsStartingBuzzcaf(true);
+    setChatLog(prev => [...prev, {
+      id: `bz-start-${Date.now()}`,
+      sender: 'dexter',
+      text: 'Starting BuzzcafAI Studio... This may take a moment.'
+    }]);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/dexter/buzzcaf/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' }
+      });
+      const data = await res.json();
+
+      if (data.ready) {
+        setBuzzcafOnline(true);
+        fetchBuzzcafProjects();
+        setChatLog(prev => [...prev, {
+          id: `bz-ready-${Date.now()}`,
+          sender: 'dexter',
+          text: 'BuzzcafAI Studio is now online! You can create video projects.'
+        }]);
+      } else {
+        setChatLog(prev => [...prev, {
+          id: `bz-starting-${Date.now()}`,
+          sender: 'dexter',
+          text: data.message || 'BuzzcafAI is starting up...'
+        }]);
+        // Check again after a few seconds
+        setTimeout(fetchBuzzcafProjects, 5000);
+      }
+    } catch (e) {
+      setChatLog(prev => [...prev, {
+        id: `bz-err-${Date.now()}`,
+        sender: 'dexter',
+        text: 'Failed to start BuzzcafAI. Check if the application is installed correctly.'
+      }]);
+    }
+    setIsStartingBuzzcaf(false);
+  };
+
   const handleSendMessage = async (customText?: string) => {
     const textToSend = customText || inputMsg;
     if (!textToSend.trim()) return;
@@ -366,40 +567,146 @@ export default function App() {
     setChatLog(prev => [...prev, userMsg]);
     setInputMsg('');
     setIsThinking(true);
+    setToolActivity('');
+    audioQueueRef.current = [];
+
+    const speakEnabled = !isVoiceMutedRef.current;
 
     try {
-      const res = await fetch(`${API_BASE}/api/dexter/chat`, {
+      // Streaming endpoint: the reply lands as soon as it is ready and each
+      // spoken chunk follows as it finishes synthesising, so audio starts in a
+      // few hundred ms instead of after the whole response is voiced.
+      const res = await fetch(`${API_BASE}/api/dexter/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: textToSend, provider })
+        body: JSON.stringify({ message: textToSend, provider, voiceEnabled: speakEnabled }),
       });
-      const data = await res.json();
+
+      if (!res.ok || !res.body) throw new Error(`Chat failed: ${res.status}`);
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let gotReply = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE frames are separated by a blank line.
+        const frames = buffer.split('\n\n');
+        buffer = frames.pop() || '';
+
+        for (const frame of frames) {
+          const dataLine = frame.split('\n').find(l => l.startsWith('data:'));
+          if (!dataLine) continue;
+
+          let evt: any;
+          try {
+            evt = JSON.parse(dataLine.slice(5).trim());
+          } catch {
+            continue;
+          }
+
+          if (evt.type === 'tool_start') {
+            setToolActivity(String(evt.payload?.name || '').replace(/_/g, ' '));
+          } else if (evt.type === 'reply') {
+            gotReply = true;
+            setIsThinking(false);
+            setToolActivity('');
+            lastSpokenTextRef.current = evt.payload.reply || '';
+            setChatLog(prev => [...prev, {
+              id: `d-${Date.now()}`,
+              sender: 'dexter' as const,
+              text: evt.payload.reply,
+              action: evt.payload.action,
+            }]);
+            fetchPlanner();
+            fetchOvernightQueue();
+            fetchSkills();
+            fetchBuzzcafProjects();
+          } else if (evt.type === 'audio' && speakEnabled) {
+            enqueueAudio(evt.payload.url);
+          } else if (evt.type === 'error') {
+            setChatLog(prev => [...prev, {
+              id: `err-${Date.now()}`,
+              sender: 'dexter' as const,
+              text: `Something went wrong: ${evt.payload?.message || 'unknown error'}`,
+            }]);
+          }
+        }
+      }
 
       setIsThinking(false);
-      const dexterMsg = { id: `d-${Date.now()}`, sender: 'dexter' as const, text: data.reply, action: data.action };
-      setChatLog(prev => [...prev, dexterMsg]);
-
-      // Refresh all widgets
-      fetchPlanner();
-      fetchOvernightQueue();
-      fetchSkills();
-
-      // Speak response if voice is active
-      if (!isVoiceMutedRef.current) {
-        speakText(data.reply);
-      } else {
+      setToolActivity('');
+      // Voice off, or nothing queued to speak: resume listening immediately.
+      if (!speakEnabled || (gotReply && audioQueueRef.current.length === 0 && !isPlayingQueueRef.current)) {
         startListening();
       }
     } catch (err: any) {
       setIsThinking(false);
-      setChatLog(prev => [...prev, { id: `err-${Date.now()}`, sender: 'dexter', text: 'Error connecting to Dexter Backend Server.' }]);
+      setToolActivity('');
+      setChatLog(prev => [...prev, {
+        id: `err-${Date.now()}`,
+        sender: 'dexter' as const,
+        text: 'Error connecting to Dexter Backend Server.',
+      }]);
       startListening();
     }
   };
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  const speakText = async (text: string) => {
+  // ── Sequential playback of streamed speech chunks ──
+
+  const FOLLOW_UP_WINDOW_MS = 9000;
+
+  const finishSpeaking = () => {
+    isPlayingQueueRef.current = false;
+    setIsSpeaking(false);
+    isSpeakingRef.current = false;
+    lastSpeechEndTimeRef.current = Date.now();
+    // Dexter just spoke, so a reply is expected - drop the wake-word
+    // requirement briefly to allow a natural follow-up.
+    followUpUntilRef.current = Date.now() + FOLLOW_UP_WINDOW_MS;
+    setTimeout(() => {
+      if (!isVoiceMutedRef.current && !isSpeakingRef.current && !isThinkingRef.current) {
+        startListening();
+      }
+    }, 1200);
+  };
+
+  const playNextChunk = () => {
+    const next = audioQueueRef.current.shift();
+    if (!next) {
+      finishSpeaking();
+      return;
+    }
+
+    const audio = new Audio(next.startsWith('http') ? next : `${API_BASE}${next}`);
+    audioRef.current = audio;
+    audio.onended = playNextChunk;
+    audio.onerror = playNextChunk;
+    audio.play().catch(() => playNextChunk());
+  };
+
+  const enqueueAudio = (url: string) => {
+    if (!url || isVoiceMutedRef.current) return;
+    audioQueueRef.current.push(url);
+    if (isPlayingQueueRef.current) return;
+
+    isPlayingQueueRef.current = true;
+    stopListening();
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort(); } catch (e) {}
+    }
+    setIsSpeaking(true);
+    isSpeakingRef.current = true;
+    playNextChunk();
+  };
+
+  const speakText = async (text: string, emotion?: string, isReminder = false) => {
     if (isVoiceMutedRef.current) {
       startListening();
       return;
@@ -422,7 +729,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/dexter/tts/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, voiceKey: 'michael' })
+        body: JSON.stringify({ text, voiceKey: 'michael', emotion, isReminder }),
       });
 
       if (!res.ok) throw new Error('TTS fetch failed');
@@ -437,7 +744,12 @@ export default function App() {
       const audio = new Audio(audioUrl);
       audioRef.current = audio;
 
+      // Every spoken reply used to leak its blob URL for the lifetime of the
+      // session; release it once playback settles either way.
+      const release = () => URL.revokeObjectURL(audioUrl);
+
       audio.onended = () => {
+        release();
         setIsSpeaking(false);
         isSpeakingRef.current = false;
         lastSpeechEndTimeRef.current = Date.now();
@@ -450,6 +762,7 @@ export default function App() {
       };
 
       audio.onerror = () => {
+        release();
         setIsSpeaking(false);
         isSpeakingRef.current = false;
         lastSpeechEndTimeRef.current = Date.now();
@@ -560,7 +873,61 @@ export default function App() {
 
   return (
     <div style={{ padding: '14px', maxWidth: isExpanded ? '1440px' : '460px', margin: '0 auto', transition: 'max-width 0.3s ease' }}>
-      
+
+      {/* Reminders pushed from the scheduler. One of three delivery channels -
+          the others are the spoken reply and a native Windows toast. */}
+      {reminders.length > 0 && (
+        <div style={{ marginBottom: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          {reminders.map(reminder => (
+            <div
+              key={reminder.id}
+              className="dexter-panel brain-active-pulse"
+              style={{
+                padding: '12px 14px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '10px',
+                border: '1px solid rgba(251, 191, 36, 0.5)',
+                background: 'rgba(251, 191, 36, 0.12)',
+              }}
+            >
+              <Bell size={18} style={{ color: '#fbbf24', flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: '9px', color: '#fbbf24', fontWeight: 700, letterSpacing: '0.5px' }}>
+                  {reminder.missed ? 'MISSED REMINDER' : 'REMINDER'}
+                </div>
+                <div style={{ fontSize: '13px', color: '#f8fafc', wordBreak: 'break-word' }}>
+                  {reminder.text}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => snoozeReminder(reminder)}
+                style={{
+                  background: 'rgba(148, 163, 184, 0.15)', color: '#cbd5e1',
+                  border: '1px solid rgba(148, 163, 184, 0.3)', padding: '5px 10px',
+                  borderRadius: '8px', fontSize: '11px', flexShrink: 0,
+                }}
+                title="Remind me again in 10 minutes"
+              >
+                Snooze
+              </button>
+              <button
+                type="button"
+                onClick={() => dismissReminder(reminder.id)}
+                style={{
+                  background: 'rgba(16, 185, 129, 0.2)', color: '#10b981',
+                  border: '1px solid rgba(16, 185, 129, 0.4)', padding: '5px 10px',
+                  borderRadius: '8px', fontSize: '11px', fontWeight: 700, flexShrink: 0,
+                }}
+              >
+                Done
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Frameless Desktop Window Title Bar */}
       <header className="dexter-panel dexter-header" style={{ padding: '10px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '14px', appRegion: 'drag' } as any}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
@@ -670,7 +1037,9 @@ export default function App() {
               {isThinking && (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '6px', color: '#a855f7', fontSize: '11px', fontWeight: 600, background: 'rgba(168, 85, 247, 0.1)', padding: '8px 12px', borderRadius: '10px', width: 'fit-content' }}>
                   <RefreshCw className="brain-active-pulse" size={12} />
-                  <span>Dexter is reasoning & executing tools...</span>
+                  {/* Naming the running tool turns a generic spinner into real
+                      feedback about what Dexter is actually doing. */}
+                  <span>{toolActivity ? `Running ${toolActivity}...` : 'Dexter is thinking...'}</span>
                 </div>
               )}
               <div ref={chatEndRef} />
@@ -799,10 +1168,115 @@ export default function App() {
           </div>
         )}
 
-        {/* EXPANDED RIGHT COLUMN: spilledCoffeeAI Queue, App Launcher & Skills (Visible when expanded) */}
+        {/* EXPANDED RIGHT COLUMN: BuzzcafAI Projects, spilledCoffeeAI Queue, App Launcher & Skills (Visible when expanded) */}
         {isExpanded && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            
+
+            {/* BuzzcafAI Projects Panel */}
+            <div className="dexter-panel" style={{ padding: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+                <h3 style={{ fontSize: '13px', color: '#10b981', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <Cpu size={15} /> BuzzcafAI Projects
+                </h3>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{
+                    width: '8px',
+                    height: '8px',
+                    borderRadius: '50%',
+                    background: buzzcafOnline ? '#10b981' : '#ef4444'
+                  }} />
+                  <span style={{ fontSize: '10px', color: buzzcafOnline ? '#10b981' : '#ef4444' }}>
+                    {buzzcafOnline ? 'Online' : 'Offline'}
+                  </span>
+                </div>
+              </div>
+
+              {!buzzcafOnline ? (
+                <div style={{ fontSize: '11px', color: '#94a3b8', padding: '10px', background: 'rgba(15, 23, 42, 0.6)', borderRadius: '8px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                  <span>BuzzcafAI Studio is offline.</span>
+                  <button
+                    type="button"
+                    onClick={handleStartBuzzcaf}
+                    disabled={isStartingBuzzcaf}
+                    style={{
+                      background: 'rgba(16, 185, 129, 0.2)',
+                      color: '#10b981',
+                      border: '1px solid rgba(16, 185, 129, 0.4)',
+                      padding: '6px 12px',
+                      borderRadius: '8px',
+                      fontSize: '11px',
+                      fontWeight: 700,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '6px',
+                      cursor: isStartingBuzzcaf ? 'wait' : 'pointer'
+                    }}
+                  >
+                    {isStartingBuzzcaf ? (
+                      <><RefreshCw size={12} className="brain-active-pulse" /> Starting...</>
+                    ) : (
+                      <><Zap size={12} /> Start BuzzcafAI Studio</>
+                    )}
+                  </button>
+                </div>
+              ) : buzzcafProjects.length === 0 ? (
+                <div style={{ fontSize: '11px', color: '#94a3b8', padding: '10px', background: 'rgba(15, 23, 42, 0.6)', borderRadius: '8px' }}>
+                  No projects yet. Say "start a video about [topic]" to create one!
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', maxHeight: '180px', overflowY: 'auto' }}>
+                  {buzzcafProjects.slice(0, 5).map(project => (
+                    <div key={project.id} style={{
+                      background: 'rgba(15, 23, 42, 0.6)',
+                      padding: '10px',
+                      borderRadius: '8px',
+                      border: project.status === 'completed' ? '1px solid rgba(16, 185, 129, 0.3)' : '1px solid rgba(56, 189, 248, 0.3)'
+                    }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '4px' }}>
+                        <div style={{ fontSize: '11px', fontWeight: 700, color: '#f8fafc' }}>{project.name}</div>
+                        <span style={{
+                          fontSize: '9px',
+                          padding: '2px 6px',
+                          borderRadius: '4px',
+                          background: project.status === 'completed' ? 'rgba(16, 185, 129, 0.2)' : 'rgba(56, 189, 248, 0.2)',
+                          color: project.status === 'completed' ? '#10b981' : '#38bdf8'
+                        }}>
+                          {project.status}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: '10px', color: '#94a3b8', marginBottom: '6px' }}>
+                        {project.brand} • Step: {project.current_step}
+                      </div>
+                      {project.status !== 'completed' && (
+                        <button
+                          type="button"
+                          onClick={() => handleExecuteBuzzcafStep(project.id)}
+                          disabled={isExecutingStep}
+                          style={{
+                            background: 'rgba(16, 185, 129, 0.2)',
+                            color: '#10b981',
+                            border: '1px solid rgba(16, 185, 129, 0.4)',
+                            padding: '4px 8px',
+                            borderRadius: '6px',
+                            fontSize: '10px',
+                            fontWeight: 700,
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            cursor: isExecutingStep ? 'wait' : 'pointer'
+                          }}
+                        >
+                          {isExecutingStep ? <RefreshCw size={10} className="brain-active-pulse" /> : <Play size={10} />}
+                          {isExecutingStep ? 'Running...' : 'Run Next Step'}
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
             {/* spilledCoffeeAI Queue */}
             <div className="dexter-panel" style={{ padding: '16px' }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>

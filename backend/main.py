@@ -1,357 +1,712 @@
+"""
+Dexter AI Super Assistant - HTTP engine.
+
+The chat endpoint used to be a 310-line keyword waterfall in which the language
+model was the last branch and could not call a single tool. Intent handling now
+lives in router.py (three tiers) and capabilities live in the tool registry, so
+this module is only transport: endpoints, lifecycle, and streaming.
+"""
+
+import asyncio
 import os
 import sys
-import json
-import time
-import urllib.parse
+import threading
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional
 
-# Ensure backend directory is in python path
+# Ensure backend directory is importable when launched from anywhere.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Load .env if python-dotenv available
 try:
     from dotenv import load_dotenv
-    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
+    load_dotenv(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    )
 except ImportError:
     pass
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
 
-from hybrid_llm import HybridLLMRouter
-from spilled_coffee_controller import SpilledCoffeeAIController
-from skill_engine import DexterSkillEngine
-from dexter_tools import DayPlannerTool, YouTubeMusicTool, AppLauncherTool, PlaywrightBrowserTool, StickyNotesTool, BuzzcafAITool
-from fastapi.responses import FileResponse
+import app_index
+import google_tools
+import media_tools
+import router as intent_router
+import tools_assistant  # noqa: F401  - registers reminder/memory tools
+import windows_tools
+from buzzcaf_client import buzzcaf_client
+from dexter_tools import AppLauncherTool, PlaywrightBrowserTool
+from events import bus
 from filesystem_tool import FileSystemTool
-from voice_engine import DexterVoiceEngine
+from hybrid_llm import llm_router
+from memory import memory
+from scheduler import scheduler
+from skill_engine import DexterSkillEngine
+from tool_registry import all_tools
+from tools_core import day_planner, spilled_coffee, sticky_notes, youtube_tool
+from voice_engine import DexterVoiceEngine, split_sentences
 
-app = FastAPI(title="Dexter AI Super Assistant Engine", version="1.3.0")
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AUDIO_DIR = os.path.join(ROOT_DIR, "data", "audio")
 
+skill_engine = DexterSkillEngine(llm_router)
+voice_engine = DexterVoiceEngine()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Warm every index in the background so the first request is not the slow one."""
+    bus.bind_loop(asyncio.get_running_loop())
+
+    removed = skill_engine.purge_invalid()
+    if removed:
+        print(f"[Startup] Removed {len(removed)} auto-generated junk skill(s).")
+
+    app_index.build_async()
+    await run_in_threadpool(intent_router.build_intent_index)
+
+    # Warm the health caches off the request path. Otherwise the very first
+    # /status pays for every provider probe at once (~6s) while the UI waits.
+    def _warm_health() -> None:
+        try:
+            llm_router.get_available_providers(force=True)
+            buzzcaf_client.health_check(force=True)
+        except Exception as exc:
+            print(f"[Startup] Health warm-up skipped: {exc}")
+
+    threading.Thread(target=_warm_health, name="dexter-health-warm", daemon=True).start()
+
+    scheduler.start()
+    armed = scheduler.rearm_planner()
+    if armed:
+        print(f"[Startup] Armed {armed} planner reminder(s).")
+
+    print(f"[Startup] Dexter ready with {len(all_tools())} tools.")
+    yield
+    scheduler.shutdown()
+
+
+app = FastAPI(title="Dexter AI Super Assistant Engine", version="2.0.0", lifespan=lifespan)
+
+# The frontend is served from three different shells (Vite dev server, the
+# backend's own static mount, and Electron's file:// origin which reports
+# "null"). Wide-open CORS is unnecessary now that the origins are known.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|null|file://.*)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-llm_router = HybridLLMRouter()
-spilled_coffee = SpilledCoffeeAIController(llm_router)
-skill_engine = DexterSkillEngine(llm_router)
-day_planner = DayPlannerTool()
-youtube_tool = YouTubeMusicTool()
-voice_engine = DexterVoiceEngine()
-sticky_notes = StickyNotesTool()
+
+# ───────────────────────── models ─────────────────────────
+
 
 class ChatRequest(BaseModel):
     message: str
     provider: Optional[str] = "auto"
     model: Optional[str] = None
     voiceEnabled: Optional[bool] = True
-    voiceKey: Optional[str] = "christopher"
+    voiceKey: Optional[str] = "michael"
+    session: Optional[str] = "default"
+
 
 class AddTaskRequest(BaseModel):
     title: str
     time: Optional[str] = "12:00 PM"
 
+
 class LaunchAppRequest(BaseModel):
     appName: str
 
+
 class BrowseRequest(BaseModel):
     url: str
+
 
 class FileSearchRequest(BaseModel):
     query: str
     path: Optional[str] = None
 
+
 class FileReadRequest(BaseModel):
     path: str
+
 
 class FileWriteRequest(BaseModel):
     path: str
     content: str
 
+
 class FileOpenRequest(BaseModel):
     path: str
+
+
+class CreateFolderRequest(BaseModel):
+    path: str
+
 
 class CurateRequest(BaseModel):
     niche: Optional[str] = "AI Tech & Viral Trends"
     count: Optional[int] = 3
 
+
 class TTSRequest(BaseModel):
     text: str
-    voiceKey: Optional[str] = "christopher"
+    voiceKey: Optional[str] = "michael"
+    emotion: Optional[str] = None
+    isReminder: Optional[bool] = False
 
-def _speech_url(text: str) -> str:
-    """Build a safe speech URL for continuous audio output."""
-    clean = text[:200].rsplit(" ", 1)[0] if len(text) > 200 else text
-    return f"https://translate.google.com/translate_tts?ie=UTF-8&q={urllib.parse.quote(clean)}&tl=en&client=tw-ob"
-
-# ───────── Intent keywords (ordered specific → broad) ─────────
-BUZZCAF_KEYWORDS       = ["buzzcaf", "buzzcafai", "spilled coffee studio", "beyond3baje studio", "agent studio", "115 agents", "channel agents"]
-FOLDER_CREATE_KEYWORDS = ["create folder", "make folder", "new folder", "create directory", "make directory", "new directory"]
-STICKY_NOTE_KEYWORDS   = ["sticky note", "add note", "create note", "take a note", "write note", "my notes", "notes"]
-CALENDAR_KEYWORDS      = ["calendar", "schedule my day", "add task", "schedule event", "add event", "book time", "schedule"]
-PLANNER_KEYWORDS       = ["plan my day", "agenda", "schedule", "my tasks", "today's plan", "daily plan"]
-CURATE_KEYWORDS        = ["curate", "video title", "spilledcoffee", "overnight content", "generate titles"]
-YOUTUBE_KEYWORDS       = ["play ", "youtube", "search for", "play song", "play music", "play video"]
-BROWSE_KEYWORDS        = ["go to ", "browse ", "navigate ", "open website", "open url", "visit "]
-FILESYS_KEYWORDS       = ["find file", "search file", "read file", "open folder", "search folder"]
-LAUNCH_KEYWORDS        = ["open ", "launch ", "start app"]
-
-@app.get("/api/dexter/status")
-def get_status():
-    providers = llm_router.get_available_providers()
-    skills = skill_engine.list_skills()
-    planner = day_planner.get_agenda()
-    overnight = spilled_coffee.get_overnight_content()
-    notes = sticky_notes.list_notes()
-    
-    return {
-        "status": "online",
-        "assistantName": "Dexter Super Assistant",
-        "providers": providers,
-        "skillsCount": len(skills),
-        "tasksCount": len(planner.get("tasks", [])),
-        "overnightQueueCount": len(overnight),
-        "notesCount": len(notes)
-    }
-
-@app.post("/api/dexter/chat")
-def process_chat(req: ChatRequest):
-    msg = req.message.strip().lower()
-
-    # ── 0. BuzzcafAI 115-Agent Studio Platform Control ──
-    if any(k in msg for k in BUZZCAF_KEYWORDS):
-        if any(w in msg for w in ["open", "launch", "start"]):
-            res = BuzzcafAITool.launch_buzzcaf_studio()
-            reply = "Launched BuzzcafAI 115-Agent Studio Platform! You can now manage all 5 YouTube channel brands."
-            return {"reply": reply, "action": "launch_buzzcaf", "details": res, "speechUrl": _speech_url(reply)}
-        else:
-            res = BuzzcafAITool.generate_channel_script("Beyond3Baje", msg)
-            reply = "Connected to BuzzcafAI Studio! Dispatched writing agents for channel production."
-            return {"reply": reply, "action": "buzzcaf_control", "details": res, "speechUrl": _speech_url(reply)}
-
-    # ── 0. Folder & Directory Creation ──
-    if any(k in msg for k in FOLDER_CREATE_KEYWORDS):
-        import re
-        folder_name = re.sub(r'^(dexter\s+)?(create folder|make folder|new folder|create directory|make directory|new directory)\s*(named|called|for)?\s*', '', msg, flags=re.IGNORECASE).strip()
-        if not folder_name:
-            folder_name = "New_Dexter_Folder"
-        
-        folder_res = FileSystemTool.create_folder(folder_name)
-        reply = f"Created folder '{os.path.basename(folder_res['folderPath'])}' and opened it in File Explorer!"
-        return {"reply": reply, "action": "create_folder", "details": folder_res, "speechUrl": _speech_url(reply)}
-
-    # ── 1. Sticky Notes Integration ──
-    if any(k in msg for k in STICKY_NOTE_KEYWORDS):
-        import re
-        note_content = re.sub(r'^(dexter\s+)?(add note|create note|take a note|write note|sticky note)\s*(to|that|saying)?\s*', '', msg, flags=re.IGNORECASE).strip()
-        if not note_content or note_content in ["my notes", "sticky notes", "show notes", "open notes"]:
-            notes = sticky_notes.list_notes()
-            AppLauncherTool.launch_app("sticky notes")
-            reply = f"You have {len(notes)} sticky notes. Opened Windows Sticky Notes for you." if notes else "Opened Windows Sticky Notes."
-            return {"reply": reply, "action": "list_notes", "details": notes, "speechUrl": _speech_url(reply)}
-        else:
-            new_note = sticky_notes.create_note(note_content)
-            reply = f"Created sticky note: '{note_content}' and launched Sticky Notes!"
-            return {"reply": reply, "action": "create_note", "details": new_note, "speechUrl": _speech_url(reply)}
-
-    # ── 2. Calendar & Day Scheduling ──
-    if any(k in msg for k in CALENDAR_KEYWORDS):
-        import re
-        if "open calendar" in msg or "show calendar" in msg:
-            AppLauncherTool.launch_app("calendar")
-            reply = "Opened Windows Calendar for you."
-            return {"reply": reply, "action": "open_calendar", "speechUrl": _speech_url(reply)}
-        
-        task_title = re.sub(r'^(dexter\s+)?(schedule|add task|add event|book time|calendar)\s*(to|that|saying)?\s*', '', msg, flags=re.IGNORECASE).strip()
-        if task_title:
-            new_task = day_planner.add_task(task_title)
-            AppLauncherTool.launch_app("calendar")
-            reply = f"Scheduled '{task_title}' in your day planner and opened Windows Calendar!"
-            return {"reply": reply, "action": "schedule_event", "details": new_task, "speechUrl": _speech_url(reply)}
-
-    # ── 3. Day Planning & Agenda ──
-    if any(k in msg for k in PLANNER_KEYWORDS):
-        agenda = day_planner.get_agenda()
-        task_list = [f"{t['time']} - {t['title']}" for t in agenda.get("tasks", [])]
-        reply = "Here is your agenda for today: " + ", ".join(task_list[:4]) + "." if task_list else "Your agenda is empty. Add some tasks!"
-        return {"reply": reply, "action": "get_agenda", "details": agenda, "speechUrl": _speech_url(reply)}
-
-    # ── 2. SpilledCoffeeAI Overnight Content Curation ──
-    if any(k in msg for k in CURATE_KEYWORDS):
-        curate_res = spilled_coffee.run_overnight_curation(count=3)
-        reply = f"I have curated {curate_res['count']} viral video titles and script outlines for SpilledCoffeeAI! They are ready in your dashboard."
-        return {"reply": reply, "action": "curate_content", "details": curate_res, "speechUrl": _speech_url(reply)}
-
-    # ── 3. YouTube & Music Playback ──
-    if any(k in msg for k in YOUTUBE_KEYWORDS):
-        import re
-        song_query = msg
-        # Clean leading action words
-        song_query = re.sub(r'^(i asked it to |please |can you |could you |search for |search |play |find |show me |look up |open |watch )+(the )?(channel )?(video )?(song )?', '', song_query, flags=re.IGNORECASE).strip()
-        # Clean trailing YouTube / platform phrases
-        song_query = re.sub(r'\s+(on youtube|youtube channel|youtube video|youtube|channel|video|song|music|please).*$', '', song_query, flags=re.IGNORECASE).strip()
-        
-        # Phonetic auto-correction for Hinglish / STT mishearings (e.g. 'beyond teen bajaj' / 'beyond 3 baje' -> 'beyond3baje')
-        clean_check = song_query.lower()
-        if "beyond" in clean_check and ("teen" in clean_check or "3" in clean_check or "bajaj" in clean_check or "baje" in clean_check):
-            song_query = "beyond3baje"
-
-        if song_query:
-            yt_res = youtube_tool.search_and_play(song_query)
-            reply = f"Searching and playing '{song_query}' on YouTube now!"
-            return {"reply": reply, "action": "play_youtube", "details": yt_res, "speechUrl": _speech_url(reply)}
-
-    # ── 4. Web Browsing via Playwright ──
-    if any(k in msg for k in BROWSE_KEYWORDS):
-        url_target = msg
-        for strip_word in ["go to ", "browse ", "navigate ", "open website ", "open url ", "visit "]:
-            url_target = url_target.replace(strip_word, "")
-        url_target = url_target.strip()
-        browse_res = PlaywrightBrowserTool.browse_url(url_target)
-        reply = f"Opening {url_target} in your browser now."
-        return {"reply": reply, "action": "browse_url", "details": browse_res, "speechUrl": _speech_url(reply)}
-
-    # ── 5. File System Commands ──
-    if any(k in msg for k in FILESYS_KEYWORDS):
-        file_query = msg
-        for strip_word in ["find file ", "search file ", "read file ", "open folder ", "search folder "]:
-            file_query = file_query.replace(strip_word, "")
-        file_query = file_query.strip()
-        fs_res = FileSystemTool.search_files(file_query)
-        count = fs_res.get("count", 0)
-        reply = f"Found {count} files matching '{file_query}' on your system." if count > 0 else f"No files matching '{file_query}' were found."
-        return {"reply": reply, "action": "search_files", "details": fs_res, "speechUrl": _speech_url(reply)}
-
-    # ── 6. App Launching ──
-    if any(k in msg for k in LAUNCH_KEYWORDS):
-        import re
-        # Clean leading action words
-        app_target = re.sub(r'^(i asked it to |please |can you |could you )?(open|launch|start|run)\s+(the\s+)?(app\s+)?', '', msg, flags=re.IGNORECASE).strip()
-        # Clean trailing filler words
-        app_target = re.sub(r'\s+(on my pc|on my computer|for me|app|application|please).*$', '', app_target, flags=re.IGNORECASE).strip()
-        
-        if app_target:
-            launch_res = AppLauncherTool.launch_app(app_target)
-            if launch_res.get("success"):
-                reply = f"I have launched {launch_res.get('appName', app_target)} for you on your desktop!"
-            else:
-                reply = f"I tried to launch {app_target}, but ran into an issue: {launch_res.get('error', 'App not found')}."
-            return {"reply": reply, "action": "launch_app", "details": launch_res, "speechUrl": _speech_url(reply)}
-
-    # ── 7. Check learned skills for a matching trigger ──
-    matched_skill = skill_engine.match_skill(msg)
-    if matched_skill:
-        skill_reply = f"I found a learned skill '{matched_skill['name']}' that matches your request. Executing steps: {', '.join(matched_skill.get('steps', [])[:3])}"
-        return {"reply": skill_reply, "action": "skill_match", "details": matched_skill, "speechUrl": _speech_url(skill_reply)}
-
-    # ── 8. Hybrid LLM Reasoning Engine (fallback) ──
-    system_prompt = (
-        "You are Dexter, an intelligent, ultra-smart personal AI super assistant. "
-        "Be extremely concise, direct, and precise. "
-        "Keep answers brief (1 to 2 sentences max) unless detailed information is explicitly requested. "
-        "Never use conversational fluff or filler text."
-    )
-    llm_reply = llm_router.generate(req.message, system_prompt=system_prompt, provider=req.provider, model=req.model)
-
-    # Auto-learn skill only if substantive multi-step task — use a unique name based on timestamp
-    if len(msg.split()) > 8:
-        skill_name = f"task_{int(time.time())}"
-        skill_engine.learn_skill_from_task(skill_name, req.message, [req.message, llm_reply[:80]])
-
-    return {"reply": llm_reply, "action": "chat_response", "speechUrl": _speech_url(llm_reply)}
-
-@app.get("/api/dexter/planner")
-def get_planner():
-    return day_planner.get_agenda()
-
-@app.post("/api/dexter/planner/add")
-def add_planner_task(req: AddTaskRequest):
-    return day_planner.add_task(req.title, req.time)
-
-@app.post("/api/dexter/planner/toggle/{task_id}")
-def toggle_planner_task(task_id: str):
-    success = day_planner.toggle_task(task_id)
-    return {"success": success}
-
-@app.get("/api/dexter/spilledcoffee/overnight-queue")
-def get_spilled_coffee_queue():
-    return spilled_coffee.get_overnight_content()
-
-@app.post("/api/dexter/spilledcoffee/curate")
-def curate_spilled_coffee(req: CurateRequest):
-    return spilled_coffee.run_overnight_curation(niche_topic=req.niche or "AI Tech & Viral Trends", count=req.count or 3)
-
-@app.get("/api/dexter/skills")
-def get_skills():
-    return skill_engine.list_skills()
-
-@app.post("/api/dexter/system/launch")
-def launch_system_app(req: LaunchAppRequest):
-    return AppLauncherTool.launch_app(req.appName)
-
-@app.post("/api/dexter/browser/navigate")
-def browse_url(req: BrowseRequest):
-    return PlaywrightBrowserTool.browse_url(req.url)
-
-@app.post("/api/dexter/filesystem/search")
-def search_files(req: FileSearchRequest):
-    return FileSystemTool.search_files(req.query, req.path)
-
-@app.post("/api/dexter/filesystem/read")
-def read_file(req: FileReadRequest):
-    return FileSystemTool.read_file(req.path)
-
-@app.post("/api/dexter/filesystem/write")
-def write_file(req: FileWriteRequest):
-    return FileSystemTool.write_file(req.path, req.content)
-
-class CreateFolderRequest(BaseModel):
-    path: str
-
-@app.post("/api/dexter/filesystem/create-folder")
-def create_folder(req: CreateFolderRequest):
-    return FileSystemTool.create_folder(req.path)
-
-@app.post("/api/dexter/filesystem/open")
-def open_file_path(req: FileOpenRequest):
-    return FileSystemTool.open_local_path(req.path)
-
-@app.post("/api/dexter/tts/generate")
-def generate_expressive_tts(req: TTSRequest):
-    file_path = voice_engine.generate_speech(req.text, req.voiceKey or "christopher")
-    return FileResponse(file_path, media_type="audio/mpeg")
 
 class CreateNoteRequest(BaseModel):
     content: str
     title: Optional[str] = "Sticky Note"
 
+
+class ReminderRequest(BaseModel):
+    text: str
+    when: str
+    channels: Optional[List[str]] = None
+
+
+class RememberRequest(BaseModel):
+    key: str
+    value: str
+
+
+class BuzzcafProjectRequest(BaseModel):
+    name: str
+    brand: str
+    workflow_name: Optional[str] = "full_video_workflow"
+
+
+class BuzzcafFeedbackRequest(BaseModel):
+    feedback: Optional[str] = None
+
+
+# ───────────────────────── status ─────────────────────────
+
+
+@app.get("/api/dexter/status")
+async def get_status():
+    providers = await run_in_threadpool(llm_router.get_available_providers)
+    planner = await run_in_threadpool(day_planner.get_agenda)
+    skills = await run_in_threadpool(skill_engine.list_skills)
+    overnight = await run_in_threadpool(spilled_coffee.get_overnight_content)
+    notes = await run_in_threadpool(sticky_notes.list_notes)
+    buzzcaf_status = await run_in_threadpool(buzzcaf_client.get_status)
+
+    return {
+        "status": "online",
+        "assistantName": "Dexter Super Assistant",
+        "version": "2.0.0",
+        "providers": providers,
+        "toolCount": len(all_tools()),
+        "intentMode": intent_router._embedder.mode,
+        "appsIndexed": app_index.size(),
+        "skillsCount": len(skills),
+        "tasksCount": len(planner.get("tasks", [])),
+        "overnightQueueCount": len(overnight),
+        "notesCount": len(notes),
+        "scheduler": scheduler.status(),
+        "memory": memory.stats(),
+        "integrations": {
+            "windows": windows_tools.availability(),
+            "media": media_tools.availability(),
+            "google": google_tools.availability(),
+        },
+        "buzzcafAI": {
+            "online": buzzcaf_status.get("online", False),
+            "activeProjects": buzzcaf_status.get("in_progress", 0),
+            "totalProjects": buzzcaf_status.get("total_projects", 0),
+        },
+    }
+
+
+@app.get("/api/dexter/tools")
+async def list_registered_tools():
+    return [
+        {
+            "name": spec.name,
+            "description": spec.description,
+            "category": spec.category,
+            "signature": spec.signature_hint(),
+            "confirm": spec.confirm,
+            "examples": spec.examples[:3],
+        }
+        for spec in all_tools()
+    ]
+
+
+# ───────────────────────── chat ─────────────────────────
+
+
+def _run_route(req: ChatRequest, on_event=None) -> Dict[str, Any]:
+    """Route one message, with conversation history and stored facts as context."""
+    session = req.session or "default"
+    history = memory.recent_turns(session=session)
+
+    context_parts = []
+    # Telling the agent what is on screen is what lets "summarise this" or
+    # "close it" resolve to something concrete.
+    active = windows_tools.get_active_window_title()
+    if active:
+        context_parts.append(f"The user currently has this window in focus: {active}")
+    facts = memory.context_note()
+    if facts:
+        context_parts.append(facts)
+    context = "\n\n".join(context_parts)
+
+    result = intent_router.route(
+        req.message,
+        history=history,
+        provider=req.provider or "auto",
+        model=req.model,
+        context_note=context,
+        on_event=on_event,
+    )
+
+    memory.add_turn("user", req.message, session=session)
+    memory.add_turn(
+        "assistant",
+        result.reply,
+        tool_calls=", ".join(c["name"] for c in result.tool_calls) or None,
+        session=session,
+    )
+    return result.to_dict()
+
+
+@app.post("/api/dexter/chat")
+async def process_chat(req: ChatRequest):
+    if not req.message or not req.message.strip():
+        return {"reply": "I didn't catch that.", "action": "empty", "toolCalls": []}
+    return await run_in_threadpool(_run_route, req)
+
+
+@app.post("/api/dexter/chat/stream")
+async def process_chat_stream(req: ChatRequest):
+    """
+    Chat with incremental delivery.
+
+    The reply is split into sentences and each one is synthesised as it becomes
+    available, so the first audio starts playing while the rest is still being
+    generated instead of after the whole response is complete.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def emit(event_type: str, payload: Any) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, (event_type, payload))
+
+    async def worker() -> None:
+        try:
+            result = await run_in_threadpool(_run_route, req, emit)
+            emit("reply", result)
+
+            if req.voiceEnabled:
+                calls = result.get("toolCalls") or []
+                # A failed tool should sound apologetic, not chirpy.
+                tool_ok = all(c.get("ok", True) for c in calls) if calls else None
+                reply_text = result.get("reply", "")
+
+                # A tool can ask for a specific delivery - read_aloud wants the
+                # narrator register rather than the clipped confirmation tone.
+                requested = (result.get("details") or {}).get("speechEmotion")
+                if not requested:
+                    requested = next(
+                        (c.get("speechEmotion") for c in calls if c.get("speechEmotion")), None
+                    )
+
+                delivery, chunks = await run_in_threadpool(
+                    voice_engine.plan_speech,
+                    reply_text,
+                    result.get("action", ""),
+                    tool_ok,
+                    False,
+                    len(reply_text) > 600,
+                    requested,
+                )
+                emit("delivery", {"emotion": delivery.emotion, "speed": delivery.speed})
+
+                for chunk in chunks:
+                    path = await run_in_threadpool(
+                        voice_engine.synthesize_chunk, chunk, delivery, req.voiceKey or "michael"
+                    )
+                    if path:
+                        emit("audio", {
+                            "text": chunk,
+                            "emotion": delivery.emotion,
+                            "url": f"/api/dexter/audio/{os.path.basename(path)}",
+                        })
+        except Exception as exc:
+            emit("error", {"message": str(exc)})
+        finally:
+            emit("done", {})
+
+    async def generate():
+        task = asyncio.create_task(worker())
+        try:
+            while True:
+                event_type, payload = await queue.get()
+                yield _sse(event_type, payload)
+                if event_type == "done":
+                    break
+        finally:
+            task.cancel()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _sse(event_type: str, payload: Any) -> str:
+    import json
+
+    body = json.dumps({"type": event_type, "payload": payload}, ensure_ascii=False)
+    return f"event: {event_type}\ndata: {body}\n\n"
+
+
+@app.get("/api/dexter/events")
+async def event_stream(request: Request):
+    """Long-lived push channel: reminders, notifications, background status."""
+    queue = bus.subscribe()
+
+    async def generate():
+        try:
+            async for frame in bus.stream(queue):
+                if await request.is_disconnected():
+                    break
+                yield frame
+        finally:
+            bus.unsubscribe(queue)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ───────────────────────── planner ─────────────────────────
+
+
+@app.get("/api/dexter/planner")
+async def get_planner():
+    return await run_in_threadpool(day_planner.get_agenda)
+
+
+@app.post("/api/dexter/planner/add")
+async def add_planner_task(req: AddTaskRequest):
+    task = await run_in_threadpool(day_planner.add_task, req.title, req.time or "12:00 PM")
+    from timeparse import parse_when
+
+    parsed = parse_when(req.time or "")
+    if parsed:
+        task = day_planner.update_task(task["id"], {"at": parsed.isoformat(timespec="seconds")}) or task
+        scheduler.sync_planner_task(task)
+    return task
+
+
+@app.post("/api/dexter/planner/toggle/{task_id}")
+async def toggle_planner_task(task_id: str):
+    success = await run_in_threadpool(day_planner.toggle_task, task_id)
+    return {"success": success}
+
+
+# ───────────────────────── reminders ─────────────────────────
+
+
+@app.get("/api/dexter/reminders")
+async def get_reminders():
+    return scheduler.list_reminders(include_fired=False)
+
+
+@app.post("/api/dexter/reminders")
+async def add_reminder(req: ReminderRequest):
+    result = await run_in_threadpool(
+        scheduler.create_reminder, req.text, req.when, req.channels
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Invalid time"))
+    return result
+
+
+@app.delete("/api/dexter/reminders/{reminder_id}")
+async def delete_reminder(reminder_id: str):
+    return {"success": scheduler.cancel_reminder(reminder_id)}
+
+
+# ───────────────────────── memory ─────────────────────────
+
+
+@app.get("/api/dexter/memory")
+async def get_memory():
+    return {"facts": memory.all_facts(), "stats": memory.stats()}
+
+
+@app.post("/api/dexter/memory")
+async def add_memory(req: RememberRequest):
+    return {"success": memory.remember(req.key, req.value)}
+
+
+@app.delete("/api/dexter/memory/{key}")
+async def delete_memory(key: str):
+    return {"success": memory.forget(key)}
+
+
+@app.post("/api/dexter/memory/history/clear")
+async def clear_history(session: str = "default"):
+    return {"cleared": memory.clear_history(session)}
+
+
+# ───────────────────────── skills ─────────────────────────
+
+
+@app.get("/api/dexter/skills")
+async def get_skills():
+    return await run_in_threadpool(skill_engine.list_skills)
+
+
+@app.delete("/api/dexter/skills/{name}")
+async def delete_skill(name: str):
+    return {"success": skill_engine.delete_skill(name)}
+
+
+# ───────────────────────── system / files ─────────────────────────
+
+
+@app.post("/api/dexter/system/launch")
+async def launch_system_app(req: LaunchAppRequest):
+    return await run_in_threadpool(AppLauncherTool.launch_app, req.appName)
+
+
+@app.post("/api/dexter/browser/navigate")
+async def browse_url(req: BrowseRequest):
+    return await run_in_threadpool(PlaywrightBrowserTool.browse_url, req.url)
+
+
+@app.post("/api/dexter/filesystem/search")
+async def search_files(req: FileSearchRequest):
+    return await run_in_threadpool(FileSystemTool.search_files, req.query, req.path)
+
+
+@app.post("/api/dexter/filesystem/read")
+async def read_file(req: FileReadRequest):
+    return await run_in_threadpool(FileSystemTool.read_file, req.path)
+
+
+@app.post("/api/dexter/filesystem/write")
+async def write_file(req: FileWriteRequest):
+    return await run_in_threadpool(FileSystemTool.write_file, req.path, req.content)
+
+
+@app.post("/api/dexter/filesystem/create-folder")
+async def create_folder(req: CreateFolderRequest):
+    return await run_in_threadpool(FileSystemTool.create_folder, req.path)
+
+
+@app.post("/api/dexter/filesystem/open")
+async def open_file_path(req: FileOpenRequest):
+    return await run_in_threadpool(FileSystemTool.open_local_path, req.path)
+
+
+# ───────────────────────── voice ─────────────────────────
+
+
+@app.post("/api/dexter/tts/generate")
+async def generate_expressive_tts(req: TTSRequest):
+    # Reminders arrive here from the SSE handler and should sound urgent, so
+    # this endpoint runs the same prosody pipeline as streaming chat rather
+    # than the old flat synthesis.
+    paths, _delivery = await run_in_threadpool(
+        voice_engine.speak_expressive,
+        req.text,
+        "",
+        None,
+        bool(req.isReminder),
+        len(req.text or "") > 600,
+        req.emotion,
+        req.voiceKey or "michael",
+    )
+    file_path = paths[0] if paths else None
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=503, detail="Speech synthesis unavailable")
+    # Kokoro emits WAV and edge-tts emits MP3; the old handler hardcoded mpeg
+    # for both, which made some players reject the Kokoro output.
+    media_type = "audio/wav" if file_path.lower().endswith(".wav") else "audio/mpeg"
+    return FileResponse(file_path, media_type=media_type)
+
+
+@app.get("/api/dexter/audio/{filename}")
+async def get_audio(filename: str):
+    """Serve a generated clip for the streaming chat endpoint."""
+    safe = os.path.basename(filename)
+    path = os.path.join(AUDIO_DIR, safe)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Audio not found")
+    media_type = "audio/wav" if safe.lower().endswith(".wav") else "audio/mpeg"
+    return FileResponse(path, media_type=media_type)
+
+
+# ───────────────────────── notes / media / content ─────────────────────────
+
+
 @app.get("/api/dexter/notes")
-def get_sticky_notes():
-    return sticky_notes.list_notes()
+async def get_sticky_notes():
+    return await run_in_threadpool(sticky_notes.list_notes)
+
 
 @app.post("/api/dexter/notes/add")
-def create_sticky_note(req: CreateNoteRequest):
-    return sticky_notes.create_note(req.content, req.title or "Sticky Note")
+async def create_sticky_note(req: CreateNoteRequest):
+    return await run_in_threadpool(
+        sticky_notes.create_note, req.content, req.title or "Sticky Note"
+    )
+
 
 @app.post("/api/dexter/notes/delete/{note_id}")
-def delete_sticky_note(note_id: str):
-    return {"success": sticky_notes.delete_note(note_id)}
+async def delete_sticky_note(note_id: str):
+    return {"success": await run_in_threadpool(sticky_notes.delete_note, note_id)}
+
 
 @app.get("/api/dexter/playlists")
-def get_playlists():
+async def get_playlists():
     return youtube_tool.get_playlists()
 
-dist_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dist")
+
+@app.get("/api/dexter/spilledcoffee/overnight-queue")
+async def get_spilled_coffee_queue():
+    return await run_in_threadpool(spilled_coffee.get_overnight_content)
+
+
+@app.post("/api/dexter/spilledcoffee/curate")
+async def curate_spilled_coffee(req: CurateRequest):
+    return await run_in_threadpool(
+        spilled_coffee.run_overnight_curation,
+        req.niche or "AI Tech & Viral Trends",
+        req.count or 3,
+    )
+
+
+# ───────────────────────── BuzzcafAI ─────────────────────────
+
+
+@app.get("/api/dexter/buzzcaf/status")
+async def get_buzzcaf_status():
+    return await run_in_threadpool(buzzcaf_client.get_status)
+
+
+@app.get("/api/dexter/buzzcaf/health")
+async def get_buzzcaf_health():
+    return {"online": await run_in_threadpool(buzzcaf_client.health_check)}
+
+
+@app.post("/api/dexter/buzzcaf/start")
+async def start_buzzcaf_studio():
+    return await run_in_threadpool(buzzcaf_client.start_studio, True, 20)
+
+
+@app.post("/api/dexter/buzzcaf/start/backend")
+async def start_buzzcaf_backend():
+    return await run_in_threadpool(buzzcaf_client.start_backend)
+
+
+@app.post("/api/dexter/buzzcaf/start/frontend")
+async def start_buzzcaf_frontend():
+    return await run_in_threadpool(buzzcaf_client.start_frontend)
+
+
+@app.get("/api/dexter/buzzcaf/brands")
+async def get_buzzcaf_brands():
+    return await run_in_threadpool(buzzcaf_client.list_brands)
+
+
+@app.get("/api/dexter/buzzcaf/workflows")
+async def get_buzzcaf_workflows():
+    return await run_in_threadpool(buzzcaf_client.list_workflows)
+
+
+@app.get("/api/dexter/buzzcaf/projects")
+async def list_buzzcaf_projects():
+    return await run_in_threadpool(buzzcaf_client.list_projects)
+
+
+@app.post("/api/dexter/buzzcaf/projects")
+async def create_buzzcaf_project(req: BuzzcafProjectRequest):
+    return await run_in_threadpool(
+        buzzcaf_client.create_project, req.name, req.brand, req.workflow_name
+    )
+
+
+@app.get("/api/dexter/buzzcaf/projects/{project_id}")
+async def get_buzzcaf_project(project_id: str):
+    project = await run_in_threadpool(buzzcaf_client.get_project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return project
+
+
+@app.post("/api/dexter/buzzcaf/projects/{project_id}/execute")
+async def execute_buzzcaf_step(project_id: str, req: BuzzcafFeedbackRequest = None):
+    feedback = req.feedback if req else None
+    return await run_in_threadpool(buzzcaf_client.execute_step, project_id, feedback)
+
+
+@app.get("/api/dexter/buzzcaf/projects/{project_id}/logs")
+async def get_buzzcaf_logs(project_id: str):
+    return await run_in_threadpool(buzzcaf_client.get_project_logs, project_id)
+
+
+@app.get("/api/dexter/buzzcaf/projects/{project_id}/asset/{asset_name}")
+async def get_buzzcaf_asset(project_id: str, asset_name: str):
+    return await run_in_threadpool(buzzcaf_client.get_project_asset, asset_name, project_id)
+
+
+@app.post("/api/dexter/buzzcaf/active/{project_id}")
+async def set_active_buzzcaf_project(project_id: str):
+    buzzcaf_client.set_active_project(project_id)
+    return {"success": True, "active_project": project_id}
+
+
+@app.get("/api/dexter/buzzcaf/active")
+async def get_active_buzzcaf_project():
+    project_id = buzzcaf_client.get_active_project()
+    if project_id:
+        return await run_in_threadpool(buzzcaf_client.get_project, project_id)
+    return {"active_project": None}
+
+
+@app.get("/api/dexter/buzzcaf/assets")
+async def query_buzzcaf_assets(
+    type: Optional[str] = None, tag: Optional[str] = None, query: Optional[str] = None
+):
+    return await run_in_threadpool(buzzcaf_client.query_assets, type, tag, query)
+
+
+@app.get("/api/dexter/buzzcaf/diagnostics")
+async def get_buzzcaf_diagnostics():
+    return await run_in_threadpool(buzzcaf_client.get_diagnostics)
+
+
+# ───────────────────────── static frontend ─────────────────────────
+
+dist_dir = os.path.join(ROOT_DIR, "dist")
 if os.path.exists(dist_dir):
     app.mount("/", StaticFiles(directory=dist_dir, html=True), name="static")
 
+
 if __name__ == "__main__":
     import uvicorn
-    print("Starting Dexter Engine on port 8098...")
-    uvicorn.run(app, host="0.0.0.0", port=8098)
+
+    # Bound to loopback: the filesystem endpoints are unauthenticated, so
+    # listening on 0.0.0.0 exposed arbitrary file writes to the whole LAN.
+    host = os.getenv("DEXTER_HOST", "127.0.0.1")
+    print(f"Starting Dexter Engine on http://{host}:8098")
+    uvicorn.run(app, host=host, port=8098)
