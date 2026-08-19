@@ -21,6 +21,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import cancellation
 from hybrid_llm import extract_json, llm_router
 from tool_registry import ToolResult, all_tools, execute, get_tool, schemas_for
 
@@ -819,7 +820,12 @@ def agent_loop(
         if on_event:
             on_event("provider_switched", {"from": failed, "to": next_provider})
 
+    def _should_cancel() -> bool:
+        return cancellation.is_cancelled(session)
+
     for iteration in range(MAX_ITERATIONS):
+        if _should_cancel():
+            return RouteResult(reply="", action="interrupted", tier=2, tool_calls=executed)
         if gate:
             gate.reset()
         response = llm_router.chat(
@@ -831,7 +837,12 @@ def agent_loop(
             tools=tool_schemas or None,
             on_token=gate.feed if gate else None,
             on_fallback=_on_fallback,
+            should_cancel=_should_cancel,
         )
+
+        # Barge-in: the user talked over the reply. Stop cleanly, no apology.
+        if response.cancelled:
+            return RouteResult(reply="", action="interrupted", tier=2, tool_calls=executed)
 
         if not response.ok:
             if executed:

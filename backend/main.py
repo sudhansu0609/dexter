@@ -8,6 +8,7 @@ this module is only transport: endpoints, lifecycle, and streaming.
 """
 
 import asyncio
+import json
 import os
 import queue as sync_queue
 import re
@@ -29,7 +30,7 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -37,9 +38,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import app_index
+import cancellation
 import google_tools
 import media_tools
 import router as intent_router
+import voice_pipeline
 import tools_assistant  # noqa: F401  - registers reminder/memory tools
 import windows_tools
 from buzzcaf_client import buzzcaf_client
@@ -92,6 +95,17 @@ async def lifespan(app: FastAPI):
         import reflection
 
         reflection.catch_up()
+        # Warm the STT model off the request path so the first spoken command
+        # does not eat the one-time load. Guarded: a missing model or blocked
+        # download just leaves the local pipeline reporting "not ready".
+        if os.getenv("DEXTER_LOCAL_STT", "1") != "0":
+            try:
+                from stt_engine import stt_engine
+
+                if stt_engine.available():
+                    stt_engine._ensure_model()
+            except Exception as exc:
+                print(f"[Startup] STT warm-up skipped: {exc}")
 
     threading.Thread(target=_warm_health, name="dexter-health-warm", daemon=True).start()
 
@@ -302,6 +316,10 @@ async def get_status():
             "media": media_tools.availability(),
             "google": google_tools.availability(),
         },
+        "voice": {
+            "enabled": os.getenv("DEXTER_LOCAL_STT", "1") != "0",
+            **voice_pipeline.capabilities(),
+        },
         "buzzcafAI": {
             "online": buzzcaf_status.get("online", False),
             "activeProjects": buzzcaf_status.get("in_progress", 0),
@@ -413,11 +431,17 @@ async def process_chat_stream(req: ChatRequest):
     tts_queue: "sync_queue.Queue[Optional[str]]" = sync_queue.Queue()
     state = {"pending": "", "spoke_stream": False, "emotion": None}
 
+    session_id = req.session or "default"
+
     def tts_worker() -> None:
         while True:
             sentence = tts_queue.get()
             if sentence is None:
                 return
+            # Barge-in: once the session is cancelled, drain the queue silently
+            # instead of speaking sentences the user has already talked over.
+            if cancellation.is_cancelled(session_id):
+                continue
             try:
                 delivery, chunks = voice_engine.plan_speech(
                     sentence, "", None, False, False, state["emotion"]
@@ -440,7 +464,7 @@ async def process_chat_stream(req: ChatRequest):
 
     def routed_emit(event_type: str, payload: Any) -> None:
         """Pass events through, feeding completed sentences to the TTS thread."""
-        if event_type == "token" and req.voiceEnabled:
+        if event_type == "token" and req.voiceEnabled and not cancellation.is_cancelled(session_id):
             state["pending"] += payload.get("text", "")
             while True:
                 match = _SENTENCE_END.search(state["pending"], _MIN_STREAM_SENTENCE)
@@ -457,10 +481,18 @@ async def process_chat_stream(req: ChatRequest):
         emit(event_type, payload)
 
     async def worker() -> None:
+        cancellation.begin(session_id)
         tts_thread = threading.Thread(target=tts_worker, daemon=True, name="dexter-stream-tts")
         tts_thread.start()
         try:
             result = await run_in_threadpool(_run_route, req, routed_emit)
+
+            # Barge-in: the user talked over the reply. Skip the answer and the
+            # remaining speech; the frontend has already stopped playback.
+            if result.get("action") == "interrupted" or cancellation.is_cancelled(session_id):
+                emit("interrupted", {})
+                return
+
             emit("reply", result)
 
             if req.voiceEnabled:
@@ -507,6 +539,7 @@ async def process_chat_stream(req: ChatRequest):
         except Exception as exc:
             emit("error", {"message": str(exc)})
         finally:
+            cancellation.clear(session_id)
             tts_queue.put(None)
             await run_in_threadpool(tts_thread.join)
             emit("done", {})
@@ -555,6 +588,84 @@ async def event_stream(request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ───────────────────────── voice pipeline (Phase 4) ─────────────────────────
+
+
+def _ws_authorized(ws: WebSocket) -> bool:
+    """
+    Authorise a WebSocket by hand.
+
+    The HTTP auth middleware does not run for the WebSocket scope, so the same
+    two checks are repeated here: the Host header must be a local name (defeats
+    DNS rebinding) and the per-run token must be presented as a query param
+    (WebSocket, like EventSource, cannot attach custom headers).
+    """
+    hostname = (ws.headers.get("host") or "").split(":")[0].lower()
+    if hostname and hostname not in _ALLOWED_HOSTNAMES:
+        return False
+    supplied = ws.query_params.get("token")
+    return bool(supplied) and secrets.compare_digest(supplied, SESSION_TOKEN)
+
+
+@app.websocket("/api/dexter/voice/ws")
+async def voice_socket(ws: WebSocket):
+    """
+    Inbound audio channel: the renderer streams 16 kHz mono int16 PCM as binary
+    frames; the backend runs wake word -> VAD -> STT and pushes back JSON voice
+    events (wake / speech_start / transcript / interrupt). This is the app's
+    first WebSocket - SSE stays the outbound push channel for everything else.
+    """
+    if not _ws_authorized(ws):
+        await ws.close(code=1008)
+        return
+    await ws.accept()
+
+    session_id = ws.query_params.get("session") or "default"
+    vsession = voice_pipeline.VoiceSession(session=session_id)
+    await ws.send_json({"type": "status", **voice_pipeline.capabilities()})
+
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+
+            data = msg.get("bytes")
+            if data is not None:
+                events = await run_in_threadpool(vsession.feed, data)
+                for event in events:
+                    await ws.send_json(event)
+                continue
+
+            text = msg.get("text")
+            if text:
+                try:
+                    ctrl = json.loads(text)
+                except Exception:
+                    continue
+                kind = ctrl.get("type")
+                if kind == "speaking":
+                    vsession.set_speaking(bool(ctrl.get("on")))
+                elif kind == "reset":
+                    vsession.reset()
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        print(f"[Voice WS] closed on error: {exc}")
+
+
+class InterruptRequest(BaseModel):
+    session: Optional[str] = "default"
+
+
+@app.post("/api/dexter/voice/interrupt")
+async def voice_interrupt(req: InterruptRequest = InterruptRequest()):
+    """Manual barge-in (stop button / keyword) - cancels the session's stream."""
+    session = req.session or "default"
+    cancellation.request_cancel(session)
+    return {"ok": True, "session": session}
 
 
 # ───────────────────────── planner ─────────────────────────

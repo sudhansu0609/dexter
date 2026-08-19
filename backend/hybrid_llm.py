@@ -44,6 +44,10 @@ class LLMResponse:
     # Set when the answering provider is not the one first selected - the
     # request was completed by a fallback after the primary failed mid-flight.
     fallback_from: Optional[str] = None
+    # Set when generation was deliberately stopped mid-stream (barge-in, Phase
+    # 4.5). Unlike an error this must NOT trigger provider fallback - the user
+    # asked us to stop, not to try harder elsewhere.
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
@@ -189,6 +193,7 @@ class HybridLLMRouter:
         timeout: int = 90,
         on_token: Optional[Callable[[str], None]] = None,
         on_fallback: Optional[Callable[[str, str], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> LLMResponse:
         """
         Full multi-turn chat with optional native tool calling.
@@ -199,10 +204,16 @@ class HybridLLMRouter:
 
         `on_fallback(failed, next)` fires before each retry against the next
         provider in the chain, so callers can reset any tokens already shown.
+
+        `should_cancel()` is polled while a stream is consumed; when it returns
+        True generation stops and the response is flagged `cancelled` - returned
+        as-is without trying the next provider (a barge-in is not a failure).
         """
         chain = self._provider_chain(provider, needs_tools=bool(tools))
         last: Optional[LLMResponse] = None
         for idx, prov in enumerate(chain):
+            if should_cancel and should_cancel():
+                return LLMResponse(provider=prov, model=model or "", cancelled=True)
             if idx > 0:
                 print(f"[HybridLLM] {chain[idx - 1]} failed mid-request; trying {prov}.")
                 if on_fallback:
@@ -211,8 +222,11 @@ class HybridLLMRouter:
                     except Exception:
                         pass
             response = self._chat_one(
-                prov, messages, model, temperature, max_tokens, tools, timeout, on_token
+                prov, messages, model, temperature, max_tokens, tools, timeout,
+                on_token, should_cancel,
             )
+            if response.cancelled:
+                return response
             if response.ok:
                 if idx > 0:
                     response.fallback_from = chain[0]
@@ -235,6 +249,7 @@ class HybridLLMRouter:
         tools: Optional[List[Dict[str, Any]]],
         timeout: int,
         on_token: Optional[Callable[[str], None]],
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> LLMResponse:
         model_name = self._model_for(prov, model)
 
@@ -252,12 +267,13 @@ class HybridLLMRouter:
                 "https://api.openai.com/v1", messages, model_name, temperature,
                 max_tokens, tools, timeout,
                 headers={"Authorization": f"Bearer {self.openai_api_key}"},
-                provider_label="openai", on_token=on_token,
+                provider_label="openai", on_token=on_token, should_cancel=should_cancel,
             )
 
         return self._chat_openai_compat(
             self._base_url_for(prov), messages, model_name, temperature,
             max_tokens, tools, timeout, provider_label=prov, on_token=on_token,
+            should_cancel=should_cancel,
         )
 
     def _chat_openai_compat(
@@ -272,6 +288,7 @@ class HybridLLMRouter:
         headers: Optional[Dict[str, str]] = None,
         provider_label: str = "lmstudio",
         on_token: Optional[Callable[[str], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> LLMResponse:
         streaming = on_token is not None
         payload: Dict[str, Any] = {
@@ -307,7 +324,7 @@ class HybridLLMRouter:
                 print(f"[HybridLLM] Server rejected native tools ({res.status_code}); retrying without.")
                 return self._chat_openai_compat(
                     base_url, messages, model, temperature, max_tokens,
-                    None, timeout, headers, provider_label, on_token,
+                    None, timeout, headers, provider_label, on_token, should_cancel,
                 )
             return LLMResponse(
                 provider=provider_label, model=model,
@@ -315,7 +332,7 @@ class HybridLLMRouter:
             )
 
         if streaming:
-            return self._consume_stream(res, provider_label, model, on_token)
+            return self._consume_stream(res, provider_label, model, on_token, should_cancel)
 
         try:
             choice = res.json()["choices"][0]["message"]
@@ -336,12 +353,16 @@ class HybridLLMRouter:
         provider_label: str,
         model: str,
         on_token: Callable[[str], None],
+        should_cancel: Optional[Callable[[], bool]] = None,
     ) -> LLMResponse:
         """
         Accumulate an SSE completion stream into a normal LLMResponse, calling
         on_token for each content delta. A connection dropped mid-stream is
         reported as an error so chat() can retry the whole request on the next
         provider - the partial text is discarded rather than stitched.
+
+        If should_cancel() turns True the stream is abandoned and a `cancelled`
+        response is returned (barge-in) - not retried on another provider.
         """
         content_parts: List[str] = []
         # Tool-call fragments arrive keyed by index; the name lands once, the
@@ -350,6 +371,12 @@ class HybridLLMRouter:
         try:
             with res:
                 for line in res.iter_lines(decode_unicode=True):
+                    if should_cancel and should_cancel():
+                        res.close()
+                        return LLMResponse(
+                            content="".join(content_parts),
+                            provider=provider_label, model=model, cancelled=True,
+                        )
                     if not line or not line.startswith("data:"):
                         continue
                     data = line[5:].strip()
