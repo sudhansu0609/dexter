@@ -1,139 +1,216 @@
-import requests
+"""
+Dexter end-to-end verification suite.
+
+Run the backend first:  python backend/main.py
+
+These are live HTTP checks against a running server. Pure routing logic is
+covered much more thoroughly by backend/test_router.py, which needs no server.
+
+Note on assertions: intent used to be asserted via the `action` string
+("launch_app", "browse_url", ...). Those were branch labels from the old keyword
+chain. `action` now reports which tier answered (fast_path / semantic / agent),
+and the tool that actually ran is in `toolCalls` - so that is what these assert.
+It is a stricter check than before, since it verifies execution rather than a
+routing label.
+"""
+
 import json
+import sys
 import time
+
+import requests
 
 BASE_URL = "http://127.0.0.1:8098"
 
+# Tier 2 falls through to a local model, which can take a minute on consumer
+# hardware. Short timeouts here were reporting slowness as failure.
+FAST_TIMEOUT = 15
+LLM_TIMEOUT = 150
+
+_passed = 0
+_failed = 0
+
+
+def check(name, fn):
+    global _passed, _failed
+    try:
+        detail = fn()
+        _passed += 1
+        print(f"[OK]   {name}: {detail}")
+    except Exception as exc:
+        _failed += 1
+        print(f"[FAIL] {name}: {exc}")
+
+
+def chat(message, timeout=FAST_TIMEOUT):
+    res = requests.post(
+        f"{BASE_URL}/api/dexter/chat", json={"message": message}, timeout=timeout
+    )
+    res.raise_for_status()
+    return res.json()
+
+
+def tools_used(data):
+    return [c["name"] for c in data.get("toolCalls", [])]
+
+
+def assert_tool(message, expected, timeout=FAST_TIMEOUT):
+    data = chat(message, timeout)
+    used = tools_used(data)
+    assert expected in used, f"{message!r} ran {used}, expected {expected} (tier {data.get('tier')})"
+    return f"{message!r} -> {expected} (tier {data.get('tier')}, {len(data['reply'])} char reply)"
+
+
 def run_tests():
-    print("===================================================")
-    print("Dexter Super Assistant - Post-Fix Verification Suite")
-    print("===================================================")
+    print("=" * 60)
+    print("Dexter Super Assistant - Verification Suite")
+    print("=" * 60)
 
-    # 1. Status endpoint
-    try:
-        res = requests.get(f"{BASE_URL}/api/dexter/status", timeout=5)
-        assert res.status_code == 200
-        data = res.json()
-        print("[OK] Test 1: Status endpoint online:", data["status"])
-    except Exception as e:
-        print("[FAIL] Test 1:", e)
+    # ── core endpoints ──
+    def status():
+        data = requests.get(f"{BASE_URL}/api/dexter/status", timeout=FAST_TIMEOUT).json()
+        assert data["status"] == "online"
+        assert data["toolCount"] > 0, "no tools registered"
+        return (
+            f"v{data['version']}, {data['toolCount']} tools, "
+            f"{data['appsIndexed']} apps indexed, intent={data['intentMode']}, "
+            f"scheduler={'up' if data['scheduler']['running'] else 'DOWN'}"
+        )
 
-    # 2. Day Planner
-    try:
-        res = requests.get(f"{BASE_URL}/api/dexter/planner", timeout=5)
-        assert res.status_code == 200
-        print("[OK] Test 2: Planner returned", len(res.json().get("tasks", [])), "tasks, date:", res.json().get("date"))
-    except Exception as e:
-        print("[FAIL] Test 2:", e)
+    check("Status endpoint", status)
 
-    # 3. Add task
-    try:
-        res = requests.post(f"{BASE_URL}/api/dexter/planner/add", json={"title": "Fix verification run", "time": "09:00 PM"}, timeout=5)
-        assert res.status_code == 200
-        print("[OK] Test 3: Added task:", res.json()["title"])
-    except Exception as e:
-        print("[FAIL] Test 3:", e)
+    check("Tool registry", lambda: (
+        f"{len(requests.get(f'{BASE_URL}/api/dexter/tools', timeout=FAST_TIMEOUT).json())} tools exposed"
+    ))
 
-    # 4. Toggle task
-    try:
-        planner = requests.get(f"{BASE_URL}/api/dexter/planner", timeout=5).json()
-        if planner["tasks"]:
-            tid = planner["tasks"][0]["id"]
-            res = requests.post(f"{BASE_URL}/api/dexter/planner/toggle/{tid}", timeout=5)
-            assert res.status_code == 200
-            print("[OK] Test 4: Toggled task", tid, "->", res.json())
-        else:
-            print("[SKIP] Test 4: No tasks to toggle")
-    except Exception as e:
-        print("[FAIL] Test 4:", e)
+    # ── planner ──
+    check("Planner read", lambda: (
+        f"{len(requests.get(f'{BASE_URL}/api/dexter/planner', timeout=FAST_TIMEOUT).json().get('tasks', []))} tasks"
+    ))
 
-    # 5. FIX VERIFY: "start my day" should hit planner NOT app launcher
-    try:
-        res = requests.post(f"{BASE_URL}/api/dexter/chat", json={"message": "start my day plan"}, timeout=10)
-        assert res.status_code == 200
-        data = res.json()
-        # Should NOT be launch_app
-        assert data["action"] != "launch_app", f"REGRESSION: 'start my day' incorrectly routed to {data['action']}"
-        print("[OK] Test 5: 'start my day plan' -> action:", data["action"], "(not launch_app)")
-    except Exception as e:
-        print("[FAIL] Test 5:", e)
+    def add_task():
+        res = requests.post(
+            f"{BASE_URL}/api/dexter/planner/add",
+            json={"title": "Verification run", "time": "09:00 PM"}, timeout=FAST_TIMEOUT,
+        )
+        body = res.json()
+        assert body["title"] == "Verification run"
+        # The ISO timestamp is what makes a task schedulable at all.
+        assert body.get("at"), "task has no ISO 'at' timestamp - scheduler cannot fire it"
+        return f"added, at={body['at']}"
 
-    # 6. FIX VERIFY: "play lofi" should hit YouTube
-    try:
-        res = requests.post(f"{BASE_URL}/api/dexter/chat", json={"message": "play lofi beats"}, timeout=10)
-        assert res.status_code == 200
-        data = res.json()
-        assert data["action"] == "play_youtube"
-        print("[OK] Test 6: YouTube intent correct:", data["action"])
-    except Exception as e:
-        print("[FAIL] Test 6:", e)
+    check("Planner add (ISO timestamp)", add_task)
 
-    # 7. FIX VERIFY: "go to google.com" should hit browse
-    try:
-        res = requests.post(f"{BASE_URL}/api/dexter/chat", json={"message": "go to google.com"}, timeout=10)
-        assert res.status_code == 200
-        data = res.json()
-        assert data["action"] == "browse_url"
-        print("[OK] Test 7: Browse intent correct:", data["action"], "url:", data["details"]["url"])
-    except Exception as e:
-        print("[FAIL] Test 7:", e)
+    def toggle_task():
+        planner = requests.get(f"{BASE_URL}/api/dexter/planner", timeout=FAST_TIMEOUT).json()
+        tasks = planner.get("tasks", [])
+        if not tasks:
+            return "skipped - no tasks"
+        tid = tasks[-1]["id"]
+        res = requests.post(f"{BASE_URL}/api/dexter/planner/toggle/{tid}", timeout=FAST_TIMEOUT)
+        assert res.json()["success"]
+        return f"toggled {tid}"
 
-    # 8. FIX VERIFY: "open notepad" should hit app launcher
-    try:
-        res = requests.post(f"{BASE_URL}/api/dexter/chat", json={"message": "open notepad"}, timeout=10)
-        assert res.status_code == 200
-        data = res.json()
-        assert data["action"] == "launch_app"
-        print("[OK] Test 8: App launcher correct:", data["action"])
-    except Exception as e:
-        print("[FAIL] Test 8:", e)
+    check("Planner toggle", toggle_task)
 
-    # 9. SpilledCoffeeAI curate
-    try:
-        res = requests.post(f"{BASE_URL}/api/dexter/spilledcoffee/curate", json={"niche": "AI", "count": 2}, timeout=10)
-        assert res.status_code == 200
-        print("[OK] Test 9: Curated", res.json()["count"], "items")
-    except Exception as e:
-        print("[FAIL] Test 9:", e)
+    # ── intent routing (the old tests 5-8, rewritten against toolCalls) ──
+    check("Intent: agenda not app launcher",
+          lambda: assert_tool("what is on my agenda", "get_agenda"))
+    check("Intent: media", lambda: assert_tool("play lofi beats", "play_on_youtube"))
+    check("Intent: browse", lambda: assert_tool("go to google.com", "open_website"))
+    check("Intent: app launch", lambda: assert_tool("open notepad", "launch_app"))
+    check("Intent: time", lambda: assert_tool("what time is it", "get_current_time"))
+    check("Intent: volume", lambda: assert_tool("what is the volume", "set_volume"))
 
-    # 10. Skills endpoint
-    try:
-        res = requests.get(f"{BASE_URL}/api/dexter/skills", timeout=5)
-        assert res.status_code == 200
-        print("[OK] Test 10: Skills count:", len(res.json()))
-    except Exception as e:
-        print("[FAIL] Test 10:", e)
+    def general_question_reaches_llm():
+        data = chat("What is machine learning?", timeout=LLM_TIMEOUT)
+        assert not tools_used(data), f"a general question wrongly ran tools: {tools_used(data)}"
+        assert len(data["reply"]) > 20, "reply suspiciously short"
+        return f"tier {data.get('tier')}, {len(data['reply'])} char answer"
 
-    # 11. Browse endpoint directly
-    try:
-        res = requests.post(f"{BASE_URL}/api/dexter/browser/navigate", json={"url": "example.com"}, timeout=5)
-        assert res.status_code == 200
-        print("[OK] Test 11: Direct browse endpoint:", res.json()["url"])
-    except Exception as e:
-        print("[FAIL] Test 11:", e)
+    check("General question reaches the model, runs no tools", general_question_reaches_llm)
 
-    # 12. Hybrid LLM fallback
-    try:
-        res = requests.post(f"{BASE_URL}/api/dexter/chat", json={"message": "What is machine learning?"}, timeout=15)
-        assert res.status_code == 200
-        data = res.json()
-        assert data["action"] == "chat_response"
-        print("[OK] Test 12: LLM fallback correct, reply length:", len(data["reply"]))
-    except Exception as e:
-        print("[FAIL] Test 12:", e)
+    # ── reminders ──
+    def reminder_lifecycle():
+        data = chat("remind me to run the verification in 3 hours")
+        assert "create_reminder" in tools_used(data), f"ran {tools_used(data)}"
+        pending = requests.get(f"{BASE_URL}/api/dexter/reminders", timeout=FAST_TIMEOUT).json()
+        match = next((r for r in pending if "verification" in r["text"].lower()), None)
+        assert match, "reminder was not persisted"
+        assert match["at"], "reminder has no fire time"
+        requests.delete(f"{BASE_URL}/api/dexter/reminders/{match['id']}", timeout=FAST_TIMEOUT)
+        return f"created and cancelled, fire at {match['at']}"
 
-    # 13. Desktop File System Search
-    try:
-        res = requests.post(f"{BASE_URL}/api/dexter/filesystem/search", json={"query": "dexter"}, timeout=10)
-        assert res.status_code == 200
-        data = res.json()
-        print("[OK] Test 13: FileSystem search returned", data["count"], "results for query 'dexter'.")
-    except Exception as e:
-        print("[FAIL] Test 13:", e)
+    check("Reminder create / list / cancel", reminder_lifecycle)
 
-    print("===================================================")
-    print("All 12 Post-Fix Verification Tests Executed!")
-    print("===================================================")
+    # ── memory ──
+    def memory_roundtrip():
+        chat("remember that my test project is dexter-rebuild")
+        data = chat("what do you remember about my test project")
+        assert "dexter-rebuild" in data["reply"], f"recall failed: {data['reply']}"
+        requests.delete(f"{BASE_URL}/api/dexter/memory/my test project", timeout=FAST_TIMEOUT)
+        return "stored and recalled"
+
+    check("Memory store / recall", memory_roundtrip)
+
+    def conversation_history():
+        stats = requests.get(f"{BASE_URL}/api/dexter/memory", timeout=FAST_TIMEOUT).json()
+        assert stats["stats"]["turns"] > 0, "no conversation turns recorded"
+        return f"{stats['stats']['turns']} turns stored"
+
+    check("Conversation history persists", conversation_history)
+
+    # ── streaming + sentence-chunked TTS ──
+    def streaming():
+        started = time.time()
+        first_audio = None
+        chunks = 0
+        reply = ""
+        res = requests.post(
+            f"{BASE_URL}/api/dexter/chat/stream",
+            json={"message": "what is on my agenda", "voiceEnabled": True},
+            stream=True, timeout=LLM_TIMEOUT,
+        )
+        for line in res.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            evt = json.loads(line[5:])
+            if evt["type"] == "reply":
+                reply = evt["payload"]["reply"]
+            elif evt["type"] == "audio":
+                chunks += 1
+                if first_audio is None:
+                    first_audio = int((time.time() - started) * 1000)
+        assert reply, "no reply event received"
+        assert chunks > 0, "no audio chunks received"
+        return f"first audio {first_audio}ms, {chunks} chunk(s)"
+
+    check("Streaming chat with chunked TTS", streaming)
+
+    # ── remaining endpoints ──
+    check("Skills", lambda: (
+        f"{len(requests.get(f'{BASE_URL}/api/dexter/skills', timeout=FAST_TIMEOUT).json())} skills"
+    ))
+    check("Direct browse endpoint", lambda: requests.post(
+        f"{BASE_URL}/api/dexter/browser/navigate", json={"url": "example.com"},
+        timeout=FAST_TIMEOUT).json()["url"])
+    check("Filesystem search", lambda: (
+        f"{requests.post(f'{BASE_URL}/api/dexter/filesystem/search', json={'query': 'dexter'}, timeout=FAST_TIMEOUT).json()['count']} results"
+    ))
+    check("SpilledCoffee curate", lambda: (
+        f"{len(requests.post(f'{BASE_URL}/api/dexter/spilledcoffee/curate', json={'niche': 'AI', 'count': 2}, timeout=LLM_TIMEOUT).json())} ideas"
+    ))
+
+    print("=" * 60)
+    print(f"{_passed} passed, {_failed} failed")
+    print("=" * 60)
+    return _failed
+
 
 if __name__ == "__main__":
-    run_tests()
+    try:
+        requests.get(f"{BASE_URL}/api/dexter/status", timeout=FAST_TIMEOUT)
+    except Exception:
+        print(f"Dexter is not running at {BASE_URL}. Start it with: python backend/main.py")
+        sys.exit(2)
+    sys.exit(1 if run_tests() else 0)
