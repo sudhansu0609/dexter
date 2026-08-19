@@ -46,10 +46,12 @@ from buzzcaf_client import buzzcaf_client
 from dexter_tools import AppLauncherTool, PlaywrightBrowserTool
 from events import bus
 from filesystem_tool import FileSystemTool
+import macros
+import tasks
+import tools_tasks  # noqa: F401  - registers background-task and macro tools
 from hybrid_llm import llm_router
 from memory import memory
 from scheduler import scheduler
-from skill_engine import DexterSkillEngine
 from tool_registry import all_tools
 from tools_core import day_planner, spilled_coffee, sticky_notes, youtube_tool
 from voice_engine import DexterVoiceEngine
@@ -57,8 +59,10 @@ from voice_engine import DexterVoiceEngine
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIO_DIR = os.path.join(ROOT_DIR, "data", "audio")
 
-skill_engine = DexterSkillEngine(llm_router)
 voice_engine = DexterVoiceEngine()
+
+# Macro recording captures tool calls as they execute.
+intent_router.TOOL_OBSERVERS.append(macros.observe_tool_call)
 
 
 @asynccontextmanager
@@ -66,7 +70,7 @@ async def lifespan(app: FastAPI):
     """Warm every index in the background so the first request is not the slow one."""
     bus.bind_loop(asyncio.get_running_loop())
 
-    removed = skill_engine.purge_invalid()
+    removed = macros.purge_invalid()
     if removed:
         print(f"[Startup] Removed {len(removed)} auto-generated junk skill(s).")
 
@@ -95,6 +99,9 @@ async def lifespan(app: FastAPI):
     armed = scheduler.rearm_planner()
     if armed:
         print(f"[Startup] Armed {armed} planner reminder(s).")
+    armed_goals = tasks.rearm_scheduled()
+    if armed_goals:
+        print(f"[Startup] Re-armed {armed_goals} scheduled goal(s).")
 
     print(f"[Startup] Dexter ready with {len(all_tools())} tools.")
     yield
@@ -271,7 +278,7 @@ class BuzzcafFeedbackRequest(BaseModel):
 async def get_status():
     providers = await run_in_threadpool(llm_router.get_available_providers)
     planner = await run_in_threadpool(day_planner.get_agenda)
-    skills = await run_in_threadpool(skill_engine.list_skills)
+    skills = await run_in_threadpool(macros.list_skills)
     overnight = await run_in_threadpool(spilled_coffee.get_overnight_content)
     notes = await run_in_threadpool(sticky_notes.list_notes)
     buzzcaf_status = await run_in_threadpool(buzzcaf_client.get_status)
@@ -324,6 +331,15 @@ async def list_registered_tools():
 def _run_route(req: ChatRequest, on_event=None) -> Dict[str, Any]:
     """Route one message, with conversation history and stored facts as context."""
     session = req.session or "default"
+
+    # A spoken yes/no can answer a background task waiting at a checkpoint,
+    # as long as the chat itself has no confirmation pending.
+    task_answer = tasks.task_queue.try_voice_confirmation(req.message)
+    if task_answer:
+        memory.add_turn("user", req.message, session=session)
+        memory.add_turn("assistant", task_answer["reply"], session=session)
+        return task_answer
+
     history = memory.recent_turns(session=session)
 
     context_parts = []
@@ -618,12 +634,48 @@ async def clear_history(session: str = "default"):
 
 @app.get("/api/dexter/skills")
 async def get_skills():
-    return await run_in_threadpool(skill_engine.list_skills)
+    return await run_in_threadpool(macros.list_skills)
 
 
 @app.delete("/api/dexter/skills/{name}")
 async def delete_skill(name: str):
-    return {"success": skill_engine.delete_skill(name)}
+    return {"success": macros.delete_skill(name)}
+
+
+# ───────────────────────── background tasks ─────────────────────────
+
+
+class TaskSubmitRequest(BaseModel):
+    goal: str
+
+
+class TaskConfirmRequest(BaseModel):
+    approve: bool = True
+
+
+@app.get("/api/dexter/tasks/scheduled")
+async def get_scheduled_tasks():
+    return await run_in_threadpool(tasks.list_scheduled)
+
+
+@app.get("/api/dexter/tasks")
+async def get_tasks():
+    return await run_in_threadpool(tasks.task_queue.list)
+
+
+@app.post("/api/dexter/tasks")
+async def submit_task(req: TaskSubmitRequest):
+    return await run_in_threadpool(tasks.task_queue.submit, req.goal)
+
+
+@app.post("/api/dexter/tasks/{task_id}/cancel")
+async def cancel_task(task_id: str):
+    return {"success": await run_in_threadpool(tasks.task_queue.cancel, task_id)}
+
+
+@app.post("/api/dexter/tasks/{task_id}/confirm")
+async def confirm_task(task_id: str, req: TaskConfirmRequest):
+    return {"success": await run_in_threadpool(tasks.task_queue.confirm, task_id, req.approve)}
 
 
 # ───────────────────────── system / files ─────────────────────────

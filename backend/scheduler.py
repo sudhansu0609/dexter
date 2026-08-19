@@ -257,6 +257,43 @@ class DexterScheduler:
         )
         print(f"[Scheduler] Fired reminder: {text}")
 
+    # ───────────────────────── generic jobs (background tasks) ─────────────────────────
+
+    def add_recurring_job(self, job_id: str, cron_kwargs: Dict[str, Any], fn, args=None) -> bool:
+        """Arm a recurring callable (used by scheduled background goals)."""
+        if not self._started:
+            return False
+        try:
+            self._scheduler.add_job(
+                fn, trigger=CronTrigger(**cron_kwargs), args=args or [],
+                id=job_id, replace_existing=True, misfire_grace_time=600,
+            )
+            return True
+        except Exception as exc:
+            print(f"[Scheduler] Could not arm recurring job {job_id}: {exc}")
+            return False
+
+    def add_date_job(self, job_id: str, fire_at: datetime, fn, args=None) -> bool:
+        """Arm a one-shot callable at a specific time."""
+        if not self._started or fire_at <= datetime.now():
+            return False
+        try:
+            self._scheduler.add_job(
+                fn, trigger=DateTrigger(run_date=fire_at), args=args or [],
+                id=job_id, replace_existing=True, misfire_grace_time=600,
+            )
+            return True
+        except Exception as exc:
+            print(f"[Scheduler] Could not arm job {job_id}: {exc}")
+            return False
+
+    def remove_job(self, job_id: str) -> None:
+        if self._started:
+            try:
+                self._scheduler.remove_job(job_id)
+            except Exception:
+                pass
+
     # ───────────────────────── planner integration ─────────────────────────
 
     def sync_planner_task(self, task: Dict[str, Any]) -> bool:
@@ -345,6 +382,10 @@ class DexterScheduler:
             id="maint-reflect", replace_existing=True,
         )
         self._scheduler.add_job(
+            self._proactive_scan, CronTrigger(minute="3,18,33,48"),
+            id="maint-proactive", replace_existing=True,
+        )
+        self._scheduler.add_job(
             self._roll_and_rearm_planner, CronTrigger(hour=0, minute=5),
             id="maint-rearm", replace_existing=True,
         )
@@ -403,6 +444,14 @@ class DexterScheduler:
         pruned = memory.prune()
         if pruned:
             print(f"[Scheduler] Pruned {pruned} old conversation turn(s).")
+
+    def _proactive_scan(self) -> None:
+        import proactive
+
+        try:
+            proactive.run_scan()
+        except Exception as exc:
+            print(f"[Scheduler] Proactive scan failed: {exc}")
 
     def _reflect_evening(self) -> None:
         """End-of-day reflection: summarize today, promote durable facts, and

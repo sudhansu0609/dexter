@@ -651,6 +651,11 @@ def _describe_call(tool_name: str, args: Dict[str, Any]) -> str:
     return f"{tool_name.replace('_', ' ')} ({rendered})"
 
 
+# Observers notified after each executed tool call: (session, tool, args, ok).
+# Macro recording hooks in here; observers must never raise into the turn.
+TOOL_OBSERVERS: List[Callable[[str, str, Dict[str, Any], bool], None]] = []
+
+
 def _run_tool(
     tool_name: str,
     args: Dict[str, Any],
@@ -676,6 +681,11 @@ def _run_tool(
     result = execute(tool_name, args)
     if on_event:
         on_event("tool_result", {"name": tool_name, "ok": result.ok, "summary": result.summary})
+    for observer in TOOL_OBSERVERS:
+        try:
+            observer(session, tool_name, args, result.ok)
+        except Exception:
+            pass
     return result, False
 
 

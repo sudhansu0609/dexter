@@ -48,6 +48,15 @@ interface ReminderBanner {
   missed?: boolean;
 }
 
+interface BgTask {
+  id: string;
+  title: string;
+  status: string;
+  question?: string | null;
+  progress?: { ts: string; text: string }[];
+  result?: string | null;
+}
+
 export default function App() {
   // Desktop Window State
   const [isExpanded, setIsExpanded] = useState(false);
@@ -83,6 +92,8 @@ export default function App() {
 
   // Reminders pushed from the backend scheduler over SSE
   const [reminders, setReminders] = useState<ReminderBanner[]>([]);
+  // Background tasks streamed from the task queue over SSE
+  const [bgTasks, setBgTasks] = useState<BgTask[]>([]);
   // Live tool activity during a turn, so the user sees what Dexter is doing
   const [toolActivity, setToolActivity] = useState<string>('');
 
@@ -141,6 +152,7 @@ export default function App() {
     fetchOvernightQueue();
     fetchSkills();
     fetchBuzzcafProjects();
+    fetchBgTasks();
     initSpeechRecognition();
   }, []);
 
@@ -178,6 +190,16 @@ export default function App() {
         }
       });
 
+      source.addEventListener('task', (evt: MessageEvent) => {
+        try {
+          const { payload } = JSON.parse(evt.data);
+          if (!payload?.id) return;
+          setBgTasks(prev => [payload, ...prev.filter(t => t.id !== payload.id)].slice(0, 5));
+        } catch (e) {
+          console.warn('Malformed task event', e);
+        }
+      });
+
       source.onerror = () => {
         source?.close();
         if (!closed) retry = setTimeout(connect, 4000);
@@ -195,6 +217,36 @@ export default function App() {
 
   const dismissReminder = (id: string) => {
     setReminders(prev => prev.filter(r => r.id !== id));
+  };
+
+  const fetchBgTasks = async () => {
+    try {
+      const res = await apiFetch(`${API_BASE}/api/dexter/tasks`);
+      const data = await res.json();
+      if (Array.isArray(data)) setBgTasks(data.slice(0, 5));
+    } catch (e) {}
+  };
+
+  const answerTask = async (taskId: string, approve: boolean) => {
+    try {
+      await apiFetch(`${API_BASE}/api/dexter/tasks/${taskId}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approve }),
+      });
+    } catch (e) {
+      console.warn('Could not answer task checkpoint', e);
+    }
+  };
+
+  const cancelBgTask = async (taskId: string) => {
+    try {
+      await apiFetch(`${API_BASE}/api/dexter/tasks/${taskId}/cancel`, { method: 'POST' });
+    } catch (e) {}
+  };
+
+  const dismissBgTask = (id: string) => {
+    setBgTasks(prev => prev.filter(t => t.id !== id));
   };
 
   const snoozeReminder = async (reminder: ReminderBanner) => {
@@ -952,6 +1004,98 @@ export default function App() {
               </button>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Background task tray: live progress, checkpoint approvals, outcomes */}
+      {bgTasks.length > 0 && (
+        <div style={{ marginBottom: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
+          {bgTasks.map(task => {
+            const active = task.status === 'running' || task.status === 'queued';
+            const waiting = task.status === 'waiting_confirmation';
+            const failed = task.status === 'failed' || task.status === 'cancelled';
+            const accent = waiting ? '#fbbf24' : failed ? '#f87171' : active ? '#38bdf8' : '#10b981';
+            const lastProgress = task.progress && task.progress.length > 0
+              ? task.progress[task.progress.length - 1].text : '';
+            return (
+              <div
+                key={task.id}
+                className="dexter-panel"
+                style={{
+                  padding: '10px 12px', display: 'flex', alignItems: 'center', gap: '10px',
+                  border: `1px solid ${accent}55`,
+                  background: `${accent}14`,
+                }}
+              >
+                <Cpu size={16} style={{ color: accent, flexShrink: 0 }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: '9px', color: accent, fontWeight: 700, letterSpacing: '0.5px' }}>
+                    TASK · {task.status.replace('_', ' ').toUpperCase()}
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#f8fafc', wordBreak: 'break-word' }}>
+                    {task.title}
+                  </div>
+                  {(waiting ? task.question : (task.result || lastProgress)) && (
+                    <div style={{ fontSize: '11px', color: '#94a3b8', wordBreak: 'break-word' }}>
+                      {waiting ? task.question : (task.result || lastProgress)}
+                    </div>
+                  )}
+                </div>
+                {waiting && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => answerTask(task.id, true)}
+                      style={{
+                        background: 'rgba(16, 185, 129, 0.2)', color: '#10b981',
+                        border: '1px solid rgba(16, 185, 129, 0.4)', padding: '5px 10px',
+                        borderRadius: '8px', fontSize: '11px', fontWeight: 700, flexShrink: 0,
+                      }}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => answerTask(task.id, false)}
+                      style={{
+                        background: 'rgba(248, 113, 113, 0.15)', color: '#f87171',
+                        border: '1px solid rgba(248, 113, 113, 0.4)', padding: '5px 10px',
+                        borderRadius: '8px', fontSize: '11px', flexShrink: 0,
+                      }}
+                    >
+                      Deny
+                    </button>
+                  </>
+                )}
+                {active && (
+                  <button
+                    type="button"
+                    onClick={() => cancelBgTask(task.id)}
+                    style={{
+                      background: 'rgba(148, 163, 184, 0.15)', color: '#cbd5e1',
+                      border: '1px solid rgba(148, 163, 184, 0.3)', padding: '5px 10px',
+                      borderRadius: '8px', fontSize: '11px', flexShrink: 0,
+                    }}
+                  >
+                    Cancel
+                  </button>
+                )}
+                {!active && !waiting && (
+                  <button
+                    type="button"
+                    onClick={() => dismissBgTask(task.id)}
+                    style={{
+                      background: 'transparent', color: '#64748b', border: 'none',
+                      padding: '4px', flexShrink: 0, cursor: 'pointer',
+                    }}
+                    title="Dismiss"
+                  >
+                    <X size={14} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
 
