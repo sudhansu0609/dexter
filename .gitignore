@@ -35,5 +35,7 @@ data/overnight_content.json
 data/playlists.json
 data/reminders.json
 data/sticky_notes.json
+data/tasks.json
+data/scheduled_tasks.json
 *.corrupt
 test_kokoro_dexter.wav
