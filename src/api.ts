@@ -66,6 +66,16 @@ export async function eventsUrl(): Promise<string> {
   return `${DEXTER}/events${t ? `?token=${encodeURIComponent(t)}` : ''}`;
 }
 
+// WebSocket cannot send headers either; the voice audio channel authenticates
+// the same way (roadmap Phase 4, item 4.2).
+export async function voiceWsUrl(session = 'default'): Promise<string> {
+  const t = await ensureToken();
+  const wsBase = API_BASE.replace(/^http/, 'ws');
+  return `${wsBase}/api/dexter/voice/ws?session=${encodeURIComponent(session)}${
+    t ? `&token=${encodeURIComponent(t)}` : ''
+  }`;
+}
+
 // ─────────────────────────── helpers ───────────────────────────
 
 const jsonHeaders = { 'Content-Type': 'application/json' };

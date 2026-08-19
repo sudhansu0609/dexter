@@ -230,20 +230,31 @@ facts accumulate without duplicates · retrieval adds <150ms to routing.
 **Goal:** replace browser `webkitSpeechRecognition` with wake word → VAD → STT
 → barge-in, fully offline.
 
-- [ ] **4.1 Server-side STT** (M): new `backend/stt_engine.py` with
+- [x] **4.1 Server-side STT** (M): new `backend/stt_engine.py` with
       **faster-whisper** (small/base, int8 — fine on CPU, better on GPU).
-- [ ] **4.2 Capture transport** (M): mic capture stays in Electron; 16 kHz PCM
+      *(done 2026-08-19: lazy-loaded singleton, graceful degrade when absent)*
+- [x] **4.2 Capture transport** (M): mic capture stays in Electron; 16 kHz PCM
       frames stream to the backend over a new **websocket** route in `main.py`
-      (the app's first WS — SSE remains the outbound channel).
-- [ ] **4.3 Wake word** (S–M): **openWakeWord** (Apache-2.0, fully local,
+      (the app's first WS — SSE remains the outbound channel). *(done
+      2026-08-19: `src/voice/localPipeline.ts` — AudioWorklet capture at 16 kHz,
+      int16 frames over `/api/dexter/voice/ws` with token auth, auto-reconnect)*
+- [x] **4.3 Wake word** (S–M): **openWakeWord** (Apache-2.0, fully local,
       trainable "Dexter" model). Swap to Porcupine only if the false-accept
-      rate annoys in practice.
-- [ ] **4.4 VAD** (S): **silero-vad** (tiny torch model — torch already present
-      after D1) gates STT so whisper only runs on speech segments.
-- [ ] **4.5 Barge-in** (M): VAD-active during TTS playback → `interrupt` event
+      rate annoys in practice. *(done 2026-08-19: `backend/wakeword.py`,
+      "hey jarvis" stock model until a "Dexter" model is trained)*
+- [x] **4.4 VAD** (S): **silero-vad** (tiny torch model — torch already present
+      after D1) gates STT so whisper only runs on speech segments. *(done
+      2026-08-19: `backend/vad.py`, 32 ms chunks as the pipeline clock)*
+- [x] **4.5 Barge-in** (M): VAD-active during TTS playback → `interrupt` event
       → frontend pauses audio, backend cancels the generation stream (2.1).
-- [ ] **4.6 Retire webkitSpeechRecognition** (S): keep as a fallback toggle for
-      one release, then delete from `src/App.tsx`.
+      *(done 2026-08-19: `backend/cancellation.py` flag threaded through
+      router → hybrid_llm stream loop; frontend reports TTS state via the
+      `speaking` control message and kills playback on `interrupt`)*
+- [x] **4.6 Retire webkitSpeechRecognition** (S): keep as a fallback toggle for
+      one release, then delete from `src/App.tsx`. *(done 2026-08-19: local
+      pipeline is the default engine; webkit remains the automatic fallback
+      when STT/VAD deps are missing, forceable via localStorage
+      `dexterVoiceEngine` = 'browser' | 'local'. Delete next release.)*
 
 **Acceptance:** wake word works with the window unfocused · speech-end → first
 reply audio <2.5s locally · "Dexter, stop" halts speech within ~300ms.

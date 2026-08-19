@@ -1,7 +1,17 @@
 import { useEffect, useRef, useState, type MutableRefObject } from 'react';
 import { audioUrl, generateTts } from '../api';
+import { LocalVoicePipeline } from '../voice/localPipeline';
 
 const FOLLOW_UP_WINDOW_MS = 9000;
+
+// Which speech engine drives hands-free input (roadmap Phase 4, item 4.6):
+//   'local'   - the fully-local pipeline: mic PCM over WebSocket, server-side
+//               wake word + VAD + faster-whisper STT, true barge-in.
+//   'browser' - legacy webkitSpeechRecognition (Chrome's cloud recognizer),
+//               kept as a fallback toggle for one release.
+// localStorage 'dexterVoiceEngine' = 'browser' | 'local' forces one; unset
+// means auto (local preferred, browser when the local pipeline is unusable).
+type VoiceEngine = 'starting' | 'local' | 'browser';
 
 interface VoiceDeps {
   // Chat owns the "thinking" flag; the mic restart guards read it so the mic
@@ -12,16 +22,18 @@ interface VoiceDeps {
   commandHandlerRef: MutableRefObject<(text: string) => void>;
 }
 
-// Owns the entire hands-free voice loop: continuous webkitSpeechRecognition,
-// wake word + conversational follow-up window, self-echo filtering, barge-in,
-// Kokoro TTS playback, and the streamed-speech audio queue. Extracted verbatim
-// from the App monolith so behaviour is unchanged (roadmap Phase 6, item 9).
+// Owns the entire hands-free voice loop: speech input (local pipeline or
+// browser recognizer), wake word + conversational follow-up window, self-echo
+// filtering, barge-in, Kokoro TTS playback, and the streamed-speech audio queue.
 export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
   const [isVoiceMuted, setIsVoiceMuted] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [voiceEngine, setVoiceEngine] = useState<VoiceEngine>('starting');
 
   const recognitionRef = useRef<any>(null);
+  const pipelineRef = useRef<LocalVoicePipeline | null>(null);
+  const engineRef = useRef<VoiceEngine>('starting');
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const isSpeakingRef = useRef(false);
   const isVoiceMutedRef = useRef(false);
@@ -32,16 +44,31 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
   const isPlayingQueueRef = useRef(false);
   // Grace period after Dexter speaks during which no wake word is needed, so a
   // follow-up ("and close it") works the way a conversation actually goes.
+  // The local pipeline keeps its own copy of this window server-side.
   const followUpUntilRef = useRef<number>(0);
 
   useEffect(() => {
     isSpeakingRef.current = isSpeaking;
   }, [isSpeaking]);
 
+  // Every place that flips the speaking flag must also tell the local pipeline,
+  // so the server stops treating mic input as commands and watches for barge-in
+  // instead (roadmap Phase 4, item 4.5).
+  const setSpeakingState = (on: boolean) => {
+    setIsSpeaking(on);
+    isSpeakingRef.current = on;
+    pipelineRef.current?.setSpeaking(on);
+  };
+
   useEffect(() => {
     isVoiceMutedRef.current = isVoiceMuted;
     if (isVoiceMuted) {
-      stopListening();
+      if (engineRef.current === 'local') {
+        pipelineRef.current?.stop();
+        setIsListening(false);
+      } else {
+        stopListening();
+      }
       if ('speechSynthesis' in window) window.speechSynthesis.cancel();
     } else {
       startListening();
@@ -50,9 +77,73 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
   }, [isVoiceMuted]);
 
   useEffect(() => {
-    initSpeechRecognition();
+    const pref = localStorage.getItem('dexterVoiceEngine');
+    if (pref === 'browser') {
+      engineRef.current = 'browser';
+      setVoiceEngine('browser');
+      initSpeechRecognition();
+    } else {
+      // Auto (and explicit 'local'): try the local pipeline first; auto falls
+      // back to the browser recognizer if it turns out to be unusable.
+      startLocalPipeline(pref !== 'local');
+    }
+    return () => pipelineRef.current?.stop();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── Local pipeline engine (Phase 4) ──
+
+  const startLocalPipeline = (allowFallback: boolean) => {
+    const pipeline = new LocalVoicePipeline({
+      onReady: (caps) => {
+        engineRef.current = 'local';
+        setVoiceEngine('local');
+        setIsListening(!isVoiceMutedRef.current);
+        console.log(
+          `[Voice] Local pipeline ready (stt=${caps.model || 'whisper'}, wake=${caps.wakeReady})`,
+        );
+      },
+      onUnavailable: (reason) => {
+        console.warn(`[Voice] Local pipeline unavailable (${reason})`);
+        pipelineRef.current = null;
+        setIsListening(false);
+        if (allowFallback && engineRef.current !== 'browser') {
+          engineRef.current = 'browser';
+          setVoiceEngine('browser');
+          initSpeechRecognition();
+        }
+      },
+      onWake: () => {
+        // The server is now capturing a command; nothing to do client-side,
+        // the visualizer already shows the listening state.
+      },
+      onTranscript: (text) => {
+        if (isVoiceMutedRef.current || isThinkingRef.current) return;
+        // Self-echo is suppressed server-side (set_speaking) but a trailing
+        // fragment of Dexter's own reply can still sneak through on slow stops.
+        const lower = text.toLowerCase();
+        const lastSpoken = lastSpokenTextRef.current.toLowerCase();
+        if (lastSpoken && lastSpoken.includes(lower)) {
+          console.log('[Voice] Ignored self-echo transcript:', text);
+          return;
+        }
+        commandHandlerRef.current(text);
+      },
+      onInterrupt: () => {
+        // The user talked over Dexter. Generation is already cancelled
+        // server-side; kill playback right away so the floor is theirs.
+        console.log('[Voice] Barge-in - stopping playback');
+        stopSpeaking();
+      },
+      onConnectionChange: (connected) => {
+        if (engineRef.current === 'local') {
+          setIsListening(connected && !isVoiceMutedRef.current);
+        }
+      },
+    });
+    pipelineRef.current = pipeline;
+    pipeline.start();
+  };
 
   const stopSpeaking = () => {
     // Drop anything still queued, otherwise "stop" only silences the current
@@ -76,8 +167,7 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
         console.warn('Could not cancel speech synthesis', e);
       }
     }
-    setIsSpeaking(false);
-    isSpeakingRef.current = false;
+    setSpeakingState(false);
     lastSpeechEndTimeRef.current = Date.now();
     setTimeout(() => {
       if (!isVoiceMutedRef.current && !isThinkingRef.current) {
@@ -86,7 +176,8 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
     }, 800);
   };
 
-  // Continuous Hands-Free Speech Recognition Loop
+  // ── Browser engine: continuous webkitSpeechRecognition loop (fallback) ──
+
   const initSpeechRecognition = () => {
     if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
       const SpeechRecognition =
@@ -193,6 +284,12 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
   };
 
   const startListening = () => {
+    if (engineRef.current === 'local') {
+      // The local mic stream stays open across turns; (re)starting is only
+      // meaningful after a mute stopped it.
+      if (!isVoiceMutedRef.current) pipelineRef.current?.start();
+      return;
+    }
     if (recognitionRef.current && !isVoiceMutedRef.current) {
       try {
         recognitionRef.current.start();
@@ -204,6 +301,11 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
   };
 
   const stopListening = () => {
+    if (engineRef.current === 'local') {
+      // Never pause the local mic between turns: the server needs the audio
+      // flowing while Dexter speaks for barge-in, and it gates commands itself.
+      return;
+    }
     if (recognitionRef.current) {
       try {
         recognitionRef.current.stop();
@@ -225,8 +327,7 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
 
   const finishSpeaking = () => {
     isPlayingQueueRef.current = false;
-    setIsSpeaking(false);
-    isSpeakingRef.current = false;
+    setSpeakingState(false);
     lastSpeechEndTimeRef.current = Date.now();
     // Dexter just spoke, so a reply is expected - drop the wake-word
     // requirement briefly to allow a natural follow-up.
@@ -266,8 +367,7 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
         // abort() throws if not started - safe to ignore.
       }
     }
-    setIsSpeaking(true);
-    isSpeakingRef.current = true;
+    setSpeakingState(true);
     playNextChunk();
   };
 
@@ -290,8 +390,7 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
       }
     }
 
-    setIsSpeaking(true);
-    isSpeakingRef.current = true;
+    setSpeakingState(true);
 
     try {
       // 2. Fetch Kokoro ONNX audio from backend endpoint
@@ -311,8 +410,7 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
 
       audio.onended = () => {
         release();
-        setIsSpeaking(false);
-        isSpeakingRef.current = false;
+        setSpeakingState(false);
         lastSpeechEndTimeRef.current = Date.now();
         // Resume listening after 1.5s cooldown so mic doesn't catch lingering room echo
         setTimeout(() => {
@@ -324,8 +422,7 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
 
       audio.onerror = () => {
         release();
-        setIsSpeaking(false);
-        isSpeakingRef.current = false;
+        setSpeakingState(false);
         lastSpeechEndTimeRef.current = Date.now();
         if (!isVoiceMutedRef.current) startListening();
       };
@@ -338,23 +435,20 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
         window.speechSynthesis.cancel();
         const utterance = new SpeechSynthesisUtterance(text.substring(0, 200));
         utterance.onend = () => {
-          setIsSpeaking(false);
-          isSpeakingRef.current = false;
+          setSpeakingState(false);
           lastSpeechEndTimeRef.current = Date.now();
           setTimeout(() => {
             if (!isVoiceMutedRef.current) startListening();
           }, 1500);
         };
         utterance.onerror = () => {
-          setIsSpeaking(false);
-          isSpeakingRef.current = false;
+          setSpeakingState(false);
           lastSpeechEndTimeRef.current = Date.now();
           if (!isVoiceMutedRef.current) startListening();
         };
         window.speechSynthesis.speak(utterance);
       } else {
-        setIsSpeaking(false);
-        isSpeakingRef.current = false;
+        setSpeakingState(false);
         lastSpeechEndTimeRef.current = Date.now();
         startListening();
       }
@@ -366,6 +460,7 @@ export function useVoice({ isThinkingRef, commandHandlerRef }: VoiceDeps) {
     isVoiceMuted,
     isListening,
     isSpeaking,
+    voiceEngine,
     // refs shared with chat
     isVoiceMutedRef,
     lastSpokenTextRef,
