@@ -341,6 +341,10 @@ class DexterScheduler:
             id="maint-reminders", replace_existing=True,
         )
         self._scheduler.add_job(
+            self._reflect_evening, CronTrigger(hour=23, minute=40),
+            id="maint-reflect", replace_existing=True,
+        )
+        self._scheduler.add_job(
             self._roll_and_rearm_planner, CronTrigger(hour=0, minute=5),
             id="maint-rearm", replace_existing=True,
         )
@@ -400,18 +404,53 @@ class DexterScheduler:
         if pruned:
             print(f"[Scheduler] Pruned {pruned} old conversation turn(s).")
 
+    def _reflect_evening(self) -> None:
+        """End-of-day reflection: summarize today, promote durable facts, and
+        recap the week on Sundays. The startup catch-up covers machines that
+        are already asleep by now."""
+        import reflection
+
+        try:
+            reflection.summarize_day()
+            reflection.extract_facts(hours=24)
+            if datetime.now().weekday() == 6:
+                reflection.summarize_week()
+        except Exception as exc:
+            print(f"[Scheduler] Evening reflection failed: {exc}")
+
     def _morning_brief(self) -> None:
         from tools_core import day_planner
 
         tasks = [t for t in day_planner.get_agenda().get("tasks", []) if not t.get("completed")]
-        if not tasks:
+
+        # Open with yesterday's episodic summary when there is one - the brief
+        # should feel like a colleague catching you up, not a bare task count.
+        yesterday_line = ""
+        try:
+            from memory import memory as _memory
+
+            yesterday = (datetime.now() - timedelta(days=1)).date().isoformat()
+            summary = _memory.get_summary("day", yesterday)
+            if summary:
+                yesterday_line = summary.split(". ")[0].rstrip(".") + "."
+        except Exception:
+            pass
+
+        if not tasks and not yesterday_line:
             return
-        headline = f"{len(tasks)} task(s) today, starting with {tasks[0].get('title', '')}"
+        headline = (
+            f"{len(tasks)} task(s) today, starting with {tasks[0].get('title', '')}"
+            if tasks else "Nothing scheduled today."
+        )
+        spoken = "Good morning. "
+        if yesterday_line:
+            spoken += f"Yesterday: {yesterday_line} "
+        spoken += f"{headline}."
         notify.toast_async("Dexter - Good morning", headline)
         bus.publish("reminder", {
             "id": "morning-brief",
             "text": headline,
-            "spoken": f"Good morning. {headline}.",
+            "spoken": spoken,
             "speak": True,
             "banner": True,
         })

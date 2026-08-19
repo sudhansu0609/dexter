@@ -81,6 +81,13 @@ async def lifespan(app: FastAPI):
             buzzcaf_client.health_check(force=True)
         except Exception as exc:
             print(f"[Startup] Health warm-up skipped: {exc}")
+        # Facts stored before semantic memory existed get their embeddings now.
+        memory.backfill_embeddings()
+        # Backfill yesterday's summary/facts if the machine slept through the
+        # nightly reflection cron. Needs the LLM, hence after the health warm.
+        import reflection
+
+        reflection.catch_up()
 
     threading.Thread(target=_warm_health, name="dexter-health-warm", daemon=True).start()
 
@@ -328,6 +335,11 @@ def _run_route(req: ChatRequest, on_event=None) -> Dict[str, Any]:
     facts = memory.context_note()
     if facts:
         context_parts.append(facts)
+    # Memories that match *this* message - past summaries, ingested documents,
+    # older facts - so "second brain" recall happens without an explicit ask.
+    relevant = memory.semantic_context(req.message)
+    if relevant:
+        context_parts.append(relevant)
     context = "\n\n".join(context_parts)
 
     result = intent_router.route(

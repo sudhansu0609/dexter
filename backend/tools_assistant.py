@@ -5,6 +5,7 @@ Kept separate from tools_core so the scheduler (which reads the day planner from
 tools_core) never forms an import cycle with the tools that drive it.
 """
 
+import os
 from typing import Optional
 
 from memory import memory
@@ -198,6 +199,83 @@ def forget_fact(key: str) -> ToolResult:
     if memory.forget(key):
         return ToolResult(ok=True, summary=f"Forgotten: {key}.", data={"key": key})
     return ToolResult.fail(f"I had nothing stored under '{key}'.")
+
+
+_DOC_EXTENSIONS = (".txt", ".md", ".markdown", ".log", ".csv", ".json", ".py", ".js", ".ts")
+_DOC_MAX_BYTES = 400_000
+_DOC_CHUNK_CHARS = 1000
+
+
+def _chunk_text(text: str, size: int = _DOC_CHUNK_CHARS) -> list:
+    """Split on paragraph boundaries, packing paragraphs up to ~size chars."""
+    chunks, current = [], ""
+    for para in text.split("\n\n"):
+        para = para.strip()
+        if not para:
+            continue
+        if len(current) + len(para) + 2 <= size:
+            current = f"{current}\n\n{para}" if current else para
+            continue
+        if current:
+            chunks.append(current)
+        # A single oversized paragraph is split hard.
+        while len(para) > size:
+            chunks.append(para[:size])
+            para = para[size:]
+        current = para
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+@tool(
+    name="remember_document",
+    description=(
+        "Read a text file (txt, md, code, csv...) into Dexter's long-term memory "
+        "so its contents can be recalled later by meaning, with the file cited "
+        "as the source."
+    ),
+    params={"path": {"type": "string", "description": "Path to the file to ingest"}},
+    examples=[
+        "remember this document",
+        "ingest my notes file into your memory",
+        "learn the contents of that readme",
+        "add this file to your knowledge",
+        "memorize the project notes",
+    ],
+    category="memory",
+)
+def remember_document(path: str) -> ToolResult:
+    import pathguard
+
+    allowed = pathguard.resolve(path)
+    if not allowed:
+        return ToolResult.fail(pathguard.denial(path))
+    if not os.path.isfile(allowed):
+        return ToolResult.fail(f"'{path}' is not a file I can read.")
+    if not allowed.lower().endswith(_DOC_EXTENSIONS):
+        return ToolResult.fail(
+            "I can only ingest text-like files for now "
+            f"({', '.join(_DOC_EXTENSIONS[:4])}...). PDFs come later."
+        )
+    if os.path.getsize(allowed) > _DOC_MAX_BYTES:
+        return ToolResult.fail("That file is too large to ingest (400KB limit).")
+
+    try:
+        with open(allowed, "r", encoding="utf-8", errors="ignore") as handle:
+            text = handle.read()
+    except Exception as exc:
+        return ToolResult.fail(f"Could not read the file: {exc}")
+
+    stored = memory.add_document(allowed, _chunk_text(text))
+    if not stored:
+        return ToolResult.fail("The file had no readable content to remember.")
+    name = os.path.basename(allowed)
+    return ToolResult(
+        ok=True,
+        summary=f"Read {name} into memory - {stored} passage(s). Ask me about it any time.",
+        data={"source": allowed, "chunks": stored},
+    )
 
 
 # ───────────────────────── time ─────────────────────────

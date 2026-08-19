@@ -267,11 +267,16 @@ class _Embedder:
             if self._mode != "pending":
                 return
             try:
-                from sentence_transformers import SentenceTransformer  # type: ignore
+                # Shared instance: memory.py embeds against the same model, so
+                # loading here must not create a second copy.
+                import embeddings as shared_embeddings
 
-                self._model = SentenceTransformer("all-MiniLM-L6-v2")
+                model = shared_embeddings.get_model()
+                if model is None:
+                    raise RuntimeError("shared embedding model unavailable")
+                self._model = model
                 self._mode = "neural"
-                print("[Router] Semantic matching: all-MiniLM-L6-v2")
+                print(f"[Router] Semantic matching: {shared_embeddings.MODEL_NAME}")
             except Exception as exc:
                 self._mode = "lexical"
                 print(f"[Router] sentence-transformers unavailable ({exc}); using lexical matching.")

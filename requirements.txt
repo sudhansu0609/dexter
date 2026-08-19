@@ -15,10 +15,12 @@ apscheduler
 dateparser
 winotify; sys_platform == "win32"
 
-# ── Intent matching ──
-# Optional but strongly recommended: without it the router falls back to
-# lexical matching, which has noticeably lower recall on paraphrased commands.
+# ── Intent matching & semantic memory ──
+# Optional but strongly recommended: without sentence-transformers the router
+# falls back to lexical matching and memory recall is keyword-only.
 sentence-transformers
+# SQL-side vector search for memory; degrades to a numpy scan if it fails to load.
+sqlite-vec
 
 # ── Desktop shell (backend/desktop_app.py) ──
 pywebview
