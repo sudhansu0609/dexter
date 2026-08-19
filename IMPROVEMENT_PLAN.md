@@ -90,7 +90,7 @@ on local LLMs (LM Studio / Ollama), that:
 
 **Goal:** clean committed baseline, one accurate living roadmap, zero known bugs.
 
-- [ ] **0.1 Commit the rebuild** in logical groups (S):
+- [x] **0.1 Commit the rebuild** in logical groups (S): *(done 2026-08-19)*
   1. `chore:` gitignore `.pytest_cache/` + runtime `data/*.json` (keep seeds/`.gitkeep`); `.env` removal stays, `.env.example` in
   2. `feat(core):` `tool_registry.py`, `router.py`, `events.py`, `jsonstore.py`, `timeparse.py`
   3. `feat(llm):` `hybrid_llm.py`
@@ -100,7 +100,8 @@ on local LLMs (LM Studio / Ollama), that:
   7. `feat(api):` `main.py`, `src/App.tsx`, modified legacy modules
   8. `test:` `backend/test_router.py`, `test_dexter_suite.py`
   9. `docs:` README + this roadmap
-- [ ] **0.2 Fix bugs 1–8** (M total, each S). Bug 6 via `zoneinfo`/`tzlocal`
+- [x] **0.2 Fix bugs 1–8** (M total, each S). *(done 2026-08-19; bug 3's
+      per-session + TTL fix also completes Phase 1.5)* Bug 6 via `zoneinfo`/`tzlocal`
       (emit IANA names). Bug 7 via real maintenance jobs: prune fired reminders
       >7 days, dedup overnight content on write, roll planner date at 00:05.
       Bug 2 for now: delete the junk skill file; the redesign is Phase 5.3.
@@ -133,8 +134,9 @@ destructive actions session-scoped and confirmed.
       `dexter_tools.py`, `windows_tools.py`; use arg lists / `os.startfile`.
 - [ ] **1.4 Sibling spawn fix** (S): `buzzcaf_client.py` spawns the sibling
       uvicorn on `127.0.0.1` (not `0.0.0.0`); sibling paths via env vars.
-- [ ] **1.5 Per-session confirmations + TTL** (S): completes bug 3 — key
+- [x] **1.5 Per-session confirmations + TTL** (S): completes bug 3 — key
       `_pending` by session id, expire after ~120s, support explicit cancel.
+      *(done 2026-08-19 as part of the Phase 0 bug fixes)*
 - [ ] **1.6 CORS tightening** (S): drop the any-`file://` origin allowance;
       restrict to the Vite dev origin + Electron origin.
 
