@@ -46,7 +46,6 @@ import voice_pipeline
 import tools_assistant  # noqa: F401  - registers reminder/memory tools
 import windows_tools
 from buzzcaf_client import buzzcaf_client
-from dexter_tools import AppLauncherTool, PlaywrightBrowserTool
 from events import bus
 from filesystem_tool import FileSystemTool
 import macros
@@ -56,7 +55,14 @@ from hybrid_llm import llm_router
 from memory import memory
 from scheduler import scheduler
 from tool_registry import all_tools
-from tools_core import day_planner, spilled_coffee, sticky_notes, youtube_tool
+from tools_core import (
+    AppLauncherTool,
+    PlaywrightBrowserTool,
+    day_planner,
+    spilled_coffee,
+    sticky_notes,
+    youtube_tool,
+)
 from voice_engine import DexterVoiceEngine
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

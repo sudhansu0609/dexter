@@ -105,10 +105,13 @@ on local LLMs (LM Studio / Ollama), that:
       (emit IANA names). Bug 7 via real maintenance jobs: prune fired reminders
       >7 days, dedup overnight content on write, roll planner date at 00:05.
       Bug 2 for now: delete the junk skill file; the redesign is Phase 5.3.
-- [ ] **0.3 Legacy module retirement** (S): fold `dexter_tools.py` /
+- [x] **0.3 Legacy module retirement** (S): fold `dexter_tools.py` /
       `spilled_coffee_controller.py` logic into `tools_core.py`/`jsonstore.py`
       opportunistically; `filesystem_tool.py` gets rewritten naturally by the
-      Phase 1 pathguard work.
+      Phase 1 pathguard work. *(done 2026-08-19: both modules folded into
+      `tools_core.py` verbatim and deleted; the dead `BuzzcafAITool` class was
+      dropped — `buzzcaf_client.py` is the real integration. `filesystem_tool.py`
+      stays: pathguard (1.2) already rewrote its enforcement core.)*
 
 **Acceptance:** `git status` clean · `pytest backend/test_router.py` green ·
 `python test_dexter_suite.py` green · this file is the only plan doc · each bug
