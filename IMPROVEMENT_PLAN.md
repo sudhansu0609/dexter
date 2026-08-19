@@ -255,31 +255,41 @@ reply audio <2.5s locally · "Dexter, stop" halts speech within ~300ms.
 **Goal:** "handle tasks on my behalf" — background execution, macros,
 proactivity, scheduled automations.
 
-- [ ] **5.1 Task queue + background execution** (M): new `backend/tasks.py` —
-      asyncio queue with persisted task records
-      (queued / running / waiting-confirmation / done / failed), progress events
-      over the existing SSE bus; submit/list/cancel endpoints; frontend task
-      tray (Phase 6).
-- [ ] **5.2 Multi-step plans with checkpoint confirmations** (M–L): extend the
-      Tier-2 loop — multi-step tasks first produce a step plan, execute as a
-      background task, and **pause at destructive steps** using the Phase-1
-      per-session confirmation mechanism ("I'm about to send this email — go
-      ahead?"). Voice-confirmable via Phase 4.
-- [ ] **5.3 Skill engine → recorded macros** (M): replace the dead auto-learn
-      design with **explicit recording** — "Dexter, record a skill" → capture
-      the tool-call sequence with parameter slots → save to `skills/*.json` →
-      replay by name with slot filling (reuses `router.py`'s deterministic slot
-      filler). Explicit beats silent learning for trust and debuggability.
-- [ ] **5.4 Proactive suggestions** (M): periodic scheduler job — calendar next
-      2h + priority unread email (`google_tools.py`) + overdue planner items →
-      suggestion events → banner/voice via `notify.py`, with per-category
-      **quiet hours and rate limits** (proactivity that nags gets disabled;
-      conservative and configurable from day one).
-- [ ] **5.5 Voice-scheduled recurring jobs** (S–M): "every Friday at 5, curate
-      video ideas and email me the list" → existing `timeparse` recurrence +
-      scheduler + task queue.
-- [ ] **5.6 Guardrails** (S): max tool calls per background task, scope limits
-      on cloud fallback, every step auditable in the task record.
+- [x] **5.1 Task queue + background execution** (M): *(done 2026-08-19)* new
+      `backend/tasks.py` — single worker thread (two tasks fighting over one
+      desktop is a bug, not a feature), records persisted to `data/tasks.json`,
+      `task` events on the SSE bus, submit/list/cancel/confirm endpoints, task
+      tray in the UI, and spoken announcements on finish/checkpoint via the
+      existing reminder channel.
+- [x] **5.2 Multi-step plans with checkpoint confirmations** (M–L): *(done
+      2026-08-19)* plan-then-execute — the LLM plans steps, each step runs
+      through the normal three-tier router in a task-scoped session, so a
+      destructive step parks the task in `waiting_confirmation` via the
+      Phase-1 mechanism. Approval comes from tray buttons, the confirm
+      endpoint, or a spoken yes/no (routed to the single waiting task when the
+      chat has no pending confirmation of its own). Verified live: 3-step plan
+      executed with progress and a correct final summary.
+- [x] **5.3 Skill engine → recorded macros** (M): *(done 2026-08-19)*
+      `skill_engine.py` deleted; new `backend/macros.py` — "record a skill
+      called X" captures executed tool calls (via a `TOOL_OBSERVERS` hook in
+      `_run_tool`), "stop recording" saves to `skills/*.json` with the first
+      step's longest string arg as the substitutable slot; `run_skill` is
+      confirm=True so one go-ahead covers the recorded sequence. Legacy prose
+      skills list as non-executable.
+- [x] **5.4 Proactive suggestions** (M): *(done 2026-08-19)* new
+      `backend/proactive.py` — 15-min scan of calendar (next 2h), unread email
+      (hourly at most), overdue planner items; banner/toast only, voice
+      reserved for events <20 min away; quiet hours (`DEXTER_QUIET_HOURS`),
+      per-category cooldowns, same-day dedup, master off-switch
+      (`DEXTER_PROACTIVE=0`).
+- [x] **5.5 Voice-scheduled recurring jobs** (S–M): *(done 2026-08-19)*
+      `schedule_task` tool → `timeparse` recurrence/one-shot →
+      `data/scheduled_tasks.json`, re-armed on boot, fires goals into the task
+      queue; list/cancel by voice.
+- [x] **5.6 Guardrails** (S): *(done 2026-08-19)* 8-step plan cap, 16 tool
+      calls per task, 30-min checkpoint timeout fails safe, full audit trail
+      (plan, per-step outcomes, timestamps, tool-call count) in the task
+      record.
 
 **Acceptance:** a scheduled morning task checks calendar + email and briefs by
 voice with progress visible · a recorded 3-step macro replays with a new
@@ -303,7 +313,7 @@ Triage of the former OPTIMIZATION_PLAN.md's 19 items against the Jarvis vision:
 | 17 | Offline detection / SSE reconnect | **Finish** (partially done: 4s auto-reconnect) (S) |
 | 15 | Loading states | **Do** where tasks/tools run (S) |
 | — | Token-stream rendering | **Do** — Phase 2.1 counterpart (S) |
-| — | Task tray + confirmation dialogs | **Do** — Phase 5.1/5.2 counterpart (M) |
+| — | Task tray + confirmation dialogs | **Done** with Phase 5 (2026-08-19) |
 | — | DPR-aware canvas, remove dead `provider`/`modelsStatus` state | **Do** — bug 8, Phase 0 (S) |
 | 4, 5, 7 | Memoize, throttle canvas, virtualize lists | **Defer** until a measured problem |
 | 12 | electron-builder packaging | **Defer** to a "distribution" milestone |
