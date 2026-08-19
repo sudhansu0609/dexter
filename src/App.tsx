@@ -65,10 +65,6 @@ export default function App() {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
   
-  // Model Provider Selection
-  const [provider, setProvider] = useState<'auto' | 'lmstudio' | 'gemini' | 'openai' | 'ollama'>('auto');
-  const [modelsStatus, setModelsStatus] = useState<any>(null);
-  
   // Widgets Data
   const [tasks, setTasks] = useState<Task[]>([]);
   const [newTaskTitle, setNewTaskTitle] = useState('');
@@ -140,7 +136,6 @@ export default function App() {
   });
 
   useEffect(() => {
-    fetchStatus();
     fetchPlanner();
     fetchOvernightQueue();
     fetchSkills();
@@ -218,14 +213,23 @@ export default function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    // Match the backing store to the CSS size at device resolution - a fixed
+    // buffer stretched by CSS renders blurry on any HiDPI screen.
+    const dpr = window.devicePixelRatio || 1;
+    const width = canvas.clientWidth || 380;
+    const height = canvas.clientHeight || 180;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
     let animFrame: number;
     const particles: { x: number; y: number; vx: number; vy: number; radius: number; color: string }[] = [];
     const particleCount = 40;
 
     for (let i = 0; i < particleCount; i++) {
       particles.push({
-        x: Math.random() * canvas.width,
-        y: Math.random() * canvas.height,
+        x: Math.random() * width,
+        y: Math.random() * height,
         vx: (Math.random() - 0.5) * 1.2,
         vy: (Math.random() - 0.5) * 1.2,
         radius: Math.random() * 3 + 2,
@@ -234,7 +238,7 @@ export default function App() {
     }
 
     const render = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.clearRect(0, 0, width, height);
       ctx.shadowBlur = 0;
       ctx.shadowColor = 'transparent';
 
@@ -265,8 +269,8 @@ export default function App() {
         p.x += p.vx * (isSpeaking ? 2.5 : isThinking ? 1.8 : 1.0);
         p.y += p.vy * (isSpeaking ? 2.5 : isThinking ? 1.8 : 1.0);
 
-        if (p.x < 0 || p.x > canvas.width) p.vx *= -1;
-        if (p.y < 0 || p.y > canvas.height) p.vy *= -1;
+        if (p.x < 0 || p.x > width) p.vx *= -1;
+        if (p.y < 0 || p.y > height) p.vy *= -1;
 
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
@@ -439,14 +443,6 @@ export default function App() {
     }
   };
 
-  const fetchStatus = async () => {
-    try {
-      const res = await fetch(`${API_BASE}/api/dexter/status`);
-      const data = await res.json();
-      setModelsStatus(data);
-    } catch (e) {}
-  };
-
   const fetchPlanner = async () => {
     try {
       const res = await fetch(`${API_BASE}/api/dexter/planner`);
@@ -579,7 +575,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/dexter/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: textToSend, provider, voiceEnabled: speakEnabled }),
+        body: JSON.stringify({ message: textToSend, provider: 'auto', voiceEnabled: speakEnabled }),
       });
 
       if (!res.ok || !res.body) throw new Error(`Chat failed: ${res.status}`);
@@ -1002,7 +998,7 @@ export default function App() {
             </div>
             
             <div style={{ position: 'relative', width: '100%', height: '180px', margin: '0 auto', background: 'rgba(9, 13, 22, 0.8)', borderRadius: '16px', border: '1px solid rgba(56, 189, 248, 0.3)', overflow: 'hidden' }}>
-              <canvas ref={canvasRef} width={380} height={180} style={{ width: '100%', height: '100%' }} />
+              <canvas ref={canvasRef} style={{ width: '100%', height: '100%' }} />
               
               {/* Status Badge */}
               <div style={{ position: 'absolute', bottom: '10px', left: '50%', transform: 'translateX(-50%)', background: 'rgba(15, 23, 42, 0.85)', padding: '4px 12px', borderRadius: '12px', border: '1px solid rgba(168, 85, 247, 0.4)', fontSize: '11px', color: isVoiceMuted ? '#f87171' : isSpeaking ? '#f472b6' : isThinking ? '#a855f7' : '#38bdf8', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '6px', whiteSpace: 'nowrap' }}>
@@ -1075,7 +1071,7 @@ export default function App() {
 
           {/* Quick Desktop Controls Bar */}
           {!isExpanded && (
-            <div style={{ display: 'flex', justifyContent: 'between', gap: '8px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px' }}>
               <button
                 type="button"
                 onClick={toggleExpandWindow}
