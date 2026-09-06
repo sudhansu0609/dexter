@@ -13,6 +13,8 @@ the conversational follow-up window and the browser-recognition fallback.
 """
 
 import os
+
+import env_boot  # noqa: F401  - loads .env for every entry point
 from typing import List, Optional
 
 import numpy as np

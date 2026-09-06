@@ -10,6 +10,8 @@ the capability and the pipeline falls back to browser recognition when it is off
 """
 
 import os
+
+import env_boot  # noqa: F401  - loads .env for every entry point
 from typing import Optional
 
 import numpy as np

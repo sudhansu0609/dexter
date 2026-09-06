@@ -209,6 +209,28 @@ export class LocalVoicePipeline {
       this.sourceNode.connect(this.processorNode);
       this.processorNode.connect(context.destination);
     }
+
+    // A freshly created AudioContext starts "suspended": its graph does not run,
+    // so no mic audio is captured and the backend hears silence (the wake word
+    // never fires) until it is resumed - which the shell may only permit after a
+    // user gesture. Resume now, and fall back to the first interaction otherwise.
+    try {
+      await context.resume();
+    } catch {
+      // Autoplay policy wants a gesture; handled below.
+    }
+    if (context.state !== 'running') {
+      const resumeOnGesture = () => {
+        context.resume().catch(() => undefined);
+        if (context.state === 'running') {
+          window.removeEventListener('pointerdown', resumeOnGesture);
+          window.removeEventListener('keydown', resumeOnGesture);
+        }
+      };
+      window.addEventListener('pointerdown', resumeOnGesture);
+      window.addEventListener('keydown', resumeOnGesture);
+    }
+    console.log('[Voice] capture AudioContext:', context.state, '@', context.sampleRate, 'Hz');
   }
 
   private connect(): void {

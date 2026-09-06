@@ -13,6 +13,8 @@ barge-in. The bundled model loads offline; `available()` is False without it.
 """
 
 import os
+
+import env_boot  # noqa: F401  - loads .env for every entry point
 from typing import Optional
 
 import numpy as np

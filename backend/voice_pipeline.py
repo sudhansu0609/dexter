@@ -23,6 +23,8 @@ socket.
 """
 
 import os
+
+import env_boot  # noqa: F401  - loads .env for every entry point
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -190,6 +192,7 @@ class VoiceSession:
             frame = self._wake_buf[:WAKE_FRAME]
             self._wake_buf = self._wake_buf[WAKE_FRAME:]
             if self._wake.process(frame):
+                print("[Voice] Wake word detected - listening.")
                 self._begin_recording()
                 events.append({"type": "wake"})
                 events.append({"type": "speech_start"})
@@ -227,6 +230,7 @@ class VoiceSession:
                 if self._in_followup() and not self._in_echo_guard():
                     self._speech_run = self._speech_run + 1 if speech else 0
                     if self._speech_run >= SPEECH_START_CHUNKS:
+                        print("[Voice] Follow-up speech detected - listening.")
                         self._begin_recording()
                         events.append({"type": "speech_start"})
                 continue
@@ -279,9 +283,19 @@ class VoiceSession:
         text = ""
         if self._had_speech or audio.size:
             text = self._stt.transcribe(audio)
+
+        seconds = audio.size / SAMPLE_RATE if audio.size else 0.0
         text = self._strip_wake_prefix(text)
         if text:
+            print(f"[Voice] Heard ({seconds:.1f}s): {text!r}")
             events.append({"type": "transcript", "text": text})
+        else:
+            # Silence here was the whole problem: the pipeline looked dead when
+            # it had simply transcribed nothing.
+            print(
+                f"[Voice] Captured {seconds:.1f}s but transcribed nothing"
+                f"{' (no speech detected)' if not self._had_speech else ''}."
+            )
 
     @staticmethod
     def _strip_wake_prefix(text: str) -> str:

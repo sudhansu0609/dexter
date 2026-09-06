@@ -1,4 +1,6 @@
 import os
+
+import env_boot  # noqa: F401  - loads .env for every entry point
 import time
 import asyncio
 import edge_tts
