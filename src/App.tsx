@@ -139,7 +139,11 @@ export default function App() {
       <div style={{ display: 'grid', gridTemplateColumns: isExpanded ? '340px 1fr 340px' : '1fr', gap: '16px' }}>
         {/* The conversation */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-          <MissionCard mission={missionState.mission} onPrefill={(t) => chat.setInputMsg(t)} />
+          <MissionCard
+            mission={missionState.mission}
+            onPrefill={(t) => chat.setInputMsg(t)}
+            onToggleInitiative={missionState.toggleInitiative}
+          />
           <ChatFeed
             chatLog={chat.chatLog}
             isThinking={chat.isThinking}

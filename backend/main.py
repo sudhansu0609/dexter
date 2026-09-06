@@ -865,6 +865,17 @@ async def update_mission(req: MissionUpdate):
     return await run_in_threadpool(mission.status)
 
 
+class InitiativeUpdate(BaseModel):
+    mode: str
+
+
+@app.post("/api/dexter/initiative")
+async def set_initiative_mode(req: InitiativeUpdate):
+    """The switch: 'dexter' takes initiative, 'me' waits to be asked."""
+    mission.set_initiative(req.mode)
+    return await run_in_threadpool(mission.status)
+
+
 @app.post("/api/dexter/companion/checkin")
 async def companion_checkin(kind: str = "midday"):
     """Fire a check-in now (the UI's 'check in' and for trying the voice)."""

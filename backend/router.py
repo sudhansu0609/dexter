@@ -227,6 +227,16 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
     ),
     # ── the mission (v7) ──
     (
+        re.compile(r"^(?:you\s+)?(?:take|keep)\s+(?:the\s+)?(?:lead|initiative)(?:\s+again)?\W*$|^(?:you|dexter)\s+(?:lead|drive|can lead(?: again)?)\W*$|^(?:take|lead)\s+(?:it\s+)?from here\W*$", re.I),
+        "set_initiative",
+        lambda m: {"mode": "dexter"},
+    ),
+    (
+        re.compile(r"^(?:i'?ll|i will|let me)\s+(?:take (?:it|over|the lead)|lead|drive)(?:\s+(?:from here|for now|now))?\W*$|^(?:stop|no more|quit)\s+(?:taking\s+)?(?:the\s+)?(?:initiative|initiatives|proposals|nudging|check-?ins)\W*$", re.I),
+        "set_initiative",
+        lambda m: {"mode": "me"},
+    ),
+    (
         re.compile(r"^(?:today'?s win is|the one thing today is|my win (?:for )?today(?: is)?:?|if i do one thing today it'?s)\s+(.+)$", re.I),
         "set_today_win",
         lambda m: {"text": m.group(1).strip(" .!")},

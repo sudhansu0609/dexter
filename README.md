@@ -200,6 +200,15 @@ Dexter is a coworker on one mission, not a command line with notifications.
 - **It coaches, briefly.** Finishing something reports the day's progress;
   adding a task while an older one is overdue names it; something moved three
   times gets a "break it down or drop it". One sentence, never a lecture.
+- **It proposes the next move.** A commitment due in twenty minutes, no win
+  picked by mid-morning, something overdue for three days, a video of yours
+  gathering pace, saved topics with nothing in production: Dexter brings it
+  up, once, with one-tap answers that act ("Move it to tomorrow", "Analyse
+  this video", "Start a video about ..."). Four such proposals a day at most.
+- **You can take the lead.** The pill on the Mission card flips between
+  **DEXTER LEADS** and **YOU LEAD**. In YOU LEAD, Dexter never speaks first:
+  no check-ins, nudges, coaching tails or proposals; it answers when asked.
+  "I'll take it from here" and "take the lead" do the same in the chat.
 - **It keeps the thread.** What you say today is in the model's context; a
   finished code job or a Studio step waiting for approval arrives as a
   message with "Approve" / "Check it first", not a banner.

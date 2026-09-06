@@ -1,4 +1,4 @@
-import { Compass, Flag, Target, AlertTriangle, Trophy } from 'lucide-react';
+import { Compass, Flag, Target, AlertTriangle, Trophy, Hand, Sparkles } from 'lucide-react';
 import type { MissionStatus } from '../types';
 
 interface Props {
@@ -6,11 +6,13 @@ interface Props {
   // Pre-fills the chat input with a phrase Dexter understands without a model,
   // so setting the mission is a conversation, not a form.
   onPrefill: (text: string) => void;
+  // The switch: Dexter takes initiative, or waits to be asked.
+  onToggleInitiative: () => void;
 }
 
 // The shared mission, always in view above the conversation (roadmap v7).
 // Empty slots are invitations: clicking one starts the sentence for you.
-export function MissionCard({ mission, onPrefill }: Props) {
+export function MissionCard({ mission, onPrefill, onToggleInitiative }: Props) {
   if (!mission) return null;
   const line = (icon: JSX.Element, label: string, value: string, prompt: string, ask: string) => (
     <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-start', fontSize: '12px', lineHeight: 1.35 }}>
@@ -42,8 +44,40 @@ export function MissionCard({ mission, onPrefill }: Props) {
     <div className="dexter-panel" style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
       <div style={{ fontSize: '10px', fontWeight: 800, letterSpacing: '0.08em', opacity: 0.8, display: 'flex', alignItems: 'center', gap: '6px' }}>
         <Compass size={12} /> OUR MISSION
-        {mission.snoozedUntil > Date.now() / 1000 && <span style={{ marginLeft: 'auto', opacity: 0.6, fontWeight: 600 }}>check-ins paused</span>}
+        {mission.snoozedUntil > Date.now() / 1000 && mission.initiative === 'dexter' && (
+          <span style={{ opacity: 0.6, fontWeight: 600 }}>check-ins paused</span>
+        )}
+        <button
+          type="button"
+          onClick={onToggleInitiative}
+          title={
+            mission.initiative === 'me'
+              ? 'You lead: Dexter waits to be asked. Click to let Dexter take initiative.'
+              : 'Dexter leads: check-ins, nudges and proposals. Click to take the initiative yourself.'
+          }
+          style={{
+            marginLeft: 'auto',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '5px',
+            background: mission.initiative === 'me' ? 'rgba(56, 189, 248, 0.12)' : 'rgba(168, 85, 247, 0.18)',
+            border: `1px solid ${mission.initiative === 'me' ? 'rgba(56, 189, 248, 0.5)' : 'rgba(168, 85, 247, 0.6)'}`,
+            color: mission.initiative === 'me' ? '#bae6fd' : '#e9d5ff',
+            borderRadius: '999px',
+            padding: '2px 9px',
+            fontSize: '10px',
+            fontWeight: 700,
+            letterSpacing: '0.04em',
+            cursor: 'pointer',
+          }}
+        >
+          {mission.initiative === 'me' ? <Hand size={11} /> : <Sparkles size={11} />}
+          {mission.initiative === 'me' ? 'YOU LEAD' : 'DEXTER LEADS'}
+        </button>
       </div>
+      {mission.initiative === 'me' && (
+        <div style={{ fontSize: '11px', opacity: 0.7 }}>Dexter waits for you: no check-ins, nudges or proposals until you hand the lead back.</div>
+      )}
       {line(<Target size={13} />, 'North star', mission.northStar, 'our mission is ', 'What are we working towards?')}
       {line(<Flag size={13} />, 'This week', mission.focus, "this week's focus is ", 'Set the focus')}
       {line(<Trophy size={13} />, "Today's win", mission.todayWin, "today's win is ", 'What makes today a win?')}

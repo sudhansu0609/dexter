@@ -36,7 +36,14 @@ _sent_today_date: str = ""
 
 
 def enabled() -> bool:
-    return os.getenv("DEXTER_PROACTIVE", "1") != "0"
+    if os.getenv("DEXTER_PROACTIVE", "1") == "0":
+        return False
+    try:
+        import mission
+
+        return mission.initiative_mode() == "dexter"
+    except Exception:
+        return True
 
 
 def _quiet_hours() -> tuple:

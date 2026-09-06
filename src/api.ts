@@ -123,6 +123,7 @@ export const reindexKnowledge = () => postJson<Record<string, unknown>>('/knowle
 
 export const getWorkbook = () => getJson<WorkbookSnapshot>('/workbook');
 export const getMission = () => getJson<MissionStatus>('/mission');
+export const setInitiative = (mode: 'dexter' | 'me') => postJson<MissionStatus>('/initiative', { mode });
 
 export const addCommitment = (text: string, when?: string, goal?: string) =>
   postJson<{ ok: boolean; summary: string }>('/workbook/commitments', { text, when, goal });

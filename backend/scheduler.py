@@ -462,12 +462,17 @@ class DexterScheduler:
             print(f"[Scheduler] Pruned {pruned} old conversation turn(s).")
 
     def _proactive_scan(self) -> None:
+        import initiative
         import proactive
 
         try:
             proactive.run_scan()
         except Exception as exc:
             print(f"[Scheduler] Proactive scan failed: {exc}")
+        try:
+            initiative.scan()
+        except Exception as exc:
+            print(f"[Scheduler] Initiative scan failed: {exc}")
 
     def _reflect_evening(self) -> None:
         """End-of-day reflection: summarize today, promote durable facts, and
@@ -494,6 +499,8 @@ class DexterScheduler:
                 return
         except Exception as exc:
             print(f"[Scheduler] Companion morning failed: {exc}")
+        if not companion.enabled():
+            return
 
         tasks: List[Dict[str, Any]] = []
 
@@ -582,6 +589,8 @@ class DexterScheduler:
                 return
         except Exception as exc:
             print(f"[Scheduler] Companion evening failed: {exc}")
+        if not companion.enabled():
+            return
 
         if open_items:
             headline = f"{len(done)} done, {len(open_items)} still open. Close out the day?"
@@ -633,6 +642,8 @@ class DexterScheduler:
                 return
         except Exception as exc:
             print(f"[Scheduler] Companion weekly failed: {exc}")
+        if not companion.enabled():
+            return
 
         headline = f"This week: {card['done']} of {card['committed']} commitments kept."
         spoken = headline

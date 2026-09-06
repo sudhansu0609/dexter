@@ -168,3 +168,24 @@ def check_in() -> ToolResult:
     text = " ".join(parts)
     mission.mark_sent("midday", text)
     return ToolResult(ok=True, summary=text, data={"quickReplies": ["On it", "Done", "Stuck", "Later"] if win else []})
+
+
+@tool(
+    name="set_initiative",
+    description="Who leads: 'dexter' means Dexter takes initiative (check-ins, nudges, proposals); 'me' means Dexter only answers when asked.",
+    params={"mode": {"type": "string", "description": "dexter or me", "enum": ["dexter", "me"]}},
+    examples=[
+        "you take the lead",
+        "take initiative",
+        "I'll take it from here",
+        "stop taking initiative",
+        "let me lead for now",
+        "you can lead again",
+    ],
+    category="mission",
+)
+def set_initiative(mode: str) -> ToolResult:
+    mode = mission.set_initiative(mode)
+    if mode == "me":
+        return ToolResult(ok=True, summary="Understood. You lead; I'll wait to be asked. Say 'take the lead' when you want me proposing again.", data=mission.status())
+    return ToolResult(ok=True, summary="On it. I'll check in, flag what slips and propose next moves; 'I'll take it from here' hands it back.", data=mission.status())

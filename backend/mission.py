@@ -32,6 +32,8 @@ _DEFAULT: Dict[str, Any] = {
     "snoozed_until": 0,
     "sent": {},
     "last_checkin": {},
+    # "dexter": Dexter takes initiative (check-ins, nudges, proposals); "me": it waits to be asked.
+    "initiative": "dexter",
 }
 
 
@@ -109,6 +111,19 @@ def clear_blocker(needle: str) -> Optional[str]:
             save(data)
             return blocker
     return None
+
+
+# ───────────────────────── who leads ─────────────────────────
+
+
+def initiative_mode() -> str:
+    return "me" if str(load().get("initiative") or "dexter").lower() == "me" else "dexter"
+
+
+def set_initiative(mode: str) -> str:
+    mode = "me" if str(mode or "").lower() in ("me", "user", "off", "mine", "i") else "dexter"
+    update(initiative=mode)
+    return mode
 
 
 # ───────────────────────── check-in bookkeeping ─────────────────────────
@@ -250,6 +265,7 @@ def status() -> Dict[str, Any]:
         "blockers": data.get("blockers") or [],
         "wins": (data.get("wins") or [])[:10],
         "snoozedUntil": data.get("snoozed_until") or 0,
+        "initiative": initiative_mode(),
         "openLoops": open_loops(),
         "sentToday": (data.get("sent") or {}).get(_today()) or [],
     }

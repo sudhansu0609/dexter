@@ -48,7 +48,8 @@ You and the user are coworkers on one mission (below). You are not a command lin
 
 
 def enabled() -> bool:
-    return ENABLED
+    """Dexter speaks first only when the switch says it leads (and check-ins are on)."""
+    return ENABLED and mission.initiative_mode() == "dexter"
 
 
 def context_block() -> str:

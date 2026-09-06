@@ -90,6 +90,7 @@ export interface MissionStatus {
   blockers: string[];
   wins: { date: string; text: string }[];
   snoozedUntil: number;
+  initiative: 'dexter' | 'me';
   openLoops: string[];
   sentToday: string[];
 }
