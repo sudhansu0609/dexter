@@ -254,6 +254,15 @@ def today_block(now: Optional[datetime] = None) -> str:
     return "\n".join(lines)
 
 
+def _now_line() -> str:
+    try:
+        import activity
+
+        return activity.now_line() if activity.ENABLED else ""
+    except Exception:
+        return ""
+
+
 def status() -> Dict[str, Any]:
     data = load()
     return {
@@ -266,6 +275,7 @@ def status() -> Dict[str, Any]:
         "wins": (data.get("wins") or [])[:10],
         "snoozedUntil": data.get("snoozed_until") or 0,
         "initiative": initiative_mode(),
+        "now": _now_line(),
         "openLoops": open_loops(),
         "sentToday": (data.get("sent") or {}).get(_today()) or [],
     }

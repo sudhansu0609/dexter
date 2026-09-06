@@ -85,6 +85,12 @@ SETTINGS: List[Setting] = [
         module="companion", attr="ENABLED", group="behaviour",
     ),
     Setting(
+        "activity", "DEXTER_ACTIVITY", "bool", True,
+        "Activity awareness",
+        "Dexter samples the window in focus and recently changed files so it knows what you are working on. Stays on this PC, seven days.",
+        module="activity", attr="ENABLED", group="behaviour",
+    ),
+    Setting(
         "quietHours", "DEXTER_QUIET_HOURS", "string", "",
         "Quiet hours",
         "When Dexter stays silent, e.g. 22:00-07:00.",

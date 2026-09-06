@@ -53,7 +53,16 @@ def enabled() -> bool:
 
 
 def context_block() -> str:
-    return STANCE + "\n\n" + mission.render_block() + "\n\n" + mission.today_block()
+    block = STANCE + "\n\n" + mission.render_block() + "\n\n" + mission.today_block()
+    try:
+        import activity
+
+        lines = activity.context_lines() if activity.ENABLED else []
+        if lines:
+            block += "\n\n## Right now\n" + "\n".join(lines)
+    except Exception:
+        pass
+    return block
 
 
 def fast_stance() -> str:
@@ -170,6 +179,14 @@ def _today_facts() -> Dict[str, Any]:
             facts["yesterday"] = summary.split(". ")[0].rstrip(".")
     except Exception:
         pass
+    try:
+        import activity
+
+        if activity.ENABLED:
+            facts["yesterday_time"] = activity.narrative("yesterday")
+            facts["today_time"] = activity.narrative("today")
+    except Exception:
+        pass
     return facts
 
 
@@ -180,6 +197,8 @@ def morning(force: bool = False) -> bool:
     facts = []
     if f["yesterday"]:
         facts.append(f"Yesterday: {f['yesterday']}")
+    if f.get("yesterday_time") and "don't have" not in f["yesterday_time"]:
+        facts.append(f["yesterday_time"])
     if f["due"]:
         facts.append("Committed today: " + "; ".join(c["text"] for c in f["due"][:5]))
     if f["overdue"]:
@@ -240,6 +259,8 @@ def evening(force: bool = False) -> bool:
         facts.append("Open: " + "; ".join(c["text"] for c in open_items[:4]))
     if win:
         facts.append(f"Today's win was: {win}")
+    if f.get("today_time") and "don't have" not in f["today_time"]:
+        facts.append(f["today_time"])
     ask = "What got done, and what rolls to tomorrow?"
     fallback = (f"That's the day. {len(f['done'])} kept, {len(open_items)} still open"
                 + (f", including '{open_items[0]['text']}'" if open_items else "") + f". {ask}")

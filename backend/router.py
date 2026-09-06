@@ -225,6 +225,17 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         "add_task",
         lambda m: {"title": m.group(1).strip(" .!")},
     ),
+    # ── activity awareness (v7) ──
+    (
+        re.compile(r"^(?:what\s+(?:am|was)\s+i\s+(?:doing|working on|on)(?:\s+(?:right\s+)?now)?|where\s+was\s+i|what\s+(?:did|do)\s+i\s+have\s+open|what\s+have\s+i\s+been\s+(?:doing|working\s+on))\W*$", re.I),
+        "what_am_i_doing",
+        lambda m: {},
+    ),
+    (
+        re.compile(r"^(?:what\s+did\s+i\s+(?:do|work\s+on)|how\s+did\s+i\s+spend\s+(?:my\s+)?(?:time|day)|how\s+was\s+my\s+day|time\s+by\s+app)\s*(today|yesterday|this\s+morning|this\s+week|week)?\W*$", re.I),
+        "activity_summary",
+        lambda m: {"when": ("this week" if (m.group(1) or "").lower() in ("week", "this week") else (m.group(1) or "today").lower())},
+    ),
     # ── the mission (v7) ──
     (
         re.compile(r"^(?:you\s+)?(?:take|keep)\s+(?:the\s+)?(?:lead|initiative)(?:\s+again)?\W*$|^(?:you|dexter)\s+(?:lead|drive|can lead(?: again)?)\W*$|^(?:take|lead)\s+(?:it\s+)?from here\W*$", re.I),

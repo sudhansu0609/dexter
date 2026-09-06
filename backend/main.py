@@ -58,6 +58,8 @@ import tools_knowledge  # noqa: F401  - registers knowledge search/reindex and p
 import tools_browser  # noqa: F401  - registers Dexter's browser tools (v6)
 import tools_code  # noqa: F401  - registers buzzcode + local engine tools (v6)
 import tools_mission  # noqa: F401  - registers the mission tools (v7)
+import tools_activity  # noqa: F401  - registers what-am-I-doing (v7)
+import activity
 import companion
 import mission
 import agenda
@@ -113,6 +115,7 @@ async def lifespan(app: FastAPI):
         import reflection
 
         reflection.catch_up()
+        activity.activity_log.start()
         # Say good morning in the chat when Dexter is opened during the day (v7).
         try:
             companion.greet_if_needed()
@@ -436,6 +439,11 @@ def _run_route(req: ChatRequest, on_event=None) -> Dict[str, Any]:
     active = windows_tools.get_active_window_title()
     if active:
         context_parts.append(f"The user currently has this window in focus: {active}")
+    # What they have been doing: app + project + minutes, files just saved, today's shape (v7).
+    try:
+        context_parts.extend(activity.context_lines())
+    except Exception as exc:
+        print(f"[Chat] activity context skipped: {exc}")
     facts = memory.context_note()
     if facts:
         context_parts.append(facts)
@@ -845,6 +853,11 @@ class MissionUpdate(BaseModel):
     why: Optional[str] = None
     focus: Optional[str] = None
     todayWin: Optional[str] = None
+
+
+@app.get("/api/dexter/activity")
+async def get_activity():
+    return await run_in_threadpool(activity.brief)
 
 
 @app.get("/api/dexter/mission")

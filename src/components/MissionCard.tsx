@@ -1,4 +1,4 @@
-import { Compass, Flag, Target, AlertTriangle, Trophy, Hand, Sparkles } from 'lucide-react';
+import { Compass, Flag, Target, AlertTriangle, Trophy, Hand, Sparkles, Activity } from 'lucide-react';
 import type { MissionStatus } from '../types';
 
 interface Props {
@@ -88,6 +88,15 @@ export function MissionCard({ mission, onPrefill, onToggleInitiative }: Props) {
           </span>
           <span style={{ opacity: 0.7, minWidth: '78px', flexShrink: 0 }}>Blocked by</span>
           <span style={{ color: '#fcd34d' }}>{mission.blockers.join(' · ')}</span>
+        </div>
+      )}
+      {mission.now && (
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', fontSize: '11px', opacity: 0.85 }}>
+          <span style={{ color: '#38bdf8', flexShrink: 0 }}>
+            <Activity size={13} />
+          </span>
+          <span style={{ opacity: 0.7, minWidth: '78px', flexShrink: 0 }}>Right now</span>
+          <span>{mission.now}</span>
         </div>
       )}
       {mission.openLoops.length > 0 && (

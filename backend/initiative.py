@@ -16,6 +16,7 @@ Candidates, in priority order:
   - saved topics are waiting on a channel with nothing in production → offer to start one
 """
 
+import re
 import time
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
@@ -152,8 +153,49 @@ def studio_idle(now: datetime) -> Optional[Dict[str, Any]]:
     }
 
 
+def _words(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 3}
+
+
+def off_mission(now: datetime) -> Optional[Dict[str, Any]]:
+    """Forty-five minutes in a work app on a project that is not today's win: plan changed, or on the way?"""
+    import activity
+
+    win = mission.today_win()
+    if not win or not activity.ENABLED:
+        return None
+    current = activity.activity_log.current()
+    if not current or current["minutes"] < 45 or current["app"] not in activity.WORK_APPS:
+        return None
+    seen = _words(current.get("project", "")) | _words(current.get("title", ""))
+    if seen & _words(win):
+        return None
+    where = f"{current['app']}" + (f" on {current['project']}" if current["project"] else "")
+    return {
+        "key": f"offmission-{current['app']}-{now.hour // 3}",
+        "text": f"You've been in {where} for {current['minutes']} minutes while today's win is '{win}'. Is this on the way there, or has the plan changed?",
+        "quick": ["It's on the way", f"Today's win is {current['project'] or current['app']}"[:60], "Change today's win"],
+    }
+
+
+def long_stretch(now: datetime) -> Optional[Dict[str, Any]]:
+    import activity
+
+    if not activity.ENABLED:
+        return None
+    current = activity.activity_log.current()
+    if not current or current["minutes"] < 110 or current["app"] not in activity.WORK_APPS:
+        return None
+    return {
+        "key": f"stretch-{now.hour // 2}",
+        "text": f"{current['minutes']} minutes straight in {current['app']}. Five minutes away from the screen, then back?",
+        "quick": ["Taking five", "Almost done, then"],
+    }
+
+
 CANDIDATES: List[Callable[[datetime], Optional[Dict[str, Any]]]] = [
-    upcoming_commitment, pick_today_win, stale_overdue, win_before_close, own_video_momentum, studio_idle,
+    upcoming_commitment, pick_today_win, stale_overdue, off_mission, win_before_close, long_stretch,
+    own_video_momentum, studio_idle,
 ]
 
 

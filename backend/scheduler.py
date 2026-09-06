@@ -377,6 +377,10 @@ class DexterScheduler:
             id="loop-midday", replace_existing=True,
         )
         self._scheduler.add_job(
+            self._compact_activity, CronTrigger(hour=3, minute=45),
+            id="maint-activity", replace_existing=True,
+        )
+        self._scheduler.add_job(
             self._prune_reminders, CronTrigger(hour=3, minute=40),
             id="maint-reminders", replace_existing=True,
         )
@@ -411,6 +415,14 @@ class DexterScheduler:
             self._weekly_review, CronTrigger(day_of_week="sun", hour=18, minute=0),
             id="loop-weekly-review", replace_existing=True,
         )
+
+    def _compact_activity(self) -> None:
+        try:
+            import activity
+
+            activity.activity_log.compact()
+        except Exception as exc:
+            print(f"[Scheduler] Activity compaction failed: {exc}")
 
     def _prune_reminders(self) -> int:
         """Fired one-shot reminders accumulated forever in reminders.json."""

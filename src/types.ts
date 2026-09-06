@@ -91,6 +91,8 @@ export interface MissionStatus {
   wins: { date: string; text: string }[];
   snoozedUntil: number;
   initiative: 'dexter' | 'me';
+  // 'VS Code on dexter · 42 min · last saved router.py (dexter) 3 min ago'
+  now?: string;
   openLoops: string[];
   sentToday: string[];
 }

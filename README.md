@@ -136,6 +136,8 @@ which model server is up (see `ECOSYSTEM.md`) and streams its reply.
 | `tools_assistant.py` | Reminders, memory, time |
 | `agenda.py` | Today, composed from the workbook + reminders + calendar |
 | `mission.py` / `companion.py` / `tools_mission.py` | The mission, Dexter's stance and voice, check-ins, coaching tails (v7) |
+| `initiative.py` | Proposes the next move; the You lead / Dexter leads switch (v7) |
+| `activity.py` / `tools_activity.py` | What you are working on: foreground window sessions + recently changed files (v7) |
 | `knowledge_ingest.py` | Indexes your folders (md/txt/pdf/docx/csv, Studio JSON) into `memory.documents` with citations |
 | `user_profile.py` | `data/profile.json`: who you are, your channels; injected into every prompt |
 | `windows_tools.py` | Volume, brightness, clipboard, screenshots, windows, lock |
@@ -209,6 +211,14 @@ Dexter is a coworker on one mission, not a command line with notifications.
   **DEXTER LEADS** and **YOU LEAD**. In YOU LEAD, Dexter never speaks first:
   no check-ins, nudges, coaching tails or proposals; it answers when asked.
   "I'll take it from here" and "take the lead" do the same in the chat.
+- **It knows what you're doing.** Dexter samples the window in focus every
+  thirty seconds and watches which files under your folders just changed, so
+  "what am I working on" answers "You're in Premiere Pro on beyond3baje, 42
+  min so far. Recently saved: ep4_cut.prproj (beyond3baje) 3 min ago." The
+  Mission card shows it live, the morning message knows how yesterday went,
+  and a long stretch in a work app on something that is not today's win gets
+  one question. Settings → Activity awareness turns it off; the log stays on
+  this PC for seven days.
 - **It keeps the thread.** What you say today is in the model's context; a
   finished code job or a Studio step waiting for approval arrives as a
   message with "Approve" / "Check it first", not a banner.
