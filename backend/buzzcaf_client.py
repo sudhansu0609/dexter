@@ -583,6 +583,15 @@ class BuzzcafAIClient:
         except Exception as e:
             return {"error": str(e)}
 
+    # ───────────── video intelligence (v6) ─────────────
+
+    def analyze_video(self, url: str, channel: Optional[str] = None, force: bool = False) -> Any:
+        """Fetching captions and running the model takes a while; wait up to five minutes."""
+        return self._post("/api/video-intel/analyze", {"url": url, "channel": channel, "force": force}, timeout=300)
+
+    def recent_analyses(self) -> Any:
+        return self._get("/api/video-intel/recent")
+
     def _post(self, path: str, body: Optional[Dict[str, Any]] = None, timeout: float = 30) -> Any:
         try:
             res = self.session.post(f"{self.base_url}{path}", json=body or {}, timeout=timeout)

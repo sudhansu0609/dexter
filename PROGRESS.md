@@ -4,6 +4,14 @@ Running record of what has actually landed, newest first. Plan: [`PLAN.md`](PLAN
 Every row is either **done** (with the evidence that proves it) or **open**.
 Nothing is marked done on intent.
 
+## v6 status at a glance (2026-09-06)
+
+| Item | Status | Evidence |
+|---|---|---|
+| B1 browser control (**J1**) | ✅ done | Live 2026-09-06 through the tools: `browser_open("example.com")` → window + "Opened Example Domain" in 0.7 s; `browser_read_page` returns the text; `browser_click("More information")` fails honestly with "Visible options: Learn more"; `browser_open("youtube bhangarh fort", new_tab)` → YouTube results; `browser_tabs` lists 2; `browser_type("chandragupta maurya", into="search", submit)` searched; `browser_screenshot` saved a PNG; `test_browser_tools.py` 4 tests; "go to / open <site>" now route to `browser_open` (`test_router.py` updated) |
+| C1 buzzcode + engine (**J2**) | ⚠️ built, live run pending | `code_agent.py` + `tools_code.py` (7 tools: code_task/status/cancel, list_code_projects, start/stop/local_model_status); event folding, repo resolution (`DEXTER_CODE_ROOTS`), yolo-only-when-asked, toast + banner on finish; `test_code_agent.py` 5 tests incl. a fake `buzzcode --json` run. A real headless run was not performed in this session (blocked by the session's permission policy); do one with `buzzcode: ...` from the Dexter window |
+| S1 analyze tool (**J3**) | ✅ done | `studio_analyze_video` → Studio `POST /api/video-intel/analyze` (5-minute timeout); fast rule "analyse this video <url> for <channel>"; Studio-side evidence in `BuzzcafAI/PROGRESS.md` |
+
 ## v5 status at a glance (2026-09-06)
 
 | Item | Status | Evidence |

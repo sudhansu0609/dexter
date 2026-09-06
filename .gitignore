@@ -51,3 +51,6 @@ data/settings.json
 data/window.json
 data/notes/
 data/day_planner.migrated.json
+data/browser_profile/
+data/code_jobs/
+data/code_jobs.json

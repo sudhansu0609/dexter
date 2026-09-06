@@ -131,6 +131,8 @@ which model server is up (see `ECOSYSTEM.md`) and streams its reply.
 | `tools_core.py` | Apps, files, agenda, notes, media |
 | `tools_studio.py` | The Buzzcaf Studio: status, launch, projects, steps, approvals, topics, YouTube stats |
 | `tools_knowledge.py` | `search_knowledge`, `reindex_knowledge`, profile tools |
+| `browser.py` / `tools_browser.py` | Dexter's Chrome window (Playwright): open, read, click, type, tabs, screenshot |
+| `code_agent.py` / `tools_code.py` | buzzcode jobs in your repos; start/stop the llama-server on 8089 |
 | `tools_assistant.py` | Reminders, memory, time |
 | `agenda.py` | Today, composed from the workbook + reminders + calendar |
 | `knowledge_ingest.py` | Indexes your folders (md/txt/pdf/docx/csv, Studio JSON) into `memory.documents` with citations |
@@ -177,6 +179,30 @@ def dim_lights(level: int = 30) -> ToolResult:
 Write `examples` the way you would actually *speak* — they are the training data
 for Tier 1. Then add a case to `backend/test_router.py` so the phrasing is
 protected against drift as more tools are added.
+
+---
+
+## Browser, coder, video intelligence (v6)
+
+**Browser.** "go to github.com", "search youtube for bhangarh fort", "click
+sign in", "type chandragupta into the search box and press enter", "read this
+page", "what tabs are open", "screenshot this page". Dexter drives its own
+Chrome window (installed Chrome, profile in `data/browser_profile`, so logins
+persist there). A click that finds nothing tells you what *is* clickable. To
+attach to your everyday Chrome instead, start it with
+`--remote-debugging-port=9222` and set `DEXTER_BROWSER_CDP=http://127.0.0.1:9222`.
+
+**Coder.** "buzzcode: fix the failing test in dexter", "ask the coder to add
+type hints to knowledge_ingest.py in dexter". Dexter runs buzzcode headless in
+that repository and comes back at once; the result (files changed, its
+summary, `git diff --stat`) arrives as a toast and a banner. "code status" while
+it runs. Files-only by default; add "and let it run the tests" to allow
+commands. "start the local model" brings up the 27B llama-server on 8089,
+which Dexter then uses for its own replies too.
+
+**Video intelligence.** "analyse this video https://youtu.be/... for
+beyond3baje" asks the Studio why it performs and how to model your video on it;
+the full breakdown is in the Studio's Analyze tab.
 
 ---
 

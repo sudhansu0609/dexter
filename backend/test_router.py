@@ -23,6 +23,8 @@ import google_tools  # noqa: F401  - registers gmail/calendar tools
 import media_tools  # noqa: F401  - registers media tools
 import tools_assistant  # noqa: F401  - registers reminder/memory tools
 import tools_core  # noqa: F401  - registers core tools
+import tools_browser  # noqa: F401  - registers the browser tools
+import tools_code  # noqa: F401  - registers the code tools
 import tools_studio  # noqa: F401  - registers the Studio tools
 import windows_tools  # noqa: F401  - registers system tools
 from router import _extract_slots, chitchat, fast_path, semantic_match
@@ -53,9 +55,9 @@ INTENT_CASES = [
     ("start spotify", "launch_app"),
     ("fire up vscode", "launch_app"),
     ("can you open notepad please", "launch_app"),
-    ("open github.com", "open_website"),
-    ("go to youtube.com", "open_website"),
-    ("navigate to reddit.com", "open_website"),
+    ("open github.com", "browser_open"),
+    ("go to youtube.com", "browser_open"),
+    ("navigate to reddit.com", "browser_open"),
     # ── files ──
     ("find my invoice file", "search_files"),
     ("search for a file called report", "search_files"),

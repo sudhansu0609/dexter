@@ -613,3 +613,62 @@ def youtube_video_stats(video: Optional[str] = None) -> ToolResult:
     if not chosen.get("mine"):
         summary += " (not marked as one of your channels)"
     return ToolResult(ok=True, summary=summary + ".", data={"latest": chosen, "history": history})
+
+
+@tool(
+    name="studio_analyze_video",
+    description=(
+        "Ask the Studio to analyse a YouTube video or channel link: why it performs (hook, packaging, "
+        "most-replayed moments, outlier factor against the channel's recent uploads) and a blueprint for "
+        "making the user's own video after it, tailored to one of the user's channels."
+    ),
+    params={
+        "url": {"type": "string", "description": "YouTube video or channel URL"},
+        "channel": {"type": "string", "description": "Which of the user's channels to model it for", "required": False},
+    },
+    examples=[
+        "analyse this video https://www.youtube.com/watch?v=abc123 for beyond3baje",
+        "why is this video doing so well https://youtu.be/abc123",
+        "break down this channel https://www.youtube.com/@somecreator",
+        "study https://www.youtube.com/watch?v=abc123 and tell me how to model my video on it",
+        "what makes this one work https://www.youtube.com/watch?v=abc123",
+    ],
+    category="studio",
+)
+def studio_analyze_video(url: str, channel: Optional[str] = None) -> ToolResult:
+    url = (url or "").strip()
+    if not url.lower().startswith("http"):
+        return ToolResult.fail("Give me the YouTube link to analyse.")
+    if not buzzcaf_client.ensure_running(auto_start=True, timeout=30):
+        return ToolResult.fail("The Studio is not running and could not be started.")
+    target_channel = channel_from_text(channel) if channel else None
+    result = buzzcaf_client.analyze_video(url, target_channel)
+    if not isinstance(result, dict) or result.get("error"):
+        detail = result.get("error") if isinstance(result, dict) else str(result)
+        return ToolResult.fail(f"The Studio could not analyse that link: {detail}")
+    analysis = result.get("analysis") or {}
+    video = result.get("video") or {}
+    metrics = result.get("metrics") or {}
+    if result.get("kind") == "channel":
+        patterns = analysis.get("what_works") or analysis.get("why_it_works") or []
+        heads = "; ".join(str(p.get("factor") if isinstance(p, dict) else p) for p in patterns[:3])
+        summary = (
+            f"{video.get('channel') or 'That channel'}: {metrics.get('videos_sampled', 0)} recent videos, "
+            f"median {metrics.get('median_views', 0):,} views. What works: {heads or 'see the Studio'}."
+        )
+    else:
+        factors = analysis.get("why_it_works") or []
+        heads = "; ".join(str(f.get("factor") if isinstance(f, dict) else f) for f in factors[:3])
+        titles = (analysis.get("blueprint") or {}).get("working_titles") or []
+        outlier = metrics.get("outlier_multiple")
+        outlier_text = f", {outlier}x the channel's median" if outlier else ""
+        summary = (
+            f"'{video.get('title')}' ({video.get('view_count', 0):,} views{outlier_text}). "
+            f"Why it works: {heads or 'see the Studio'}."
+        )
+        if titles:
+            summary += f" A title for you: {titles[0]}"
+    if result.get("simulated"):
+        summary += " (No model was reachable, so this is the metrics-only read, not a model analysis.)"
+    summary += " Full breakdown is in the Studio's Analyze tab."
+    return ToolResult(ok=True, summary=summary, data=result)

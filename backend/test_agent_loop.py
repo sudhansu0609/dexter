@@ -272,9 +272,9 @@ def test_fast_rule_with_unusable_args_falls_through(monkeypatch, executed, no_ti
 
 def test_fast_rule_still_matches_later_rule_after_fallthrough(monkeypatch, executed):
     # A matched-but-unbuildable rule must not shadow a later rule that fits:
-    # "open github.com" hits launch_app's rule but is redirected to open_website.
+    # "open github.com" hits launch_app's rule but is redirected to Dexter's browser (v6).
     hit = router.fast_path("open github.com")
     assert hit is not None
     tool_name, args = hit
-    assert tool_name == "open_website"
-    assert args["url"] == "github.com"
+    assert tool_name == "browser_open"
+    assert args["target"] == "github.com"

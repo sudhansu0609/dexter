@@ -133,8 +133,8 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
     ),
     (
         re.compile(r"^(?:go to|navigate to|browse to|visit|open (?:the )?(?:website|url|site))\s+(.+)$", re.I),
-        "open_website",
-        lambda m: {"url": m.group(1).strip()},
+        "browser_open",
+        lambda m: {"target": m.group(1).strip(" .!?,")},
     ),
     # ── file mutation ──
     # "move X to Y" and "copy X to Y" are the same sentence with one verb
@@ -219,6 +219,93 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
     ),
     # "open the studio" is the Buzzcaf Studio, not an installed app called
     # "studio"; it must win before the generic launcher below.
+    # ── Dexter's browser (v6) ──
+    (
+        re.compile(r"^(?:search|look up|find)\s+(?:on\s+)?youtube\s+(?:for\s+)?(.+)$", re.I),
+        "browser_open",
+        lambda m: {"target": "youtube " + m.group(1).strip(" .!?,")},
+    ),
+    (
+        re.compile(r"^(?:read|summari[sz]e|what(?:'s| is| does)(?: on)?)\s+(?:this|the|that)\s+(?:page|tab|site|article|website)(?:\s+say)?\s*[.!?]*$", re.I),
+        "browser_read_page",
+        lambda m: {},
+    ),
+    (
+        re.compile(r"^(?:click|press|hit|tap)\s+(?:on\s+)?(?:the\s+)?(.+?)(?:\s+(?:button|link|tab))?\s*[.!?]*$", re.I),
+        "browser_click",
+        lambda m: {"target": m.group(1).strip()} if m.group(1).strip() else None,
+    ),
+    (
+        re.compile(r"^(?:type|enter|write)\s+['\"]?(.+?)['\"]?\s+(?:in|into)\s+(?:the\s+)?(.+?)(?:\s+(?:field|box|bar|input))?(?:\s+and\s+(?:press|hit)\s+enter)?\s*[.!?]*$", re.I),
+        "browser_type",
+        lambda m: {"text": m.group(1).strip(), "into": m.group(2).strip(), "submit": bool(re.search(r"enter\s*[.!?]*$", m.string, re.I))},
+    ),
+    (
+        re.compile(r"^(?:scroll|page)\s*(down|up|to the top|to the bottom|to top|to bottom)?\s*(?:a bit|a little|more)?\s*[.!?]*$", re.I),
+        "browser_scroll",
+        lambda m: {"direction": (m.group(1) or "down").replace("to the ", "").replace("to ", "")},
+    ),
+    (
+        re.compile(r"^(?:go\s+)?back(?:\s+(?:a|one)\s+page|\s+to\s+the\s+previous\s+page)?\s*[.!?]*$", re.I),
+        "browser_back",
+        lambda m: {},
+    ),
+    (
+        re.compile(r"^(?:what|which|list|show)\s+(?:my\s+|the\s+)?(?:browser\s+)?tabs(?:\s+(?:are|do i have)\s*(?:open)?)?\s*[.!?]*$", re.I),
+        "browser_tabs",
+        lambda m: {},
+    ),
+    (
+        re.compile(r"^(?:switch|go|jump|move)\s+to\s+(?:the\s+)?(.+?)\s+tab\s*[.!?]*$|^(next|previous|prev)\s+tab\s*[.!?]*$", re.I),
+        "browser_switch_tab",
+        lambda m: {"which": (m.group(1) or m.group(2)).strip()},
+    ),
+    (
+        re.compile(r"^(?:close|shut)\s+(?:this|the|current)\s+tab\s*[.!?]*$", re.I),
+        "browser_close_tab",
+        lambda m: {},
+    ),
+    (
+        re.compile(r"^(?:take\s+a\s+|grab\s+a\s+)?screenshot\s+(?:of\s+)?(?:this|the)\s+(?:page|tab|browser)\s*[.!?]*$", re.I),
+        "browser_screenshot",
+        lambda m: {},
+    ),
+    # ── buzzcode and the local engine (v6) ──
+    (
+        re.compile(r"^(?:ask\s+|tell\s+|have\s+)?(?:buzzcode|codebuzz|the\s+coder)\s*[:,]?\s+(?:to\s+)?(.+)$", re.I),
+        "code_task",
+        lambda m: {"task": m.group(1).strip()},
+    ),
+    (
+        re.compile(r"^code\s*[:\-]\s*(.+)$", re.I),
+        "code_task",
+        lambda m: {"task": m.group(1).strip()},
+    ),
+    (
+        re.compile(r"^(?:code|coding|buzzcode)\s+status\s*[.!?]*$|^(?:is|has)\s+(?:buzzcode|the\s+coder|the\s+code\s+(?:task|job))\s+(?:done|finished|ready).*$", re.I),
+        "code_status",
+        lambda m: {},
+    ),
+    (
+        re.compile(r"^(?:start|launch|boot(?:\s+up)?|bring\s+up|turn\s+on|load)\s+(?:the\s+)?(?:local\s+)?(?:model|engine|llm|llama[\s-]?server|buzzcode\s+engine|27b(?:\s+model)?)\s*[.!?]*$", re.I),
+        "start_local_model",
+        lambda m: {},
+    ),
+    (
+        re.compile(r"^(?:is\s+)?(?:the\s+)?(?:local\s+)?(?:model|engine|llama[\s-]?server)\s+(?:status|running|up|online)\s*[?.!]*$", re.I),
+        "local_model_status",
+        lambda m: {},
+    ),
+    # ── Studio video intelligence (v6) ──
+    (
+        re.compile(
+            r"^(?:analy[sz]e|break\s*down|study|dissect|why\s+(?:is|does)\s+this\s+(?:video|channel)\s+(?:work|perform|do\s+well))"
+            r"\s*(?:this\s+|that\s+|the\s+)?(?:video|channel|link|url)?\s*[:\-]?\s*(https?://\S+)(?:\s+(?:for|as|on)\s+(.+))?\s*[.!?]*$",
+            re.I,
+        ),
+        "studio_analyze_video",
+        lambda m: {"url": m.group(1).strip(), "channel": (m.group(2) or "").strip() or None},
+    ),
     (
         re.compile(
             r"^(?:open|launch|start|run|fire up|boot up|bring up)\s+(?:up\s+)?(?:the\s+)?"
@@ -286,7 +373,7 @@ def fast_path(message: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         if tool_name == "launch_app":
             target = args.get("app_name", "")
             if _URLISH.search(target):
-                return "open_website", {"url": target}
+                return "browser_open", {"target": target}
             # "start a video about X" is a Buzzcaf project, "run the next step"
             # is a workflow action - neither is an app. Let the later tiers decide.
             if _NOT_AN_APP.match(target):

@@ -55,6 +55,8 @@ import tools_files  # noqa: F401  - registers rename/move/copy/delete
 import tools_web  # noqa: F401  - registers web search and weather
 import tools_studio  # noqa: F401  - registers the Buzzcaf Studio control tools
 import tools_knowledge  # noqa: F401  - registers knowledge search/reindex and profile tools
+import tools_browser  # noqa: F401  - registers Dexter's browser tools (v6)
+import tools_code  # noqa: F401  - registers buzzcode + local engine tools (v6)
 import agenda
 import knowledge_ingest
 import user_profile
@@ -160,6 +162,12 @@ async def lifespan(app: FastAPI):
     threading.Thread(target=_report_runtime, name="dexter-runtime-check", daemon=True).start()
     yield
     scheduler.shutdown()
+    try:
+        from browser import browser as _browser
+
+        _browser.close()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Dexter AI Super Assistant Engine", version="2.0.0", lifespan=lifespan)
@@ -807,6 +815,13 @@ async def open_file_path(req: FileOpenRequest):
 
 
 # ───────────────────────── notes / media / content ─────────────────────────
+
+
+@app.get("/api/dexter/code/jobs")
+async def code_jobs():
+    from code_agent import code_agent
+
+    return {"jobs": code_agent.recent(), "engine": await run_in_threadpool(code_agent.engine_status)}
 
 
 @app.get("/api/dexter/notes")

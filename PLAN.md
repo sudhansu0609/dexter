@@ -1,3 +1,22 @@
+# Dexter Roadmap v6 — Hands: the browser, the coder, video intelligence
+
+**Status date:** 2026-09-06 · **Progress log:** `PROGRESS.md` · **Contract:** `ECOSYSTEM.md`
+**Owner's ask (2026-09-06):** Dexter must control the browser; Dexter must use
+the buzzcode llama-server "so it can code for me"; the Studio needs a place to
+drop a video or channel link and learn why it performs and how to model our
+video on it.
+
+| # | Item | Design | Acceptance |
+|---|---|---|---|
+| B1 | Browser control | `browser.py`: one Chrome window (installed Chrome via Playwright, own profile `data/browser_profile`, or attach with `DEXTER_BROWSER_CDP`) on a worker thread; `tools_browser.py`: open / read page / click by text / type into field / scroll / back / tabs / switch / close / screenshot; fast rules so "go to X", "click Y", "read this page" never touch the model | **J1** "go to github.com", "click sign in", "read this page" act in Dexter's window; failures name what *is* clickable |
+| C1 | Coding through buzzcode | `code_agent.py` runs `buzzcode -C <repo> --mode edits\|yolo --json -p "<task>"` as a background job, folds its JSON-lines events (tool calls, edits, verify, finished) into a status, toasts and banners the result with `git diff --stat`; engine tools start/stop/inspect the llama-server on 8089 (also Dexter's first model provider). Repos come from `DEXTER_CODE_ROOTS`; `yolo` only when asked for in words | **J2** "buzzcode: fix X in dexter" returns at once, "code status" reports turns/files, completion arrives as a banner |
+| S1 | Video intelligence (Studio) | Studio `video_intel.py` (yt-dlp: metadata, captions, most-replayed heatmap, channel baseline) + model read with the target channel's brand guide → why it works + blueprint; `POST /api/video-intel/analyze`; Analyze tab; Dexter tool `studio_analyze_video` | **J3** paste a link → metrics, peaks with transcript, why-it-works, blueprint; "save as topic" / "start a project" work; no model ⇒ labelled numbers-only read |
+
+Not doing: driving the owner's already-open Chrome without a debugging port
+(profile lock); running buzzcode in `ask` mode headless (it would hang).
+
+---
+
 # Dexter Roadmap v5 — The assistant that runs the Studio
 
 **Status date:** 2026-09-06 · **Progress log:** `PROGRESS.md` · **Cross-project contract:** `ECOSYSTEM.md`

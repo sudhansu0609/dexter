@@ -42,6 +42,9 @@ bridge keep running); `Ctrl+Alt+D` or the tray icon brings it back.
 | `DEXTER_LLM_PROVIDER` | dexter `.env` | `auto` (llamacpp → lmstudio → ollama → cloud), or a fixed provider |
 | `DEXTER_KNOWLEDGE_ROOTS` | dexter `.env` / settings | `tag=path;tag=path` folders Dexter indexes; the `notes` tag is where new notes are written |
 | `DEXTER_TRAY` | dexter `.env` | `1` (default) hide-to-tray on close; `0` close quits |
+| `DEXTER_BROWSER_CDP` | dexter `.env` | Attach to an existing Chrome (`http://127.0.0.1:9222`) instead of launching Dexter's window |
+| `DEXTER_CODE_ROOTS` | dexter `.env` | Folders whose child repositories buzzcode may work in, default `B:\youtubeProjects\Buzzcaf_Media` |
+| `BUZZCODE_BIN` | dexter `.env` | buzzcode executable, default `~/.cargo/bin/buzzcode.exe` |
 | `GEMINI_API_KEY`, `OPENAI_API_KEY` | both | Cloud fallbacks |
 
 ## Control API: Dexter tool → Studio route
@@ -60,9 +63,19 @@ bridge keep running); `Ctrl+Alt+D` or the tray icon brings it back.
 | `studio_saved_topics` / `studio_save_topic` | `GET /api/topics/saved` / `POST /api/topics/save` | 3 |
 | `studio_agents` | `GET /api/agents` | 3 |
 | `youtube_channel_status` / `youtube_video_stats` | `GET /api/buzzbrain/channels`, `/videos/{id}`, `/latest` | 5.1 |
+| `studio_analyze_video` | `POST /api/video-intel/analyze` `{url, channel?, force?}` (also `GET /api/video-intel/recent`, `/{id}`) | v6 |
 | (event stream) | `GET /api/studio/events` SSE: `project_created`, `step_started`, `step_completed`, `approval_needed`, `step_failed`, `buzzbrain_snapshot` | 3 |
 
 BuzzBrain → Studio: `POST /api/buzzbrain/snapshot` (5.1).
+
+## Dexter's other hands (v6)
+
+| Hand | How | Notes |
+|---|---|---|
+| Browser | Playwright driving the installed Chrome (`channel="chrome"`), profile `dexter/data/browser_profile`; or attach to a Chrome started with `--remote-debugging-port=9222` via `DEXTER_BROWSER_CDP` | Tools `browser_*`; one worker thread owns the window; closing the window is fine, the next command reopens it |
+| Coder | `buzzcode -C <repo> --mode edits\|yolo --json -p "<task>"` (headless JSON-lines) as a background job | Repos under `DEXTER_CODE_ROOTS`; `ask` mode is never used headless; results → toast + banner + `/api/dexter/code/jobs` |
+| Local engine | `buzzcode engine serve` → llama-server on 8089 | The same server is Dexter's first-choice provider (`LLAMACPP_URL`); `start_local_model` / `stop_local_model` |
+| Video intelligence | Studio `video_intel.py`: yt-dlp metadata, captions, "most replayed" heatmap, 30-video channel baseline, then one model call with the target channel's brand guide | No YouTube API key; results cached in `BuzzcafAI/backend/knowledge/video_intel/` |
 
 ## Where data lives
 
@@ -73,6 +86,8 @@ BuzzBrain → Studio: `POST /api/buzzbrain/snapshot` (5.1).
 | Dexter profile | `dexter/data/profile.json` |
 | Dexter knowledge index | `documents` + `ingest_sources` tables in `dexter_memory.db` |
 | Dexter notes | the `notes` knowledge root, default `dexter/data/notes/*.md` |
+| Dexter browser profile, screenshots, code-job logs | `dexter/data/browser_profile/`, `data/screenshots/`, `data/code_jobs/` |
+| Studio video analyses | `BuzzcafAI/backend/knowledge/video_intel/<video or channel id>.json` |
 | Dexter settings, reminders, scheduled tasks, window, log | `dexter/data/*.json`, `dexter/data/dexter.log` |
 | Studio projects and assets | `BuzzcafAI/backend/projects/<id>/` |
 | Studio memory, saved topics, seed topics | `BuzzcafAI/backend/knowledge/` |

@@ -60,3 +60,4 @@ python-docx      # text from .docx files
 pystray
 pillow
 keyboard
+playwright>=1.50        # Dexter's browser (uses the installed Chrome; no bundled browser needed)
