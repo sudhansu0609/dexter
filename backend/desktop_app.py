@@ -65,7 +65,7 @@ def _preflight_or_exit() -> None:
         print(f"[Desktop] Preflight unavailable, continuing: {exc}")
         return
 
-    report = preflight.run_checks()
+    report = preflight.run_fast_checks()
     for line in report.problem_lines():
         print(f"[Preflight] {line}")
     if report.failed:
@@ -76,6 +76,17 @@ def _preflight_or_exit() -> None:
             + "\n\nFix them and launch again (start_dexter.bat shows the full report).",
         )
         sys.exit(1)
+
+    # The slow probes (model servers, GPU, Windows integrations) took ~7 s and
+    # only ever warn; run them after the window is up and log what they find.
+    def _slow_checks() -> None:
+        try:
+            for line in preflight.run_slow_checks().problem_lines():
+                print(f"[Preflight] {line}")
+        except Exception as exc:
+            print(f"[Preflight] slow checks skipped: {exc}")
+
+    threading.Thread(target=_slow_checks, name="dexter-preflight-slow", daemon=True).start()
 
 
 # ───────────────────────── UI bundle ─────────────────────────

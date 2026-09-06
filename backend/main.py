@@ -81,11 +81,16 @@ async def lifespan(app: FastAPI):
         print(f"[Startup] Removed {len(removed)} auto-generated junk skill(s).")
 
     app_index.build_async()
-    await run_in_threadpool(intent_router.build_intent_index)
 
-    # Warm the health caches off the request path. Otherwise the very first
-    # /status pays for every provider probe at once (~6s) while the UI waits.
+    # Warm the caches off the request path. The intent index (torch import +
+    # 400 phrase embeddings, ~6 s) used to block startup; building it here lets
+    # the window open in a couple of seconds, and a message that arrives first
+    # simply waits on the index lock inside rank_tools().
     def _warm_health() -> None:
+        try:
+            intent_router.build_intent_index()
+        except Exception as exc:
+            print(f"[Startup] Intent index build failed: {exc}")
         try:
             llm_router.get_available_providers(force=True)
             buzzcaf_client.health_check(force=True)

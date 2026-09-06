@@ -287,19 +287,37 @@ def check_runtime(report: Report) -> None:
         report.add(WARN, "Runtime", warning["message"], warning["action"])
 
 
-def run_checks(quiet: bool = True) -> Report:
-    """Every check, in order. desktop_app.py calls this before opening a window."""
+# Fast checks answer in milliseconds and are the only ones that can FAIL; they
+# gate the window. Slow checks probe model servers and the GPU (several seconds
+# of network and nvidia-smi timeouts) and only ever WARN - the app reports the
+# same facts live once it is up - so the desktop shell runs them after the
+# window has opened rather than making the owner wait (roadmap v5, I1).
+FAST_CHECKS = [
+    check_python_deps, check_embeddings_cache, check_env, check_data_dir,
+    check_frontend, check_reminders, check_desktop_shell,
+]
+SLOW_CHECKS = [check_llm, check_runtime, check_system_integrations]
+
+
+def run_fast_checks(quiet: bool = True) -> Report:
     report = Report(quiet=quiet)
-    check_python_deps(report)
-    check_embeddings_cache(report)
-    check_env(report)
-    check_data_dir(report)
-    check_frontend(report)
-    check_llm(report)
-    check_runtime(report)
-    check_reminders(report)
-    check_system_integrations(report)
-    check_desktop_shell(report)
+    for check in FAST_CHECKS:
+        check(report)
+    return report
+
+
+def run_slow_checks(quiet: bool = True) -> Report:
+    report = Report(quiet=quiet)
+    for check in SLOW_CHECKS:
+        check(report)
+    return report
+
+
+def run_checks(quiet: bool = True) -> Report:
+    """Every check, in order - the CLI report."""
+    report = Report(quiet=quiet)
+    for check in FAST_CHECKS + SLOW_CHECKS:
+        check(report)
     return report
 
 
