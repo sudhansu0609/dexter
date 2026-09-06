@@ -570,6 +570,137 @@ class BuzzcafAIClient:
         """Clear the active project context."""
         self._active_project_id = None
 
+    # ─────────────────────────────────────────────────────────────
+    # v5 control surface (see ECOSYSTEM.md)
+    # ─────────────────────────────────────────────────────────────
+
+    def _get(self, path: str, timeout: float = 8, **params) -> Any:
+        try:
+            res = self.session.get(f"{self.base_url}{path}", params=params or None, timeout=timeout)
+            if res.ok:
+                return res.json()
+            return {"error": _detail(res), "status_code": res.status_code}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _post(self, path: str, body: Optional[Dict[str, Any]] = None, timeout: float = 30) -> Any:
+        try:
+            res = self.session.post(f"{self.base_url}{path}", json=body or {}, timeout=timeout)
+            if res.ok:
+                return res.json()
+            return {"error": _detail(res), "status_code": res.status_code}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def state(self) -> Dict[str, Any]:
+        """GET /api/studio/state - counts, pending approvals, active project."""
+        data = self._get("/api/studio/state")
+        return data if isinstance(data, dict) else {"error": "unexpected reply"}
+
+    def chat(
+        self,
+        message: str,
+        channel: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        history: Optional[List[Dict[str, str]]] = None,
+        context_topic: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """POST /api/studio/chat - one Studio Assistant turn. Slow: a real model call."""
+        data = self._post(
+            "/api/studio/chat",
+            {"message": message, "channel": channel, "agent_name": agent_name,
+             "history": history or [], "context_topic": context_topic},
+            timeout=240,
+        )
+        return data if isinstance(data, dict) else {"error": "unexpected reply"}
+
+    def discover_topics(self, channel: str) -> Dict[str, Any]:
+        data = self._post("/api/topics/discover", {"channel": channel}, timeout=20)
+        return data if isinstance(data, dict) else {"error": "unexpected reply"}
+
+    def saved_topics(self, channel: Optional[str] = None) -> List[Dict[str, Any]]:
+        data = self._get("/api/topics/saved")
+        topics = data.get("topics", []) if isinstance(data, dict) else []
+        if channel:
+            needle = channel.lower()
+            topics = [t for t in topics if needle in str(t.get("channel", "")).lower()]
+        return topics
+
+    def save_topic(self, topic: Dict[str, Any]) -> Dict[str, Any]:
+        data = self._post("/api/topics/save", topic, timeout=10)
+        return data if isinstance(data, dict) else {"error": "unexpected reply"}
+
+    def list_agents(self) -> List[Dict[str, Any]]:
+        data = self._get("/api/agents")
+        return data.get("agents", []) if isinstance(data, dict) else []
+
+    def approve(self, project_id: Optional[str] = None, feedback: Optional[str] = None) -> Dict[str, Any]:
+        """POST /api/projects/{id}/approve - approve the paused step, or send it back with notes."""
+        pid = project_id or self._active_project_id
+        if not pid:
+            return {"error": "No project selected."}
+        body = {"feedback": feedback} if feedback else {}
+        data = self._post(f"/api/projects/{pid}/approve", body, timeout=240)
+        return data if isinstance(data, dict) else {"error": "unexpected reply"}
+
+    # ── events: the Studio pushes, Dexter listens ──
+
+    def start_event_listener(self, on_event) -> None:
+        """
+        Follow GET /api/studio/events in a daemon thread and call
+        on_event(type, payload) for each frame. Reconnects when the Studio
+        restarts; idles cheaply while it is offline. One listener per process.
+        """
+        if getattr(self, "_listener", None) is not None:
+            return
+        import json as _json
+        import threading
+
+        def _run() -> None:
+            backoff = 5
+            while True:
+                if not self.health_check(force=True):
+                    time.sleep(15)
+                    continue
+                try:
+                    with self.session.get(
+                        f"{self.base_url}/api/studio/events", stream=True, timeout=(5, None)
+                    ) as res:
+                        if not res.ok:
+                            time.sleep(backoff)
+                            continue
+                        backoff = 5
+                        for line in res.iter_lines(decode_unicode=True):
+                            if not line or not line.startswith("data:"):
+                                continue
+                            try:
+                                message = _json.loads(line[5:].strip())
+                            except Exception:
+                                continue
+                            kind = message.get("type")
+                            if kind and kind != "connected":
+                                try:
+                                    on_event(kind, message.get("payload"))
+                                except Exception as exc:
+                                    print(f"[Studio events] handler failed for {kind}: {exc}")
+                except Exception as exc:
+                    print(f"[Studio events] stream dropped: {exc}")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+
+        self._listener = threading.Thread(target=_run, name="dexter-studio-events", daemon=True)
+        self._listener.start()
+
+
+def _detail(res) -> str:
+    try:
+        body = res.json()
+        if isinstance(body, dict):
+            return str(body.get("detail") or body.get("error") or body.get("message") or res.text[:300])
+    except Exception:
+        pass
+    return res.text[:300]
+
 
 # Singleton instance
 buzzcaf_client = BuzzcafAIClient()

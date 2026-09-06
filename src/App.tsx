@@ -56,7 +56,7 @@ export default function App() {
   });
   pushMessageRef.current = chat.pushDexterMessage;
 
-  const events = useServerEvents({ refreshPlanner: planner.refresh });
+  const events = useServerEvents({ refreshPlanner: planner.refresh, refreshBuzzcaf: buzzcaf.refresh });
 
   const toggleExpandWindow = () => {
     const nextState = !isExpanded;
@@ -189,10 +189,13 @@ export default function App() {
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             <BuzzcafPanel
               projects={buzzcaf.projects}
+              pending={buzzcaf.pending}
               online={buzzcaf.online}
               isExecutingStep={buzzcaf.isExecutingStep}
               isStarting={buzzcaf.isStarting}
+              isApproving={buzzcaf.isApproving}
               onExecute={buzzcaf.executeStep}
+              onApprove={buzzcaf.approve}
               onStart={buzzcaf.start}
             />
             <AppLauncher onLaunch={handleLaunchApp} />

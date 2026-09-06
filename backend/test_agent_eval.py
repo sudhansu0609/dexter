@@ -29,6 +29,7 @@ import google_tools  # noqa: F401  - registers gmail/calendar tools
 import media_tools  # noqa: F401  - registers media tools
 import tools_assistant  # noqa: F401  - registers reminder/memory tools
 import tools_core  # noqa: F401  - registers core tools
+import tools_studio  # noqa: F401  - registers the Studio tools
 import windows_tools  # noqa: F401  - registers system tools
 
 import router

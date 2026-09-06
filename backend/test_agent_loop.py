@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cancellation
 import router
 import tools_core  # noqa: F401  - registers the real tool specs (confirm flags)
+import tools_studio  # noqa: F401  - registers the Studio tools
 from hybrid_llm import LLMResponse
 from tool_registry import ToolResult
 

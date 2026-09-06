@@ -216,6 +216,17 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         "remember_fact",
         lambda m: {"key": m.group(1).strip(), "value": m.group(2).strip(" .")},
     ),
+    # "open the studio" is the Buzzcaf Studio, not an installed app called
+    # "studio"; it must win before the generic launcher below.
+    (
+        re.compile(
+            r"^(?:open|launch|start|run|fire up|boot up|bring up)\s+(?:up\s+)?(?:the\s+)?"
+            r"(?:buzzcaf(?:ai)?\s*)?(?:studio|buzzcaf(?:ai)?)(?:\s+(?:app|studio|desktop|window))?\s*$",
+            re.I,
+        ),
+        "buzzcaf_start_studio",
+        lambda m: {},
+    ),
     (
         re.compile(r"^(?:open|launch|start|run|fire up|boot up|bring up)\s+(.+)$", re.I),
         "launch_app",

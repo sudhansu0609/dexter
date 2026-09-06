@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
+  approveBuzzcafStep,
   executeBuzzcafStep,
   getBuzzcafHealth,
   getBuzzcafProjects,
+  getBuzzcafState,
   startBuzzcaf,
 } from '../api';
-import type { BuzzcafProject } from '../types';
+import type { BuzzcafPending, BuzzcafProject } from '../types';
 
 // BuzzcafAI Studio integration: health, project list, run-a-step, and launch.
 // Status narration is surfaced in the chat feed, so a `pushMessage` sink is
@@ -15,6 +17,8 @@ export function useBuzzcaf(pushMessage: (text: string) => void) {
   const [online, setOnline] = useState(false);
   const [isExecutingStep, setIsExecutingStep] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
+  const [pending, setPending] = useState<BuzzcafPending[]>([]);
+  const [isApproving, setIsApproving] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -23,6 +27,14 @@ export function useBuzzcaf(pushMessage: (text: string) => void) {
       if (status.online) {
         const data = await getBuzzcafProjects();
         setProjects(data || []);
+        try {
+          const state = await getBuzzcafState();
+          setPending(state.pending_approvals || []);
+        } catch {
+          setPending([]);
+        }
+      } else {
+        setPending([]);
       }
     } catch (e) {
       console.warn('BuzzcafAI unreachable', e);
@@ -76,5 +88,22 @@ export function useBuzzcaf(pushMessage: (text: string) => void) {
     }
   }, [pushMessage, refresh]);
 
-  return { projects, online, isExecutingStep, isStarting, executeStep, start, refresh };
+  const approve = useCallback(
+    async (projectId: string) => {
+      setIsApproving(true);
+      try {
+        const data = await approveBuzzcafStep(projectId);
+        await refresh();
+        pushMessage(`Approved; "${data.name || projectId}" is now at ${data.current_step || 'the next step'}.`);
+      } catch (e) {
+        console.warn('Studio approve failed', e);
+        pushMessage('The Studio could not approve that step.');
+      } finally {
+        setIsApproving(false);
+      }
+    },
+    [pushMessage, refresh],
+  );
+
+  return { projects, pending, online, isExecutingStep, isStarting, isApproving, executeStep, approve, start, refresh };
 }

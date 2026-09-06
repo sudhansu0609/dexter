@@ -1,17 +1,23 @@
-import { Cpu, Play, RefreshCw, Zap } from 'lucide-react';
-import type { BuzzcafProject } from '../types';
+import { CheckCircle2, Cpu, Play, RefreshCw, Zap } from 'lucide-react';
+import type { BuzzcafPending, BuzzcafProject } from '../types';
 
 interface Props {
   projects: BuzzcafProject[];
+  pending?: BuzzcafPending[];
   online: boolean;
   isExecutingStep: boolean;
   isStarting: boolean;
+  isApproving?: boolean;
   onExecute: (projectId: string) => void;
+  onApprove?: (projectId: string) => void;
   onStart: () => void;
 }
 
-// BuzzcafAI Studio projects panel.
-export function BuzzcafPanel({ projects, online, isExecutingStep, isStarting, onExecute, onStart }: Props) {
+// Buzzcaf Studio panel: projects, steps waiting for approval, and launch.
+export function BuzzcafPanel({
+  projects, pending = [], online, isExecutingStep, isStarting, isApproving = false, onExecute, onApprove, onStart,
+}: Props) {
+  const pendingIds = new Set(pending.map((p) => p.project_id));
   return (
     <div className="dexter-panel" style={{ padding: '16px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
@@ -68,7 +74,34 @@ export function BuzzcafPanel({ projects, online, isExecutingStep, isStarting, on
             )}
           </button>
         </div>
-      ) : projects.length === 0 ? (
+      ) : null}
+
+      {online && pending.length > 0 && (
+        <div style={{ marginBottom: '8px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          {pending.map((p) => (
+            <div
+              key={`${p.project_id}-${p.step}`}
+              style={{ background: 'rgba(245, 158, 11, 0.12)', border: '1px solid rgba(245, 158, 11, 0.4)', borderRadius: '8px', padding: '8px 10px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}
+            >
+              <div style={{ fontSize: '10px', color: '#fbbf24' }}>
+                <strong>{p.name}</strong> is waiting at {p.step || 'a step'}
+              </div>
+              {onApprove && (
+                <button
+                  type="button"
+                  onClick={() => onApprove(p.project_id)}
+                  disabled={isApproving}
+                  style={{ background: 'rgba(245, 158, 11, 0.2)', color: '#fbbf24', border: '1px solid rgba(245, 158, 11, 0.5)', padding: '4px 8px', borderRadius: '6px', fontSize: '10px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: '4px', cursor: isApproving ? 'wait' : 'pointer' }}
+                >
+                  <CheckCircle2 size={10} /> {isApproving ? 'Approving...' : 'Approve'}
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {!online ? null : projects.length === 0 ? (
         <div style={{ fontSize: '11px', color: '#94a3b8', padding: '10px', background: 'rgba(15, 23, 42, 0.6)', borderRadius: '8px' }}>
           No projects yet. Say "start a video about [topic]" to create one!
         </div>
@@ -104,7 +137,7 @@ export function BuzzcafPanel({ projects, online, isExecutingStep, isStarting, on
               <div style={{ fontSize: '10px', color: '#94a3b8', marginBottom: '6px' }}>
                 {project.brand} • Step: {project.current_step}
               </div>
-              {project.status !== 'completed' && (
+              {project.status !== 'completed' && !pendingIds.has(project.id) && (
                 <button
                   type="button"
                   onClick={() => onExecute(project.id)}

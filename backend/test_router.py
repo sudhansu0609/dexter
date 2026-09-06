@@ -23,6 +23,7 @@ import google_tools  # noqa: F401  - registers gmail/calendar tools
 import media_tools  # noqa: F401  - registers media tools
 import tools_assistant  # noqa: F401  - registers reminder/memory tools
 import tools_core  # noqa: F401  - registers core tools
+import tools_studio  # noqa: F401  - registers the Studio tools
 import windows_tools  # noqa: F401  - registers system tools
 from router import _extract_slots, chitchat, fast_path, semantic_match
 from timeparse import parse_recurrence, parse_when, strip_time_phrases
@@ -88,6 +89,11 @@ INTENT_CASES = [
     ("run the next step", "buzzcaf_execute_step"),
     ("show my video projects", "buzzcaf_list_projects"),
     ("start a video about AI agents", "buzzcaf_create_project"),
+    ("open the studio", "buzzcaf_start_studio"),
+    ("anything waiting on me in the studio", "studio_pending_approvals"),
+    ("approve that step", "studio_approve_step"),
+    ("ask the studio for title ideas for khayal3baje", "studio_chat"),
+    ("show saved topics for khayal3baje", "studio_saved_topics"),
     # ── system control ──
     ("what am I looking at", "get_active_window"),
     ("what apps are open", "list_open_windows"),

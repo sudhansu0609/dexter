@@ -5,19 +5,21 @@ import type { BgTask, ReminderBanner } from '../types';
 interface EventDeps {
   // Reminders can change the planner (a due item is checked off server-side).
   refreshPlanner: () => void;
+  // Studio events (a step finished, approval needed) change the Studio panel.
+  refreshBuzzcaf?: () => void;
 }
 
 // Owns the SSE push channel - the backend's only way to reach the user unprompted
 // - plus the reminder banners and background-task tray it feeds. Reconnects on
 // error (roadmap Phase 6, item 17). The listeners are registered once, so they
 // dispatch through a ref that always holds the current-render callbacks.
-export function useServerEvents({ refreshPlanner }: EventDeps) {
+export function useServerEvents({ refreshPlanner, refreshBuzzcaf }: EventDeps) {
   const [reminders, setReminders] = useState<ReminderBanner[]>([]);
   const [bgTasks, setBgTasks] = useState<BgTask[]>([]);
   const [connected, setConnected] = useState(false);
 
-  const depsRef = useRef({ refreshPlanner });
-  depsRef.current = { refreshPlanner };
+  const depsRef = useRef({ refreshPlanner, refreshBuzzcaf });
+  depsRef.current = { refreshPlanner, refreshBuzzcaf };
 
   const dismissReminder = (id: string) => {
     setReminders((prev) => prev.filter((r) => r.id !== id));
@@ -103,6 +105,10 @@ export function useServerEvents({ refreshPlanner }: EventDeps) {
         } catch (e) {
           console.warn('Malformed task event', e);
         }
+      });
+
+      source.addEventListener('studio', () => {
+        depsRef.current.refreshBuzzcaf?.();
       });
 
       source.onerror = () => {

@@ -32,6 +32,25 @@ export interface BuzzcafProject {
   workflow_name: string;
 }
 
+export interface BuzzcafPending {
+  project_id: string;
+  name: string;
+  brand?: string;
+  step?: string;
+  agent?: string;
+  since?: string;
+}
+
+export interface BuzzcafState {
+  online: boolean;
+  version?: string;
+  llm_provider?: string;
+  projects?: { total: number; in_progress: number; paused_for_approval: number; done: number };
+  pending_approvals?: BuzzcafPending[];
+  active_project?: { id: string; name: string; brand: string; status: string; current_step: string } | null;
+  saved_topics_count?: number;
+}
+
 export interface ReminderBanner {
   id: string;
   text: string;

@@ -13,6 +13,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Any, Dict, List, Optional
@@ -52,6 +53,7 @@ import tools_tasks  # noqa: F401  - registers background-task and macro tools
 import tools_workbook  # noqa: F401  - registers goal/commitment/review tools
 import tools_files  # noqa: F401  - registers rename/move/copy/delete
 import tools_web  # noqa: F401  - registers web search and weather
+import tools_studio  # noqa: F401  - registers the Buzzcaf Studio control tools
 from workbook import workbook
 from hybrid_llm import llm_router
 from memory import memory
@@ -103,6 +105,12 @@ async def lifespan(app: FastAPI):
         import reflection
 
         reflection.catch_up()
+        # Studio events (a step waiting for approval, a failed step) arrive as
+        # banners and toasts instead of being discovered on the next poll.
+        try:
+            buzzcaf_client.start_event_listener(_on_studio_event)
+        except Exception as exc:
+            print(f"[Startup] Studio event listener not started: {exc}")
 
     threading.Thread(target=_warm_health, name="dexter-health-warm", daemon=True).start()
 
@@ -793,6 +801,32 @@ async def get_playlists():
 # ───────────────────────── BuzzcafAI ─────────────────────────
 
 
+def _on_studio_event(event_type: str, payload: Any) -> None:
+    """A Studio SSE frame → Dexter's own bus (UI refresh) and, when it matters, a reminder."""
+    data = payload if isinstance(payload, dict) else {}
+    bus.publish("studio", {"type": event_type, "payload": data})
+    text = None
+    if event_type == "approval_needed":
+        text = (
+            f"The Studio needs your approval: {data.get('step') or 'a step'} on "
+            f"'{data.get('name') or data.get('project_id')}'. Say 'approve' or give notes."
+        )
+    elif event_type == "step_failed":
+        text = f"A Studio step failed on '{data.get('project_id')}': {str(data.get('error'))[:160]}"
+    if text:
+        bus.publish("reminder", {
+            "id": f"studio-{event_type}-{data.get('project_id')}-{int(time.time())}",
+            "text": text, "spoken": text, "speak": False, "banner": True, "missed": False,
+        })
+        try:
+            import notify
+
+            notify.toast_async("Buzzcaf Studio", text, urgent=(event_type == "step_failed"))
+        except Exception as exc:
+            print(f"[Studio events] toast failed: {exc}")
+
+
+
 @app.get("/api/dexter/buzzcaf/status")
 async def get_buzzcaf_status():
     return await run_in_threadpool(buzzcaf_client.get_status)
@@ -888,6 +922,23 @@ async def query_buzzcaf_assets(
 @app.get("/api/dexter/buzzcaf/diagnostics")
 async def get_buzzcaf_diagnostics():
     return await run_in_threadpool(buzzcaf_client.get_diagnostics)
+
+
+@app.get("/api/dexter/buzzcaf/state")
+async def get_buzzcaf_state():
+    if not await run_in_threadpool(buzzcaf_client.health_check):
+        return {"online": False}
+    state = await run_in_threadpool(buzzcaf_client.state)
+    return {"online": not state.get("error"), **state}
+
+
+@app.post("/api/dexter/buzzcaf/projects/{project_id}/approve")
+async def approve_buzzcaf_step(project_id: str, req: BuzzcafFeedbackRequest = None):
+    feedback = req.feedback if req else None
+    result = await run_in_threadpool(buzzcaf_client.approve, project_id, feedback)
+    if isinstance(result, dict) and result.get("error"):
+        raise HTTPException(status_code=int(result.get("status_code") or 502), detail=result["error"])
+    return result
 
 
 # ───────────────────────── static frontend ─────────────────────────

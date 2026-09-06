@@ -17,7 +17,7 @@ Nothing is marked done on intent.
 | 1.4 voice removed | ✅ done | 6 backend modules + WS/TTS routes + mic patch + 4 settings + deps + `useVoice`/`VoiceVisualizer` removed; `import main` OK; `pytest` 280 passed; `tsc`, `vitest` (4), `vite build` green |
 | 1.5 llamacpp provider (**I3**) | ⚠️ built, timing pending | `_provider_chain('auto')` → `['ollama','lmstudio']` with 8089 down (llamacpp first when up); fast tier skipped on llamacpp; **I3** timing not yet measured with the server up |
 | 1.6 hidden launcher (**I1**) | ✅ done | `pythonw backend/desktop_app.py`: no new `conhost` (21 → 21), `/api/dexter/health` OK after **1.4 s**, log `[Desktop] Window opening after 1.2s` (2026-09-06). Slow preflight probes and the intent index now run after the window opens |
-| 3.2 studio tools (**I5**) | ⬜ open | |
+| 3.2 studio tools (**I5**) | ✅ done (LLM-driven run pending) | `tools_studio.py` (12 tools, 82 total); client gains `state/chat/discover/saved/save/agents/approve` + SSE listener → `studio` events, approval banners/toasts; panel shows approvals. Live 2026-09-06: `buzzcaf_status`, `studio_pending_approvals`, `studio_saved_topics`, `studio_agents` (115), `studio_discover_topics`, `buzzcaf_create_project` (project appeared in the Studio) all real; `project_created` event received. `test_tools_studio.py` 9 tests; router cases for the new phrasings |
 | 4.1 knowledge ingestion (**I6/I7**) | ⬜ open | |
 | 4.2 profile (**I8**) | ⬜ open | |
 | 4.3 Google connected | ⬜ blocked on owner | needs `data/google_credentials.json` |

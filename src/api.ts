@@ -10,6 +10,7 @@
 import type {
   BgTask,
   BuzzcafProject,
+  BuzzcafState,
   DexterStatus,
   FileResult,
   SettingRow,
@@ -143,6 +144,9 @@ export const executeBuzzcafStep = (projectId: string) =>
   postJson<BuzzcafProject>(`/buzzcaf/projects/${projectId}/execute`);
 export const startBuzzcaf = () =>
   postJson<{ ready?: boolean; message?: string }>('/buzzcaf/start');
+export const getBuzzcafState = () => getJson<BuzzcafState>('/buzzcaf/state');
+export const approveBuzzcafStep = (projectId: string, feedback?: string) =>
+  postJson<BuzzcafProject>(`/buzzcaf/projects/${projectId}/approve`, feedback ? { feedback } : {});
 
 // ─────────────────────────── system ────────────────────────────
 
