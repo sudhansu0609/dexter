@@ -18,8 +18,8 @@ Nothing is marked done on intent.
 | 1.5 llamacpp provider (**I3**) | ⚠️ built, timing pending | `_provider_chain('auto')` → `['ollama','lmstudio']` with 8089 down (llamacpp first when up); fast tier skipped on llamacpp; **I3** timing not yet measured with the server up |
 | 1.6 hidden launcher (**I1**) | ✅ done | `pythonw backend/desktop_app.py`: no new `conhost` (21 → 21), `/api/dexter/health` OK after **1.4 s**, log `[Desktop] Window opening after 1.2s` (2026-09-06). Slow preflight probes and the intent index now run after the window opens |
 | 3.2 studio tools (**I5**) | ✅ done (LLM-driven run pending) | `tools_studio.py` (12 tools, 82 total); client gains `state/chat/discover/saved/save/agents/approve` + SSE listener → `studio` events, approval banners/toasts; panel shows approvals. Live 2026-09-06: `buzzcaf_status`, `studio_pending_approvals`, `studio_saved_topics`, `studio_agents` (115), `studio_discover_topics`, `buzzcaf_create_project` (project appeared in the Studio) all real; `project_created` event received. `test_tools_studio.py` 9 tests; router cases for the new phrasings |
-| 4.1 knowledge ingestion (**I6/I7**) | ⬜ open | |
-| 4.2 profile (**I8**) | ⬜ open | |
+| 4.1 knowledge ingestion (**I6/I7**) | ✅ built | `knowledge_ingest.py` (roots `tag=path;…`, mtime/size fingerprints, pdf/docx/json→prose, excludes for caches/venvs/code-repo docs), `memory.documents` + `ingest_sources`, `search_documents` with tag/file citations, nightly 02:30 job + 60 s startup pass, tools `search_knowledge`/`reindex_knowledge`; `test_knowledge_ingest.py` 6 tests. Live scan 2026-09-06: 338 files / 79 MB across youtube, docs, studio |
+| 4.2 profile (**I8**) | ✅ built | `user_profile.py` → `data/profile.json`; block injected into both router prompts; tools `show_profile`/`update_profile`; `/api/dexter/profile`; Settings → "About you". Profile is empty until you fill it |
 | 4.3 Google connected | ⬜ blocked on owner | needs `data/google_credentials.json` |
 | 5.1 YouTube status tools (**I9**) | ⬜ open | |
 | 5.2 one agenda (**I10**) | ⬜ open | |

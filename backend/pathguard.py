@@ -33,7 +33,20 @@ def _default_roots() -> List[str]:
 def allowed_roots() -> List[str]:
     raw = os.getenv("DEXTER_FS_ROOTS", "")
     roots = [r.strip() for r in raw.split(os.pathsep) if r.strip()] or _default_roots()
-    return [os.path.realpath(r) for r in roots]
+    # The knowledge folders Dexter indexes are, by definition, folders it may read.
+    try:
+        import knowledge_ingest
+
+        roots += knowledge_ingest.root_paths()
+    except Exception:
+        pass
+    seen, unique = set(), []
+    for root in (os.path.realpath(r) for r in roots):
+        key = os.path.normcase(root)
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
 
 
 def resolve(path: str) -> Optional[str]:

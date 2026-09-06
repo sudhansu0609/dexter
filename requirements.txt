@@ -51,3 +51,7 @@ send2trash
 
 # ── Web search and weather (keyless, matching the local-first stance) ──
 ddgs             # DuckDuckGo search; without it web_search reports unavailable
+
+# ── Knowledge ingestion (roadmap v5, 4.1) ──
+pypdf            # text from PDFs in the knowledge folders
+python-docx      # text from .docx files

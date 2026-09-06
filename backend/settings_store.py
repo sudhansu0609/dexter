@@ -85,6 +85,12 @@ SETTINGS: List[Setting] = [
         module="proactive", attr=None, group="behaviour",
     ),
     Setting(
+        "knowledgeRoots", "DEXTER_KNOWLEDGE_ROOTS", "string", "",
+        "Knowledge folders",
+        "Folders Dexter indexes, as tag=path;tag=path (tags: notes, docs, youtube, studio).",
+        module="knowledge_ingest", attr="ROOTS_SPEC", group="knowledge",
+    ),
+    Setting(
         "closeOutHour", "DEXTER_CLOSEOUT_HOUR", "int", 21,
         "End-of-day check-in",
         "The hour Dexter asks you to close out the day. Takes effect on next start.",

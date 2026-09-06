@@ -42,6 +42,8 @@ SEMANTIC_FLOOR = 0.35
 # Calibrated on MiniLM: direct paraphrases score ~0.85, related-but-distinct
 # facts ~0.7, unrelated ~0.05. Kept strict so distinct facts never merge.
 DUPLICATE_SIMILARITY = 0.82
+# An explicit "search my notes" can afford weaker matches than silent context injection.
+DOCUMENT_SEARCH_FLOOR = 0.25
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -79,7 +81,21 @@ CREATE TABLE IF NOT EXISTS documents (
     content     TEXT NOT NULL,
     added_at    REAL NOT NULL,
     embedding   BLOB,
+    tag         TEXT NOT NULL DEFAULT '',
+    title       TEXT NOT NULL DEFAULT '',
     UNIQUE(source, chunk_index)
+);
+
+CREATE TABLE IF NOT EXISTS ingest_sources (
+    path       TEXT PRIMARY KEY,
+    tag        TEXT NOT NULL,
+    mtime      REAL,
+    size       INTEGER,
+    sha1       TEXT,
+    chunks     INTEGER,
+    indexed_at REAL,
+    status     TEXT,
+    error      TEXT
 );
 """
 
@@ -99,6 +115,13 @@ class Memory:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "embedding" not in cols:
             conn.execute("ALTER TABLE facts ADD COLUMN embedding BLOB")
+        doc_cols = {r[1] for r in conn.execute("PRAGMA table_info(documents)").fetchall()}
+        if "tag" not in doc_cols:
+            conn.execute("ALTER TABLE documents ADD COLUMN tag TEXT NOT NULL DEFAULT ''")
+        if "title" not in doc_cols:
+            conn.execute("ALTER TABLE documents ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+        # Only after the column exists on databases that predate it.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_tag ON documents(tag)")
 
     def _connect(self) -> sqlite3.Connection:
         """One connection per thread - sqlite3 objects are not thread-safe."""
@@ -384,7 +407,7 @@ class Memory:
         for hit in hits:
             text = hit["text"][:300]
             if hit["kind"] == "document":
-                lines.append(f"- (from {os.path.basename(str(hit['source']))}) {text}")
+                lines.append(f"- (from {self.document_label(str(hit['source']), text)}) {text}")
             elif hit["kind"] == "summary":
                 lines.append(f"- (past conversations, {hit['source']}) {text}")
             else:
@@ -482,7 +505,7 @@ class Memory:
 
     # ───────────────────────── documents ─────────────────────────
 
-    def add_document(self, source: str, chunks: List[str]) -> int:
+    def add_document(self, source: str, chunks: List[str], tag: str = "", title: str = "") -> int:
         """(Re)ingest a document's chunks; returns how many were stored."""
         chunks = [c.strip() for c in chunks if c and c.strip()]
         if not chunks:
@@ -496,14 +519,160 @@ class Memory:
                 for index, chunk in enumerate(chunks):
                     blob = embeddings.to_blob(vectors[index]) if vectors is not None else None
                     conn.execute(
-                        "INSERT INTO documents (source, chunk_index, content, added_at, embedding) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (source, index, chunk, now, blob),
+                        "INSERT INTO documents (source, chunk_index, content, added_at, embedding, tag, title) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (source, index, chunk, now, blob, tag or "", title or ""),
                     )
             return len(chunks)
         except Exception as exc:
             print(f"[Memory] Could not ingest document: {exc}")
             return 0
+
+    def remove_document(self, source: str) -> int:
+        try:
+            conn = self._connect()
+            with conn:
+                cur = conn.execute("DELETE FROM documents WHERE source = ?", (source,))
+            return cur.rowcount
+        except Exception as exc:
+            print(f"[Memory] Could not remove document: {exc}")
+            return 0
+
+    def document_label(self, source: str, text: str = "") -> str:
+        """`tag/relative-name[, p.N]` for a citation; falls back to the basename."""
+        name = os.path.basename(source)
+        tag = ""
+        try:
+            row = self._connect().execute(
+                "SELECT tag FROM documents WHERE source = ? LIMIT 1", (source,)
+            ).fetchone()
+            tag = row["tag"] if row else ""
+        except Exception:
+            pass
+        page = ""
+        if text.startswith("[p.") and "]" in text[:8]:
+            page = text[1:text.find("]")]
+        label = f"{tag}/{name}" if tag else name
+        return f"{label}, {page}" if page else label
+
+    def search_documents(self, query: str, top_k: int = 8, tag: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Meaning search over ingested files only, optionally within one tag; cites source/tag/title."""
+        query = (query or "").strip()
+        if not query:
+            return []
+        vectors = embeddings.embed([query])
+        if vectors is None:
+            return self._keyword_documents(query, top_k, tag)
+        query_blob = embeddings.to_blob(vectors[0])
+        where = "WHERE embedding IS NOT NULL" + (" AND tag = ?" if tag else "")
+        params: tuple = (tag,) if tag else ()
+        results: List[Dict[str, Any]] = []
+        try:
+            conn = self._connect()
+            if self._vec_sql:
+                rows = conn.execute(
+                    f"SELECT content, source, tag, title, vec_distance_cosine(embedding, ?) AS dist "
+                    f"FROM documents {where} ORDER BY dist LIMIT ?",
+                    (query_blob, *params, top_k),
+                ).fetchall()
+                for row in rows:
+                    results.append({
+                        "kind": "document", "text": row["content"], "source": row["source"],
+                        "tag": row["tag"], "title": row["title"], "score": 1.0 - float(row["dist"]),
+                    })
+            else:
+                query_vec = embeddings.from_blob(query_blob)
+                rows = conn.execute(
+                    f"SELECT content, source, tag, title, embedding FROM documents {where}", params
+                ).fetchall()
+                for row in rows:
+                    score = float((query_vec * embeddings.from_blob(row["embedding"])).sum())
+                    results.append({
+                        "kind": "document", "text": row["content"], "source": row["source"],
+                        "tag": row["tag"], "title": row["title"], "score": score,
+                    })
+        except Exception as exc:
+            print(f"[Memory] Document search failed: {exc}")
+            return []
+        results = [r for r in results if r["score"] >= DOCUMENT_SEARCH_FLOOR]
+        results.sort(key=lambda r: r["score"], reverse=True)
+        # Exact words still matter: a file name or a rare term the embedding
+        # underweights is caught by the keyword pass and merged in.
+        seen = {(r["source"], r["text"][:80]) for r in results}
+        for hit in self._keyword_documents(query, top_k, tag):
+            if (hit["source"], hit["text"][:80]) not in seen:
+                results.append(hit)
+        return results[:top_k]
+
+    def _keyword_documents(self, query: str, top_k: int, tag: Optional[str]) -> List[Dict[str, Any]]:
+        words = [w for w in query.lower().split() if len(w) > 2][:6]
+        if not words:
+            return []
+        clauses = " AND ".join("LOWER(content) LIKE ?" for _ in words)
+        params: List[Any] = [f"%{w}%" for w in words]
+        if tag:
+            clauses += " AND tag = ?"
+            params.append(tag)
+        try:
+            rows = self._connect().execute(
+                f"SELECT content, source, tag, title FROM documents WHERE {clauses} LIMIT ?",
+                (*params, top_k),
+            ).fetchall()
+        except Exception:
+            return []
+        return [{"kind": "document", "text": r["content"], "source": r["source"], "tag": r["tag"],
+                 "title": r["title"], "score": 0.5} for r in rows]
+
+    # ── ingest bookkeeping (knowledge_ingest.py) ──
+
+    def ingest_source(self, path: str) -> Optional[Dict[str, Any]]:
+        try:
+            row = self._connect().execute("SELECT * FROM ingest_sources WHERE path = ?", (path,)).fetchone()
+            return dict(row) if row else None
+        except Exception:
+            return None
+
+    def ingest_sources(self) -> List[Dict[str, Any]]:
+        try:
+            return [dict(r) for r in self._connect().execute("SELECT * FROM ingest_sources").fetchall()]
+        except Exception:
+            return []
+
+    def upsert_ingest_source(self, path: str, tag: str, mtime: float, size: int, sha1: str,
+                             chunks: int, status: str, error: str = "") -> None:
+        try:
+            conn = self._connect()
+            with conn:
+                conn.execute(
+                    "INSERT INTO ingest_sources (path, tag, mtime, size, sha1, chunks, indexed_at, status, error) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET tag=excluded.tag, "
+                    "mtime=excluded.mtime, size=excluded.size, sha1=excluded.sha1, chunks=excluded.chunks, "
+                    "indexed_at=excluded.indexed_at, status=excluded.status, error=excluded.error",
+                    (path, tag, mtime, size, sha1, chunks, time.time(), status, error),
+                )
+        except Exception as exc:
+            print(f"[Memory] Could not record ingest source: {exc}")
+
+    def remove_ingest_source(self, path: str) -> None:
+        try:
+            conn = self._connect()
+            with conn:
+                conn.execute("DELETE FROM ingest_sources WHERE path = ?", (path,))
+        except Exception:
+            pass
+
+    def knowledge_stats(self) -> Dict[str, Any]:
+        try:
+            conn = self._connect()
+            per_tag = {
+                r["tag"] or "(untagged)": r["c"]
+                for r in conn.execute("SELECT tag, COUNT(DISTINCT source) c FROM documents GROUP BY tag").fetchall()
+            }
+            files = conn.execute("SELECT COUNT(*) c FROM ingest_sources WHERE status = 'ok'").fetchone()["c"]
+            last = conn.execute("SELECT MAX(indexed_at) m FROM ingest_sources").fetchone()["m"]
+            return {"files": files, "perTag": per_tag, "lastIndexedAt": last}
+        except Exception:
+            return {"files": 0, "perTag": {}, "lastIndexedAt": None}
 
     def stats(self) -> Dict[str, Any]:
         try:
@@ -517,6 +686,7 @@ class Memory:
             }
             counts["semantic"] = embeddings.available()
             counts["vecExtension"] = self._vec_sql
+            counts["knowledge"] = self.knowledge_stats()
             return counts
         except Exception:
             return {"turns": 0, "facts": 0, "summaries": 0, "documentChunks": 0}

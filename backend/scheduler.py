@@ -363,6 +363,10 @@ class DexterScheduler:
             id="maint-memory", replace_existing=True,
         )
         self._scheduler.add_job(
+            self._reindex_knowledge, CronTrigger(hour=2, minute=30),
+            id="maint-knowledge", replace_existing=True,
+        )
+        self._scheduler.add_job(
             self._morning_brief, CronTrigger(hour=6, minute=0),
             id="maint-brief", replace_existing=True,
         )
@@ -426,6 +430,19 @@ class DexterScheduler:
         # get_agenda() rolls the planner onto today's date as a side effect,
         # so calling it just after midnight both rolls and re-arms.
         self.rearm_planner()
+
+    def _reindex_knowledge(self) -> None:
+        """Nightly: bring the folder index up to date (roadmap v5, 4.1)."""
+        try:
+            import knowledge_ingest
+
+            stats = knowledge_ingest.reindex()
+            print(
+                f"[Scheduler] Knowledge reindex: {stats['scanned']} scanned, {stats['updated']} updated, "
+                f"{stats['removed']} removed in {stats['seconds']}s."
+            )
+        except Exception as exc:
+            print(f"[Scheduler] Knowledge reindex failed: {exc}")
 
     def _refresh_app_index(self) -> None:
         import app_index

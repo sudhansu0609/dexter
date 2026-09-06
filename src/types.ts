@@ -162,6 +162,23 @@ export interface WorkbookSnapshot {
 // A runtime-tunable setting. `liveReload` false means the value is saved but
 // only takes effect on the next start, which the UI has to say out loud rather
 // than letting the change look applied.
+export interface ProfileChannel {
+  name: string;
+  channel_id: string;
+  brand: string;
+}
+
+export interface UserProfile {
+  name: string;
+  timezone: string;
+  location: string;
+  roles: string[];
+  preferences: string[];
+  working_hours: string;
+  channels: ProfileChannel[];
+  notes: string;
+}
+
 export interface SettingRow {
   key: string;
   label: string;

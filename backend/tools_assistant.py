@@ -253,21 +253,22 @@ def remember_document(path: str) -> ToolResult:
         return ToolResult.fail(pathguard.denial(path))
     if not os.path.isfile(allowed):
         return ToolResult.fail(f"'{path}' is not a file I can read.")
-    if not allowed.lower().endswith(_DOC_EXTENSIONS):
+    import knowledge_ingest
+
+    if not allowed.lower().endswith(_DOC_EXTENSIONS + (".pdf", ".docx")):
         return ToolResult.fail(
-            "I can only ingest text-like files for now "
-            f"({', '.join(_DOC_EXTENSIONS[:4])}...). PDFs come later."
+            "I can ingest text-like files, PDFs and Word documents "
+            f"({', '.join(_DOC_EXTENSIONS[:4])}, .pdf, .docx ...)."
         )
-    if os.path.getsize(allowed) > _DOC_MAX_BYTES:
-        return ToolResult.fail("That file is too large to ingest (400KB limit).")
+    if os.path.getsize(allowed) > max(_DOC_MAX_BYTES, knowledge_ingest.MAX_FILE_BYTES):
+        return ToolResult.fail("That file is too large to ingest (10 MB limit).")
 
     try:
-        with open(allowed, "r", encoding="utf-8", errors="ignore") as handle:
-            text = handle.read()
+        title, text = knowledge_ingest.extract(allowed)
     except Exception as exc:
         return ToolResult.fail(f"Could not read the file: {exc}")
 
-    stored = memory.add_document(allowed, _chunk_text(text))
+    stored = memory.add_document(allowed, knowledge_ingest.chunk_text(text), tag="manual", title=title)
     if not stored:
         return ToolResult.fail("The file had no readable content to remember.")
     name = os.path.basename(allowed)

@@ -54,6 +54,9 @@ import tools_workbook  # noqa: F401  - registers goal/commitment/review tools
 import tools_files  # noqa: F401  - registers rename/move/copy/delete
 import tools_web  # noqa: F401  - registers web search and weather
 import tools_studio  # noqa: F401  - registers the Buzzcaf Studio control tools
+import tools_knowledge  # noqa: F401  - registers knowledge search/reindex and profile tools
+import knowledge_ingest
+import user_profile
 from workbook import workbook
 from hybrid_llm import llm_router
 from memory import memory
@@ -111,6 +114,17 @@ async def lifespan(app: FastAPI):
             buzzcaf_client.start_event_listener(_on_studio_event)
         except Exception as exc:
             print(f"[Startup] Studio event listener not started: {exc}")
+        # Catch up on files that changed while Dexter was off, within a small
+        # budget; the rest waits for the 02:30 job.
+        try:
+            stats = knowledge_ingest.reindex(budget_seconds=60)
+            if stats["scanned"]:
+                print(
+                    f"[Startup] Knowledge: {stats['scanned']} file(s) scanned, {stats['updated']} updated"
+                    f"{' (partial, rest tonight)' if stats['partial'] else ''} in {stats['seconds']}s."
+                )
+        except Exception as exc:
+            print(f"[Startup] Knowledge pass skipped: {exc}")
 
     threading.Thread(target=_warm_health, name="dexter-health-warm", daemon=True).start()
 
@@ -339,6 +353,8 @@ async def get_status():
         "notesCount": len(notes),
         "scheduler": scheduler.status(),
         "memory": memory.stats(),
+        "profile": {"name": user_profile.load().get("name") or None, "known": not user_profile.is_empty()},
+        "knowledgeRoots": [f"{tag}={path}" for tag, path in knowledge_ingest.parse_roots()],
         "workbook": workbook.stats(),
         "integrations": {
             "windows": windows_tools.availability(),
@@ -708,6 +724,26 @@ async def read_settings():
 @app.post("/api/dexter/settings")
 async def write_settings(req: SettingsUpdate):
     return await run_in_threadpool(settings_store.update, req.changes)
+
+
+class ProfileUpdate(BaseModel):
+    profile: Dict[str, Any]
+
+
+@app.get("/api/dexter/profile")
+async def read_profile():
+    return {"profile": user_profile.load(), "summary": user_profile.summary()}
+
+
+@app.post("/api/dexter/profile")
+async def write_profile(req: ProfileUpdate):
+    saved = await run_in_threadpool(user_profile.save, req.profile)
+    return {"profile": saved, "summary": user_profile.summary()}
+
+
+@app.post("/api/dexter/knowledge/reindex")
+async def reindex_knowledge_now():
+    return await run_in_threadpool(knowledge_ingest.reindex)
 
 
 @app.get("/api/dexter/tasks/scheduled")

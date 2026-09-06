@@ -17,6 +17,7 @@ import type {
   SettingsUpdateResult,
   SkillItem,
   Task,
+  UserProfile,
   WorkbookSnapshot,
 } from './types';
 
@@ -114,6 +115,11 @@ export const getSettings = () => getJson<{ settings: SettingRow[] }>('/settings'
 
 export const updateSettings = (changes: Record<string, unknown>) =>
   postJson<SettingsUpdateResult>('/settings', { changes });
+
+export const getProfile = () => getJson<{ profile: UserProfile; summary: string }>('/profile');
+export const updateProfile = (profile: Partial<UserProfile>) =>
+  postJson<{ profile: UserProfile; summary: string }>('/profile', { profile });
+export const reindexKnowledge = () => postJson<Record<string, unknown>>('/knowledge/reindex');
 
 export const getWorkbook = () => getJson<WorkbookSnapshot>('/workbook');
 

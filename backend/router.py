@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import cancellation
 from hybrid_llm import extract_json, llm_router
 from tool_registry import ToolResult, all_tools, execute, get_tool, schemas_for
+import user_profile
 
 # ───────────────────────── result type ─────────────────────────
 
@@ -932,8 +933,9 @@ You can act on the computer by calling tools. Rules:
 - For general questions, conversation or knowledge, just answer directly. Do not call a tool.
 - When the task is done, reply in 1-2 short sentences describing what happened.
 - Never invent file paths or results. If a tool fails, say so plainly.
+- When you use a passage from the user's files, name the file (the context shows it as "from ...").
 
-Your replies are spoken aloud, so keep them short and natural."""
+Keep replies short and natural."""
 
 JSON_PROTOCOL_HINT = """If you cannot use the native tool-calling format, respond with a single JSON object instead:
 {"tool": "tool_name", "args": {...}}
@@ -1015,6 +1017,9 @@ def _fast_reply(
     None so the smart model is the safe fallback.
     """
     system = _FAST_SYSTEM
+    profile_block = user_profile.render_block()
+    if profile_block:
+        system += f"\n\n{profile_block}"
     if context_note:
         system += f"\n\nContext you may use:\n{context_note}"
 
@@ -1073,6 +1078,9 @@ def agent_loop(
     tool_schemas = schemas_for(candidate_names)
 
     system = AGENT_SYSTEM_PROMPT
+    profile_block = user_profile.render_block()
+    if profile_block:
+        system += f"\n\n{profile_block}"
     if context_note:
         system += f"\n\nContext you may use:\n{context_note}"
 
