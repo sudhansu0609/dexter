@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MutableRefObject } from 'react';
-import { chatStream } from '../api';
+import { chatStream, getHistory } from '../api';
 import { getLlmChoice } from './useLlmChoice';
 import type { ChatMessage, StreamEvent } from '../types';
 import type { VoiceApi } from './useVoice';
@@ -12,6 +12,10 @@ interface ChatDeps {
   // whose data a tool call may have changed.
   onTurnComplete: () => void;
 }
+
+// Enough to re-establish where the conversation was, without the feed opening
+// on a wall of yesterday.
+const HISTORY_TURNS = 12;
 
 const WELCOME: ChatMessage = {
   id: 'w1',
@@ -34,6 +38,38 @@ export function useChat({ voice, isThinkingRef, commandHandlerRef, onTurnComplet
   useEffect(() => {
     isThinkingRef.current = isThinking;
   }, [isThinking, isThinkingRef]);
+
+  // Resume the thread on launch. The backend has always persisted these turns
+  // and fed them to the model; the UI just could not read them back, so every
+  // relaunch opened on a blank welcome while Dexter itself remembered the
+  // conversation. Only replace the welcome when there is genuinely something to
+  // restore - a first run should still be greeted.
+  useEffect(() => {
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const { turns } = await getHistory(HISTORY_TURNS);
+        if (cancelled || turns.length === 0) return;
+
+        const restored: ChatMessage[] = turns
+          .filter((turn) => turn.role === 'user' || turn.role === 'assistant')
+          .map((turn, index) => ({
+            id: `h-${index}`,
+            sender: turn.role === 'user' ? 'user' : 'dexter',
+            text: turn.content,
+          }));
+
+        if (restored.length > 0) setChatLog(restored);
+      } catch {
+        // No history is not an error - keep the welcome and carry on.
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const pushDexterMessage = (text: string, action?: string) => {
     setChatLog((prev) => [...prev, { id: `d-${Date.now()}`, sender: 'dexter', text, action }]);

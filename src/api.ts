@@ -10,10 +10,14 @@
 import type {
   BgTask,
   BuzzcafProject,
+  DexterStatus,
   FileResult,
   OverNightItem,
+  SettingRow,
+  SettingsUpdateResult,
   SkillItem,
   Task,
+  WorkbookSnapshot,
 } from './types';
 
 export const API_BASE = 'http://localhost:8098';
@@ -103,6 +107,36 @@ async function post(path: string, body?: unknown): Promise<void> {
 }
 
 // ─────────────────────────── planner ───────────────────────────
+
+export const getStatus = () => getJson<DexterStatus>('/status');
+
+export interface HistoryTurn {
+  role: string;
+  content: string;
+}
+
+export const getHistory = (limit = 20, session = 'default') =>
+  getJson<{ session: string; turns: HistoryTurn[] }>(
+    `/memory/history?session=${encodeURIComponent(session)}&limit=${limit}`,
+  );
+
+export const getSettings = () => getJson<{ settings: SettingRow[] }>('/settings');
+
+export const updateSettings = (changes: Record<string, unknown>) =>
+  postJson<SettingsUpdateResult>('/settings', { changes });
+
+export const getWorkbook = () => getJson<WorkbookSnapshot>('/workbook');
+
+export const addCommitment = (text: string, when?: string, goal?: string) =>
+  postJson<{ ok: boolean; summary: string }>('/workbook/commitments', { text, when, goal });
+
+export const finishCommitment = (id: number) => post(`/workbook/commitments/${id}/done`);
+
+export const rollCommitment = (id: number) => post(`/workbook/commitments/${id}/roll`);
+
+export const closeOutDay = () => postJson<{ done: number; rolled: number }>(
+  '/workbook/close-out', { rollUnfinished: true },
+);
 
 export const getPlanner = () => getJson<{ tasks?: Task[] }>('/planner');
 export const addPlannerTask = (title: string) => post('/planner/add', { title });

@@ -11,10 +11,15 @@ import { useBuzzcaf } from './hooks/useBuzzcaf';
 import { useFileSearch } from './hooks/useFileSearch';
 import { useServerEvents } from './hooks/useServerEvents';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
+import { useRuntimeHealth } from './hooks/useRuntimeHealth';
+import { useWorkbook } from './hooks/useWorkbook';
 
 import { Header } from './components/Header';
 import ProviderSelector from './components/ProviderSelector';
 import { ReminderBanners } from './components/ReminderBanners';
+import { RuntimeBanner } from './components/RuntimeBanner';
+import { WorkbookPanel } from './components/WorkbookPanel';
+import { SettingsPanel } from './components/SettingsPanel';
 import { TaskTray } from './components/TaskTray';
 import { VoiceVisualizer } from './components/VoiceVisualizer';
 import { ChatFeed } from './components/ChatFeed';
@@ -35,6 +40,7 @@ import { SkillsPanel } from './components/SkillsPanel';
 // and updates both.
 export default function App() {
   const [isExpanded, setIsExpanded] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   const isThinkingRef = useRef(false);
   const commandHandlerRef = useRef<(text: string) => void>(() => {});
@@ -49,6 +55,8 @@ export default function App() {
   const buzzcaf = useBuzzcaf((text) => pushMessageRef.current(text));
   const fileSearch = useFileSearch();
   const online = useOnlineStatus();
+  const runtime = useRuntimeHealth();
+  const workbook = useWorkbook();
 
   const chat = useChat({
     voice,
@@ -56,6 +64,7 @@ export default function App() {
     commandHandlerRef,
     onTurnComplete: () => {
       planner.refresh();
+      workbook.refresh();
       overnight.refresh();
       skills.refresh();
       buzzcaf.refresh();
@@ -93,10 +102,23 @@ export default function App() {
         transition: 'max-width 0.3s ease',
       }}
     >
+      <RuntimeBanner warnings={runtime.warnings} onDismiss={runtime.dismiss} />
+
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+
       <ReminderBanners
         reminders={events.reminders}
         onSnooze={events.snoozeReminder}
         onDismiss={events.dismissReminder}
+      />
+
+      <WorkbookPanel
+        snapshot={workbook.snapshot}
+        busy={workbook.busy}
+        onCommit={workbook.commit}
+        onKeep={workbook.keep}
+        onRoll={workbook.roll}
+        onCloseOut={workbook.closeOut}
       />
 
       <TaskTray
@@ -112,6 +134,7 @@ export default function App() {
         isExpanded={isExpanded}
         onToggleExpand={toggleExpandWindow}
         online={online}
+        onToggleSettings={() => setShowSettings((v) => !v)}
       />
 
       {/* Pick the LLM backend + model (or leave on Auto). */}

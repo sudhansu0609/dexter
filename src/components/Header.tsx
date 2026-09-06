@@ -1,4 +1,4 @@
-import { Maximize2, MicOff, Minimize2, Radio, WifiOff, X } from 'lucide-react';
+import { Maximize2, MicOff, Minimize2, Radio, Settings, WifiOff, X } from 'lucide-react';
 
 interface Props {
   isVoiceMuted: boolean;
@@ -6,11 +6,19 @@ interface Props {
   isExpanded: boolean;
   onToggleExpand: () => void;
   online: boolean;
+  onToggleSettings: () => void;
 }
 
 // Frameless desktop window title bar: brand, connectivity, voice mute, and the
 // window action controls.
-export function Header({ isVoiceMuted, onToggleMute, isExpanded, onToggleExpand, online }: Props) {
+export function Header({
+  isVoiceMuted,
+  onToggleMute,
+  isExpanded,
+  onToggleExpand,
+  online,
+  onToggleSettings,
+}: Props) {
   return (
     <header
       className="dexter-panel dexter-header"
@@ -107,7 +115,28 @@ export function Header({ isVoiceMuted, onToggleMute, isExpanded, onToggleExpand,
           title={isVoiceMuted ? 'Unmute Voice' : 'Disable/Mute Voice'}
         >
           {isVoiceMuted ? <MicOff size={14} /> : <Radio className="brain-active-pulse" size={14} />}
-          {isVoiceMuted ? 'Muted' : 'Say "Dexter..."'}
+          {/* The wake phrase is openWakeWord's stock "hey jarvis" model - no
+              Dexter model exists and training one was declined. Telling the user
+              to say "Dexter" made every interaction start with a word that does
+              not wake anything. */}
+          {isVoiceMuted ? 'Muted' : 'Say "Hey Jarvis"'}
+        </button>
+
+        <button
+          type="button"
+          onClick={onToggleSettings}
+          style={{
+            background: 'rgba(148, 163, 184, 0.15)',
+            color: '#94a3b8',
+            border: '1px solid rgba(148, 163, 184, 0.3)',
+            padding: '6px 8px',
+            borderRadius: '10px',
+            display: 'flex',
+            alignItems: 'center',
+          }}
+          title="Settings"
+        >
+          <Settings size={14} />
         </button>
 
         {/* Window Expand / Compact Toggle */}
