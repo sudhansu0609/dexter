@@ -10,10 +10,37 @@ simply unavailable, the router falls back to lexical matching, and memory
 falls back to its keyword recall.
 """
 
+import os
 import threading
 from typing import Any, List, Optional
 
 MODEL_NAME = "all-MiniLM-L6-v2"
+_HF_CACHE_DIR = os.path.join(
+    os.path.expanduser("~"), ".cache", "huggingface", "hub",
+    f"models--sentence-transformers--{MODEL_NAME}",
+)
+
+
+def cached_locally() -> bool:
+    """True when the MiniLM snapshot is already on disk."""
+    return os.path.isdir(os.path.join(_HF_CACHE_DIR, "snapshots"))
+
+
+def _prefer_offline() -> None:
+    """
+    Load from the local cache without touching the network.
+
+    Every startup used to issue ~40 HEAD requests to huggingface.co before the
+    model loaded (a multi-second stall, and much worse with no connectivity).
+    When the snapshot exists there is nothing to fetch, so tell the hub so.
+    Explicit environment values win; a missing cache leaves the one-time
+    download path untouched.
+    """
+    if cached_locally():
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    else:
+        print(f"[Embeddings] {MODEL_NAME} not cached yet; first load will download it once.")
 
 _model: Optional[Any] = None
 _state = "pending"  # pending | ready | unavailable
@@ -28,11 +55,18 @@ def get_model() -> Optional[Any]:
         if _state != "pending":
             return _model
         try:
+            _prefer_offline()
+            import time as _time
+
             from sentence_transformers import SentenceTransformer  # type: ignore
 
+            started = _time.perf_counter()
             _model = SentenceTransformer(MODEL_NAME)
             _state = "ready"
-            print(f"[Embeddings] {MODEL_NAME} loaded (shared by router + memory).")
+            print(
+                f"[Embeddings] {MODEL_NAME} loaded in {_time.perf_counter() - started:.1f}s "
+                f"(shared by router + memory, offline={os.environ.get('HF_HUB_OFFLINE') == '1'})."
+            )
         except Exception as exc:
             _state = "unavailable"
             print(f"[Embeddings] sentence-transformers unavailable ({exc}).")

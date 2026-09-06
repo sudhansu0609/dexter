@@ -35,9 +35,6 @@ _SYMBOL = {OK: "[ OK ]", WARN: "[WARN]", FAIL: "[FAIL]"}
 # never broken - Dexter reports what is missing rather than crashing.
 _OPTIONAL = [
     ("sentence_transformers", "semantic intent matching and memory recall"),
-    ("faster_whisper", "local speech-to-text"),
-    ("openwakeword", "the local wake word"),
-    ("kokoro_onnx", "Kokoro speech (falls back to edge-tts)"),
 ]
 
 _REQUIRED = [
@@ -66,6 +63,20 @@ class Report:
     @property
     def failed(self) -> bool:
         return any(row[0] == FAIL for row in self.rows)
+
+    def problem_lines(self):
+        """WARN/FAIL rows as plain text - what a dialog or log should show."""
+        lines = []
+        for status, title, detail, action in self.rows:
+            if status == OK:
+                continue
+            line = f"{_SYMBOL[status]} {title}"
+            if detail:
+                line += f" - {detail}"
+            if action:
+                line += f"  -> {action}"
+            lines.append(line)
+        return lines
 
     def summary(self) -> str:
         counts = {OK: 0, WARN: 0, FAIL: 0}
@@ -127,28 +138,6 @@ def check_data_dir(report: Report) -> None:
                    "Dexter cannot persist reminders, tasks, or memory without it")
 
 
-def check_voice(report: Report) -> None:
-    """Kokoro needs both the package and its two model files, in that order."""
-    if not _installed("kokoro_onnx"):
-        report.add(WARN, "Speech output", "kokoro-onnx not installed, falling back to edge-tts",
-                   "pip install kokoro-onnx (edge-tts needs an internet connection)")
-        return
-    try:
-        import voice_engine
-
-        missing = [
-            path for path in (voice_engine.KOKORO_MODEL_PATH, voice_engine.KOKORO_VOICES_PATH)
-            if not os.path.exists(path)
-        ]
-        if missing:
-            report.add(WARN, "Speech output", f"Kokoro model files missing: {', '.join(missing)}",
-                       "Set KOKORO_DIR in .env, or drop the files into ./models")
-        else:
-            report.add(OK, "Speech output", "Kokoro model and voices found")
-    except Exception as exc:
-        report.add(WARN, "Speech output", f"could not check Kokoro: {exc}")
-
-
 def check_desktop_shell(report: Report) -> None:
     """
     The window itself.
@@ -165,23 +154,25 @@ def check_desktop_shell(report: Report) -> None:
 
     report.add(OK, "Desktop shell", "pywebview present")
 
-    # The mic-permission patch reaches into pywebview's WebView2 backend, so a
-    # pywebview upgrade can silently break voice input while everything else
-    # keeps working. Cheap to verify, and invisible if it ever stops matching.
+
+def check_embeddings_cache(report: Report) -> None:
+    """
+    MiniLM powers Tier-1 routing and memory recall. When its snapshot is cached
+    Dexter loads it offline; when it is not, the first launch downloads ~90 MB
+    and every launch before that stalls on the network (roadmap v5, 1.3).
+    """
     try:
-        from webview.platforms import edgechromium as ec
-
-        if not hasattr(ec.EdgeChrome, "on_webview_ready"):
-            report.add(WARN, "Microphone permission",
-                       "pywebview's WebView2 hook has changed; the mic patch will not attach",
-                       "Voice input will not work until backend/desktop_app.py is updated")
-            return
-        from Microsoft.Web.WebView2.Core import CoreWebView2PermissionKind  # noqa: F401
-
-        report.add(OK, "Microphone permission", "WebView2 patch will attach")
+        import embeddings
     except Exception as exc:
-        report.add(WARN, "Microphone permission", f"could not verify the WebView2 patch: {exc}",
-                   "Voice input may not work in the desktop shell")
+        report.add(WARN, "Embeddings", f"could not check: {exc}")
+        return
+    if not _installed("sentence_transformers"):
+        return
+    if embeddings.cached_locally():
+        report.add(OK, "Embeddings", f"{embeddings.MODEL_NAME} cached; loads offline")
+    else:
+        report.add(WARN, "Embeddings", f"{embeddings.MODEL_NAME} not cached yet",
+                   "The first launch needs internet once to download it (~90 MB)")
 
 
 def check_system_integrations(report: Report) -> None:
@@ -237,7 +228,9 @@ def check_llm(report: Report) -> None:
 
     providers = llm_router.get_available_providers(force=True)
     online = [
-        name for name, key in (("LM Studio", "lmStudio"), ("Ollama", "ollama"))
+        name for name, key in (
+            ("llama-server", "llamacpp"), ("LM Studio", "lmStudio"), ("Ollama", "ollama"),
+        )
         if providers.get(key, {}).get("online")
     ]
     if not online:
@@ -294,25 +287,30 @@ def check_runtime(report: Report) -> None:
         report.add(WARN, "Runtime", warning["message"], warning["action"])
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Check that Dexter can run.")
-    parser.add_argument("--quiet", action="store_true", help="only print problems")
-    args = parser.parse_args()
-
-    report = Report(quiet=args.quiet)
-    if not args.quiet:
-        print("=== Dexter preflight ===")
-
+def run_checks(quiet: bool = True) -> Report:
+    """Every check, in order. desktop_app.py calls this before opening a window."""
+    report = Report(quiet=quiet)
     check_python_deps(report)
+    check_embeddings_cache(report)
     check_env(report)
     check_data_dir(report)
     check_frontend(report)
     check_llm(report)
     check_runtime(report)
-    check_voice(report)
     check_reminders(report)
     check_system_integrations(report)
     check_desktop_shell(report)
+    return report
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Check that Dexter can run.")
+    parser.add_argument("--quiet", action="store_true", help="only print problems")
+    args = parser.parse_args()
+
+    if not args.quiet:
+        print("=== Dexter preflight ===")
+    report = run_checks(quiet=args.quiet)
 
     print(f"--- {report.summary()} ---")
     if report.failed:

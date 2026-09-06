@@ -58,12 +58,17 @@ class LLMResponse:
 
 class HybridLLMRouter:
     def __init__(self) -> None:
+        # codeBuzz's llama-server (Qwen3.8-27B on 8089). It is only up while
+        # codeBuzz runs, but when it is, it already owns the GPU - using it
+        # beats loading a second model onto the CPU (roadmap v5, 1.5).
+        self.llamacpp_url = os.getenv("LLAMACPP_URL", "http://127.0.0.1:8089/v1")
         self.lm_studio_url = os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
         self.ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/v1")
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
 
         # Explicit overrides; when unset the loaded model is auto-detected.
+        self.llamacpp_model = os.getenv("LLAMACPP_MODEL", "")
         self.lm_studio_model = os.getenv("LM_STUDIO_MODEL", "")
         self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
 
@@ -98,9 +103,11 @@ class HybridLLMRouter:
             if fresh and not force:
                 return self._health_cache  # type: ignore[return-value]
 
+        llamacpp_online = self._check_endpoint(f"{self.llamacpp_url}/models")
         lm_online = self._check_endpoint(f"{self.lm_studio_url}/models")
         ollama_online = self._check_endpoint(f"{self.ollama_url}/models")
         result = {
+            "llamacpp": {"online": llamacpp_online, "url": self.llamacpp_url},
             "lmStudio": {"online": lm_online, "url": self.lm_studio_url},
             "ollama": {"online": ollama_online, "url": self.ollama_url},
             "gemini": {"configured": bool(self.gemini_api_key)},
@@ -115,6 +122,9 @@ class HybridLLMRouter:
     def invalidate_health(self) -> None:
         with self._lock:
             self._health_cache = None
+            # The shared llama-server swaps models when codeBuzz does; do not
+            # keep naming a model that is no longer loaded.
+            self._model_cache.pop(self.llamacpp_url, None)
 
     def _list_models_at(self, base_url: str) -> List[str]:
         """All model ids a local OpenAI-compatible server currently exposes."""
@@ -135,6 +145,7 @@ class HybridLLMRouter:
         health = self.get_available_providers(force=True)
         providers = {}
         for key, prov, url in (
+            ("llamacpp", "llamacpp", self.llamacpp_url),
             ("lmStudio", "lmstudio", self.lm_studio_url),
             ("ollama", "ollama", self.ollama_url),
         ):
@@ -149,6 +160,7 @@ class HybridLLMRouter:
             "preferred": self.default_provider,
             # The model each provider defaults to when none is picked explicitly.
             "defaultModel": {
+                "llamacpp": self.llamacpp_model or None,
                 "lmstudio": self.lm_studio_model or None,
                 "ollama": self.ollama_model or None,
             },
@@ -177,6 +189,8 @@ class HybridLLMRouter:
     def _model_for(self, provider: str, override: Optional[str]) -> str:
         if override:
             return override
+        if provider == "llamacpp":
+            return self.llamacpp_model or self._discover_model(self.llamacpp_url) or "local-model"
         if provider == "lmstudio":
             return self.lm_studio_model or self._discover_model(self.lm_studio_url) or "local-model"
         if provider == "ollama":
@@ -188,6 +202,8 @@ class HybridLLMRouter:
         return "local-model"
 
     def _is_available(self, provider: str, providers: Dict[str, Any]) -> bool:
+        if provider == "llamacpp":
+            return bool(providers.get("llamacpp", {}).get("online"))
         if provider == "lmstudio":
             return bool(providers["lmStudio"]["online"])
         if provider == "ollama":
@@ -204,7 +220,7 @@ class HybridLLMRouter:
         providers = self.get_available_providers()
         # Configured preference wins when it is actually up; otherwise fall back
         # to the original local-first order.
-        order = ["lmstudio", "ollama", "gemini", "openai"]
+        order = ["llamacpp", "lmstudio", "ollama", "gemini", "openai"]
         if self.default_provider != "auto":
             order = [self.default_provider] + [p for p in order if p != self.default_provider]
         for prov in order:
@@ -213,6 +229,8 @@ class HybridLLMRouter:
         return "lmstudio"
 
     def _base_url_for(self, provider: str) -> str:
+        if provider == "llamacpp":
+            return self.llamacpp_url
         return self.ollama_url if provider == "ollama" else self.lm_studio_url
 
     def _provider_chain(self, provider: str, needs_tools: bool = False) -> List[str]:
@@ -227,6 +245,8 @@ class HybridLLMRouter:
             return [provider]
         health = self.get_available_providers()
         chain: List[str] = []
+        if health.get("llamacpp", {}).get("online"):
+            chain.append("llamacpp")
         if health["lmStudio"]["online"]:
             chain.append("lmstudio")
         if health["ollama"]["online"]:

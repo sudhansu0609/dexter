@@ -1,8 +1,9 @@
 # Dexter — Personal AI Super Assistant
 
 A local-first desktop assistant for Windows. Runs your apps and files, plans your
-day, actually reminds you, controls audio/media/system, and takes voice commands
-hands-free — with the language model kept local (LM Studio / Ollama).
+day, actually reminds you, controls audio/media/system, and runs the Buzzcaf
+Studio for you — with the language model kept local (a llama.cpp server,
+LM Studio, or Ollama). Text chat is the way in; voice was removed in v5.
 
 ---
 
@@ -11,7 +12,8 @@ hands-free — with the language model kept local (LM Studio / Ollama).
 ```bash
 pip install -r requirements.txt      # see "Optional extras" below
 npm install && npm run build
-start_dexter.bat                     # native WebView2 window
+Dexter.vbs                           # native WebView2 window, no console
+start_dexter.bat                     # same, with a console for the log
 ```
 
 `start_dexter.bat` runs a **preflight check** first and refuses to launch on a
@@ -19,13 +21,13 @@ real failure. Run it on its own any time you want to know whether Dexter can
 actually work:
 
 ```bash
-python backend/preflight.py          # deps, model, GPU, voice, reminders
+python backend/preflight.py          # deps, model, GPU, embeddings cache, reminders
 npm run check                        # preflight + pytest + tsc + vitest
 ```
 
 It reports the degradations that used to be silent — a missing APScheduler
 (reminders stored but never fired), a model that has fallen back to the CPU
-because something else holds the GPU, Kokoro assets it cannot find.
+because something else holds the GPU, an embeddings model that is not cached.
 
 Or run the pieces separately:
 
@@ -40,7 +42,9 @@ no API key is required.
 
 ### The model matters
 
-Dexter is local-first. Load a model in LM Studio with solid **function calling** —
+Dexter is local-first. When codeBuzz's `llama-server` is up on port 8089 Dexter
+uses it first (it already holds the GPU; see `LLAMACPP_URL`). Otherwise load a
+model in LM Studio with solid **function calling** —
 **Qwen2.5-7B-Instruct** or **Qwen3-8B** are the best quality-per-VRAM locally. A
 3B model will misfire on multi-step requests. The loaded model is auto-detected
 from `/models`, so there is nothing to configure after you swap it.
@@ -120,9 +124,11 @@ Measured on this machine: Tier 0/1 answer in **3–30ms**; time-to-first-audio i
 | File | Role |
 |---|---|
 | `main.py` | FastAPI transport only — endpoints, lifecycle, SSE streaming |
+| `desktop_app.py` | The window: preflight, in-process uvicorn, WebView2, remembered size |
+| `buzzcaf_client.py` | HTTP client for the Buzzcaf Studio (port 8000), launches its desktop app |
 | `router.py` | The three tiers, slot extraction, agent loop, confirmations |
 | `tool_registry.py` | `@tool` decorator → OpenAI schema + intent examples + validation |
-| `tools_core.py` | Apps, files, planner, notes, media, BuzzcafAI |
+| `tools_core.py` | Apps, files, planner, notes, media, the Studio |
 | `tools_assistant.py` | Reminders, memory, time |
 | `windows_tools.py` | Volume, brightness, clipboard, screenshots, windows, lock |
 | `media_tools.py` | System-wide playback via Windows SMTC |
@@ -137,7 +143,7 @@ Measured on this machine: Tier 0/1 answer in **3–30ms**; time-to-first-audio i
 | `workbook.py` | Goals, projects, commitments, entries — the spine of the planner/coach |
 | `runtime_health.py` | Detects and explains a degraded runtime (model on CPU, VRAM taken) |
 | `settings_store.py` | Runtime-tunable settings that apply without a restart |
-| `preflight.py` | Pre-launch check: deps, model, GPU, voice, reminders |
+| `preflight.py` | Pre-launch check: deps, model, GPU, embeddings cache, reminders |
 | `logging_setup.py` | Rotating `data/dexter.log`; stdout/stderr tee'd into it |
 | `env_boot.py` | Loads `.env` for every entry point, not just the server |
 
@@ -169,90 +175,13 @@ protected against drift as more tools are added.
 
 ---
 
-## Voice
-
-### Speaking — expressive delivery
-
-Kokoro is driven through a prosody layer (`backend/prosody.py`) rather than at a
-fixed voice and speed. Each reply gets a `Delivery`: an emotion, a speed, and a
-subtle voice blend.
-
-| Emotion | When | Speed | Blend |
-|---|---|---|---|
-| `urgent` | a reminder fires | 1.12× | + `am_eric` |
-| `upbeat` | an action succeeded | 1.07× | + `am_puck` |
-| `warm` | greetings, small talk | 0.97× | + `am_adam` |
-| `apologetic` | a tool failed or found nothing | 0.93× | + `am_onyx` |
-| `reading` | long-form narration | 0.96× | + `am_onyx` |
-| `calm` / `thinking` | long answers, deliberation | 0.94× / 0.90× | + `am_onyx` |
-
-Emotion comes from three sources, in priority order: an explicit request, an
-inline cue in the text, then inference from the reply and the tool result.
-Blend weights stay under ~0.25 deliberately — past that Dexter stops sounding
-like the same person in a different mood and starts sounding like someone else.
-
-**Inline cues work.** `*excited*`, `[laughs]`, `(gently)` used to be deleted
-before they could do anything; they now set the delivery and are removed from
-what is spoken:
-
-```
-"*excited* Your render just finished!"   → upbeat, 1.07×
-```
-
-### Speaking — text normalisation
-
-The single biggest naturalness win, and it was entirely absent. Raw text is
-rewritten into something that *sounds* right:
-
-| Written | Spoken |
-|---|---|
-| `10:30 AM` | "ten thirty A M" |
-| `40%` | "forty percent" |
-| `C:\Users\me\screenshot_1786554297.png` | "screenshot dot png" |
-| `t-1786555392658` | *(dropped — never read an id aloud)* |
-| `task(s)` | "tasks" |
-| `A; B; C` | "A. B. C." (real pauses — Kokoro runs straight through `;`) |
-
-### Reading things aloud
-
-```
-"read my agenda out loud"      "read out my notes"
-"read the clipboard to me"     "read C:\path\to\notes.txt aloud"
-```
-
-`read_aloud` produces genuine narration rather than the terse summary — *"You
-have three things left today. First, at two P M, Content Strategy. Then, at six
-P M, Evening Walk."* — and requests the narrator register via a `_speech_emotion`
-hint that the speech layer honours.
-
-### Listening
-
-- **Wake word: say “hey Jarvis”.** Not “Dexter” — openWakeWord ships no Dexter
-  phrase and training one was deliberately skipped, so the stock `hey_jarvis`
-  model is what actually listens. Change it with `DEXTER_WAKEWORD_MODEL`
-  (another pretrained phrase, or a path to your own `.onnx`).
-- A **9-second follow-up window** after Dexter speaks, during which no wake word
-  is needed — so "open chrome" → "now make it full screen" works the way a
-  conversation does (`DEXTER_FOLLOWUP_WINDOW`).
-- **Barge-in**: "stop" / "quiet" / "cancel" interrupts mid-sentence and clears
-  the queued audio. **Off by default** (half-duplex) because Dexter used to
-  answer its own TTS echo; enable with `DEXTER_VOICE_BARGE_IN=1`.
-- **Echo suppression**: mic aborts while speaking, a cooldown
-  (`DEXTER_ECHO_GUARD_MS`), and a self-echo filter against the last spoken text.
-
-The pipeline is fully local — openWakeWord → silero-vad → faster-whisper. The
-browser recognizer remains an automatic fallback when those deps are missing.
-
----
-
 ## Reminders
 
-Three delivery channels fire together, so a reminder lands whether or not the
+Two delivery channels fire together, so a reminder lands whether or not the
 window is open:
 
-1. **Spoken** — Kokoro TTS through the app
-2. **Windows toast** — persists in Action Center, works with Dexter closed
-3. **In-app banner** — with Snooze (10 min) and Done
+1. **Windows toast** — persists in Action Center, works with Dexter closed
+2. **In-app banner** — with Snooze (10 min) and Done
 
 ```
 "remind me to check the render in 30 minutes"
@@ -302,7 +231,6 @@ crashing.
 | `sentence-transformers` | Tier 1 falls back to lexical matching (lower recall on unusual paraphrases) |
 | `apscheduler` | Reminders are stored and listed but never fire |
 | `winotify` | Toasts fall back to a slower PowerShell path |
-| `kokoro-onnx` | TTS falls back to edge-tts |
 | `pycaw`, `screen-brightness-control`, `pyperclip`, `mss`, `pygetwindow` | Those specific system tools report unavailable |
 | `winsdk` | Media keys still work; "what's playing" does not |
 | `google-api-python-client`, `google-auth-oauthlib` | Gmail/Calendar unavailable |
@@ -317,10 +245,9 @@ pip install sentence-transformers
 
 ## Settings
 
-The gear icon in the title bar changes voice, model, and behaviour settings
-**while Dexter is running** — barge-in, the follow-up window, echo guard, wake
-word sensitivity, preferred backend, the fast-model tier, proactive suggestions,
-and quiet hours. Anything that genuinely needs a restart says so instead of
+The gear icon in the title bar changes model and behaviour settings
+**while Dexter is running** — preferred backend, the fast-model tier, proactive
+suggestions, and quiet hours. Anything that genuinely needs a restart says so instead of
 looking applied. Values persist in `data/settings.json` and override `.env`.
 
 ## When something is wrong

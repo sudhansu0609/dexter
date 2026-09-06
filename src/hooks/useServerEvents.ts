@@ -1,10 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { addReminder, cancelTask, confirmTask, eventsUrl, getTasks } from '../api';
 import type { BgTask, ReminderBanner } from '../types';
-import type { VoiceApi } from './useVoice';
 
 interface EventDeps {
-  voice: VoiceApi;
   // Reminders can change the planner (a due item is checked off server-side).
   refreshPlanner: () => void;
 }
@@ -13,13 +11,13 @@ interface EventDeps {
 // - plus the reminder banners and background-task tray it feeds. Reconnects on
 // error (roadmap Phase 6, item 17). The listeners are registered once, so they
 // dispatch through a ref that always holds the current-render callbacks.
-export function useServerEvents({ voice, refreshPlanner }: EventDeps) {
+export function useServerEvents({ refreshPlanner }: EventDeps) {
   const [reminders, setReminders] = useState<ReminderBanner[]>([]);
   const [bgTasks, setBgTasks] = useState<BgTask[]>([]);
   const [connected, setConnected] = useState(false);
 
-  const depsRef = useRef({ voice, refreshPlanner });
-  depsRef.current = { voice, refreshPlanner };
+  const depsRef = useRef({ refreshPlanner });
+  depsRef.current = { refreshPlanner };
 
   const dismissReminder = (id: string) => {
     setReminders((prev) => prev.filter((r) => r.id !== id));
@@ -90,10 +88,6 @@ export function useServerEvents({ voice, refreshPlanner }: EventDeps) {
               ...prev,
               { id: payload.id || `rem-${Date.now()}`, text: payload.text, missed: payload.missed },
             ]);
-          }
-          if (payload?.speak && !depsRef.current.voice.isVoiceMutedRef.current) {
-            // Flagged as a reminder so it is delivered in the urgent register.
-            depsRef.current.voice.speakText(payload.spoken || payload.text, 'urgent', true);
           }
           depsRef.current.refreshPlanner();
         } catch (e) {

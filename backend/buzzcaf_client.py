@@ -1,7 +1,7 @@
 """
 BuzzcafAI Client - HTTP interface to the 115-agent content production studio.
 
-BuzzcafAI API runs on http://localhost:8095 and provides:
+BuzzcafAI API runs on http://127.0.0.1:8000 (BUZZCAF_API_URL) and provides:
 - Project management (create, execute workflows, track status)
 - Workflow engine (multi-step content pipelines)
 - Asset management (media files, thumbnails, etc.)
@@ -19,12 +19,40 @@ import requests
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
-BUZZCAF_BASE_URL = os.getenv("BUZZCAF_API_URL", "http://localhost:8095")
+BUZZCAF_BASE_URL = os.getenv("BUZZCAF_API_URL", "http://127.0.0.1:8000")
 # Sibling-project locations default to directories next to the Dexter checkout
 # but can be pointed anywhere via .env.
 _SIBLING_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BUZZCAF_DIR = os.getenv("BUZZCAF_DIR", os.path.join(_SIBLING_ROOT, "BuzzcafAI"))
-MIDNIGHTBUZZ_DIR = os.getenv("MIDNIGHTBUZZ_DIR", os.path.join(_SIBLING_ROOT, "MidnightBuzz"))
+
+
+def _studio_port(base_url: str) -> str:
+    """Port the Studio should listen on, derived from the URL Dexter will poll."""
+    try:
+        from urllib.parse import urlparse
+
+        return str(urlparse(base_url).port or 8000)
+    except Exception:
+        return "8000"
+
+
+def _studio_python() -> str:
+    """
+    Interpreter used to launch the Studio: an explicit BUZZCAF_PYTHON, then a
+    .venv inside the Studio checkout, then a console-less pythonw next to our
+    own interpreter, then ourselves. pythonw matters: the Studio is a desktop
+    app and must not open a console window.
+    """
+    explicit = os.getenv("BUZZCAF_PYTHON", "").strip()
+    if explicit and os.path.exists(explicit):
+        return explicit
+    venv = os.path.join(BUZZCAF_DIR, ".venv", "Scripts", "pythonw.exe")
+    if os.path.exists(venv):
+        return venv
+    sibling = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if sys.platform == "win32" and os.path.exists(sibling):
+        return sibling
+    return sys.executable
 
 
 @dataclass
@@ -90,7 +118,9 @@ class BuzzcafAIClient:
 
         try:
             res = self.session.get(f"{self.base_url}/health", timeout=1.5)
-            online = res.status_code == 200
+            # Port 8000 is popular. Only the Studio answers with app=buzzcaf;
+            # anything else there is "offline" as far as Dexter is concerned.
+            online = res.status_code == 200 and (res.json() or {}).get("app") == "buzzcaf"
         except Exception:
             online = False
 
@@ -114,37 +144,37 @@ class BuzzcafAIClient:
         if self.health_check(force=True):
             return {"success": True, "message": "BuzzcafAI is already running.", "already_running": True}
 
-        # Try to find the backend directory and start uvicorn
-        backend_dir = os.path.join(MIDNIGHTBUZZ_DIR, "backend")
+        backend_dir = os.path.join(BUZZCAF_DIR, "backend")
         if not os.path.exists(backend_dir):
-            backend_dir = os.path.join(BUZZCAF_DIR, "backend")
+            return {"success": False, "error": f"Studio backend directory not found at {backend_dir}"}
 
-        if not os.path.exists(backend_dir):
-            return {"success": False, "error": f"Backend directory not found at {backend_dir}"}
-
-        # Check for virtual environment python
-        venv_python = os.path.join(backend_dir, "voice_env", "Scripts", "python.exe")
-        if not os.path.exists(venv_python):
-            venv_python = sys.executable  # Fallback to current python
-
-        try:
-            # Start uvicorn in background
-            # Loopback only: Dexter is the sole consumer, and 0.0.0.0 exposed
-            # the studio API to the whole LAN regardless of Dexter's own bind.
+        python_exe = _studio_python()
+        port = _studio_port(self.base_url)
+        desktop_entry = os.path.join(backend_dir, "desktop_app.py")
+        if os.path.exists(desktop_entry):
+            # The Studio's own desktop shell: FastAPI in-process plus its window.
+            cmd = [python_exe, desktop_entry]
+        else:
+            # Older checkout without the shell: API only, loopback, no reload.
             cmd = [
-                venv_python, "-m", "uvicorn",
-                "app.main:app",
-                "--host", "127.0.0.1",
-                "--port", "8095"
+                python_exe, "-m", "uvicorn", "app.main:app",
+                "--host", "127.0.0.1", "--port", port,
             ]
 
-            # Use subprocess.Popen to start in background
+        try:
+            env = dict(os.environ)
+            env["BUZZCAF_PORT"] = port
+            env.setdefault("PYTHONIOENCODING", "utf-8")
+            # No console window: the Studio is a desktop app, and a stray
+            # cmd.exe behind it was one of the owner's explicit complaints.
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
             process = subprocess.Popen(
                 cmd,
                 cwd=backend_dir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
+                creationflags=flags,
+                env=env,
             )
 
             return {
@@ -157,29 +187,31 @@ class BuzzcafAIClient:
             return {"success": False, "error": str(e)}
 
     def start_frontend(self) -> Dict[str, Any]:
-        """Start the BuzzcafAI frontend dev server."""
-        frontend_dir = os.path.join(MIDNIGHTBUZZ_DIR, "frontend")
-        if not os.path.exists(frontend_dir):
-            frontend_dir = os.path.join(BUZZCAF_DIR, "frontend")
+        """
+        Kept for API compatibility. The Studio's UI is a built bundle served by
+        its own backend (and shown in its desktop window), so there is no
+        separate dev server to start any more.
+        """
+        return {
+            "success": True,
+            "message": "The Studio UI is served by its backend; nothing separate to start.",
+            "already_running": True,
+        }
 
-        if not os.path.exists(frontend_dir):
-            return {"success": False, "error": f"Frontend directory not found"}
-
+    def _retired_start_frontend(self) -> Dict[str, Any]:  # pragma: no cover
+        frontend_dir = os.path.join(BUZZCAF_DIR, "frontend")
         try:
-            # Start npm dev server in background. which() resolves npm.cmd on
-            # Windows, so no shell is needed on either platform.
             npm = shutil.which("npm") or "npm"
             process = subprocess.Popen(
                 [npm, "run", "dev"],
                 cwd=frontend_dir,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
             )
 
             return {
                 "success": True,
-                "message": "BuzzcafAI frontend starting on port 3005...",
+                "message": "Studio dev server starting...",
                 "pid": process.pid
             }
         except Exception as e:
@@ -303,7 +335,9 @@ class BuzzcafAIClient:
             res = self.session.get(f"{self.base_url}/api/brands", timeout=5)
             return res.json() if res.ok else []
         except Exception:
-            return ["Beyond3Baje", "Khayal3Baje", "Spilled Coffee Studio"]
+            # Never invent channels: an empty list tells the caller the Studio
+            # is unreachable, which is the truth.
+            return []
 
     # ─────────────────────────────────────────────────────────────
     # Workflows

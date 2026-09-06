@@ -4,7 +4,6 @@ import { getSettings, updateSettings } from '../api';
 import type { SettingRow } from '../types';
 
 const GROUP_LABELS: Record<string, string> = {
-  voice: 'Voice',
   model: 'Model',
   behaviour: 'Behaviour',
   general: 'General',

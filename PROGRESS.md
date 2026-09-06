@@ -11,12 +11,12 @@ Nothing is marked done on intent.
 | 0.1 commit + `pre-v5` tag | ✅ done | 6 commits `0a66577..83f7065`, `git tag -l` → `pre-v5` |
 | 0.2 session token ACL | ✅ done | `icacls data\.session_token` → `WARHEAD-MOTHERS\singh:(F)` only (2026-09-06) |
 | 0.4 ECOSYSTEM.md identical | ✅ done | `diff ECOSYSTEM.md ../BuzzcafAI/ECOSYSTEM.md` empty |
-| 1.1 Studio client fixed | ⬜ open | |
-| 1.2 curation removed | ⬜ open | |
-| 1.3 offline startup (**I4**) | ⬜ open | |
-| 1.4 voice removed | ⬜ open | |
-| 1.5 llamacpp provider (**I3**) | ⬜ open | |
-| 1.6 hidden launcher (**I1**) | ⬜ open | |
+| 1.1 Studio client fixed | ✅ done | `buzzcaf_client.py` → port 8000, `BUZZCAF_DIR` only, `pythonw desktop_app.py` launch, `[]` brands on error, `/health` must say `app:"buzzcaf"`; `buzzcaf_execute_step` fails on error and reports `paused_for_approval`; `grep MIDNIGHTBUZZ\|8095\|3005` empty |
+| 1.2 curation removed | ✅ done | `SpilledCoffeeAIController`, `curate_video_ideas`, `/spilledcoffee/*`, overnight UI, legacy skill, demo seed tasks deleted; tools 77 → 75; `pytest` 280 passed |
+| 1.3 offline startup (**I4**) | ✅ done | log: `[Embeddings] all-MiniLM-L6-v2 loaded in 0.3s (... offline=True)`; preflight has an embeddings-cache row |
+| 1.4 voice removed | ✅ done | 6 backend modules + WS/TTS routes + mic patch + 4 settings + deps + `useVoice`/`VoiceVisualizer` removed; `import main` OK; `pytest` 280 passed; `tsc`, `vitest` (4), `vite build` green |
+| 1.5 llamacpp provider (**I3**) | ⚠️ built, timing pending | `_provider_chain('auto')` → `['ollama','lmstudio']` with 8089 down (llamacpp first when up); fast tier skipped on llamacpp; **I3** timing not yet measured with the server up |
+| 1.6 hidden launcher (**I1**) | ⚠️ partial | `pythonw backend/desktop_app.py` → no new `conhost` (21 → 21), health OK, window after **18.2 s** (2026-09-06). Works hidden; startup time still fails the < 5 s bar |
 | 3.2 studio tools (**I5**) | ⬜ open | |
 | 4.1 knowledge ingestion (**I6/I7**) | ⬜ open | |
 | 4.2 profile (**I8**) | ⬜ open | |

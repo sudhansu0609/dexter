@@ -1,13 +1,9 @@
-import { useEffect, useRef, useState, type MutableRefObject } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { chatStream, getHistory } from '../api';
 import { getLlmChoice } from './useLlmChoice';
 import type { ChatMessage, StreamEvent } from '../types';
-import type { VoiceApi } from './useVoice';
 
 interface ChatDeps {
-  voice: VoiceApi;
-  isThinkingRef: MutableRefObject<boolean>;
-  commandHandlerRef: MutableRefObject<(text: string) => void>;
   // Called once a turn produces its authoritative reply, to refresh the widgets
   // whose data a tool call may have changed.
   onTurnComplete: () => void;
@@ -20,24 +16,20 @@ const HISTORY_TURNS = 12;
 const WELCOME: ChatMessage = {
   id: 'w1',
   sender: 'dexter',
-  text: 'Hello! I am Dexter, your AI super assistant. Speak your command hands-free or type a request.',
+  text: 'Hello! I am Dexter. Ask me anything, or tell me what to do.',
 };
 
 // Owns the chat feed and the streaming /chat/stream turn loop: live token
-// rendering, tool-activity labels, provider-switch handling, and feeding spoken
-// chunks to the voice layer (roadmap Phase 6, items 9 + token-stream rendering).
-export function useChat({ voice, isThinkingRef, commandHandlerRef, onTurnComplete }: ChatDeps) {
+// rendering, tool-activity labels and provider-switch handling (roadmap Phase
+// 6, items 9 + token-stream rendering). Voice was removed in v5; the chat is
+// text-only.
+export function useChat({ onTurnComplete }: ChatDeps) {
   const [chatLog, setChatLog] = useState<ChatMessage[]>([WELCOME]);
   const [inputMsg, setInputMsg] = useState('');
   const [isThinking, setIsThinking] = useState(false);
   const [toolActivity, setToolActivity] = useState('');
   // Chat message currently receiving streamed LLM tokens, if any.
   const streamMsgIdRef = useRef<string | null>(null);
-
-  // Keep the thinking flag mirrored into the ref the voice loop reads.
-  useEffect(() => {
-    isThinkingRef.current = isThinking;
-  }, [isThinking, isThinkingRef]);
 
   // Resume the thread on launch. The backend has always persisted these turns
   // and fed them to the model; the UI just could not read them back, so every
@@ -79,33 +71,24 @@ export function useChat({ voice, isThinkingRef, commandHandlerRef, onTurnComplet
     const textToSend = customText || inputMsg;
     if (!textToSend.trim()) return;
 
-    // Temporarily pause mic while processing & speaking
-    voice.stopListening();
-
     const userMsg: ChatMessage = { id: `u-${Date.now()}`, sender: 'user', text: textToSend };
     setChatLog((prev) => [...prev, userMsg]);
     setInputMsg('');
     setIsThinking(true);
     setToolActivity('');
-    voice.audioQueueRef.current = [];
     streamMsgIdRef.current = null;
 
-    const speakEnabled = !voice.isVoiceMutedRef.current;
-
     try {
-      // Streaming endpoint: the reply lands as soon as it is ready and each
-      // spoken chunk follows as it finishes synthesising, so audio starts in a
-      // few hundred ms instead of after the whole response is voiced. The
-      // user's picked provider/model (or 'auto') rides along on every turn.
+      // Streaming endpoint: tokens land as they are generated. The user's picked
+      // provider/model (or 'auto') rides along on every turn.
       const choice = getLlmChoice();
-      const res = await chatStream(textToSend, speakEnabled, choice.provider, choice.model);
+      const res = await chatStream(textToSend, choice.provider, choice.model);
 
       if (!res.ok || !res.body) throw new Error(`Chat failed: ${res.status}`);
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
-      let gotReply = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -147,10 +130,8 @@ export function useChat({ voice, isThinkingRef, commandHandlerRef, onTurnComplet
             if (sid) setChatLog((prev) => prev.map((m) => (m.id === sid ? { ...m, text: '' } : m)));
             setToolActivity(`retrying on ${evt.payload?.to || 'fallback'}`);
           } else if (evt.type === 'reply') {
-            gotReply = true;
             setIsThinking(false);
             setToolActivity('');
-            voice.lastSpokenTextRef.current = evt.payload.reply || '';
             const sid = streamMsgIdRef.current;
             streamMsgIdRef.current = null;
             if (sid) {
@@ -167,8 +148,6 @@ export function useChat({ voice, isThinkingRef, commandHandlerRef, onTurnComplet
               ]);
             }
             onTurnComplete();
-          } else if (evt.type === 'audio' && speakEnabled) {
-            voice.enqueueAudio(evt.payload.url);
           } else if (evt.type === 'error') {
             setChatLog((prev) => [
               ...prev,
@@ -184,13 +163,6 @@ export function useChat({ voice, isThinkingRef, commandHandlerRef, onTurnComplet
 
       setIsThinking(false);
       setToolActivity('');
-      // Voice off, or nothing queued to speak: resume listening immediately.
-      if (
-        !speakEnabled ||
-        (gotReply && voice.audioQueueRef.current.length === 0 && !voice.isPlayingQueueRef.current)
-      ) {
-        voice.startListening();
-      }
     } catch (err) {
       console.warn('Chat request failed', err);
       setIsThinking(false);
@@ -199,15 +171,8 @@ export function useChat({ voice, isThinkingRef, commandHandlerRef, onTurnComplet
         ...prev,
         { id: `err-${Date.now()}`, sender: 'dexter', text: 'Error connecting to Dexter Backend Server.' },
       ]);
-      voice.startListening();
     }
   };
-
-  // The mic is registered once on mount but must always dispatch to the current
-  // render's send closure; keep the shared handler ref pointed at it.
-  useEffect(() => {
-    commandHandlerRef.current = handleSendMessage;
-  });
 
   return {
     chatLog,

@@ -1,7 +1,6 @@
 """
 Scheduler tests (roadmap 7.2): re-arm on restart, missed-reminder catch-up,
-and the maintenance jobs that fix bug 7 (prune fired reminders, dedup
-overnight content on write).
+and the maintenance jobs that fix bug 7 (prune fired reminders).
 
 APScheduler is optional in production and absent here on purpose: the tests
 inject a fake scheduler + fake triggers, so what is exercised is Dexter's own
@@ -202,28 +201,3 @@ def test_prune_removes_only_old_fired_one_shots(sched):
     assert removed == 1
     kept = {r["id"] for r in sched.list_reminders()}
     assert kept == {"r-fresh", "r-pending", "r-cron"}
-
-
-# ───────────────────────── maintenance: overnight dedup (bug 7) ─────────────────────────
-
-
-def test_overnight_curation_dedups_on_write(tmp_path, monkeypatch):
-    import tools_core
-
-    monkeypatch.setattr(tools_core, "OVERNIGHT_FILE", str(tmp_path / "overnight.json"))
-
-    class FakeLLM:
-        def generate(self, *a, **k):
-            return (
-                '[{"title": "Same Idea", "hook": "h", "scriptOutline": [],'
-                ' "targetAudience": "t", "ctrScore": "9%"}]'
-            )
-
-    controller = tools_core.SpilledCoffeeAIController(FakeLLM())
-    first = controller.run_overnight_curation("test niche")
-    second = controller.run_overnight_curation("test niche")
-
-    assert first["count"] == 1
-    assert second["count"] == 0  # identical title skipped on re-run
-    titles = [i["title"] for i in controller.get_overnight_content()]
-    assert titles == ["Same Idea"]

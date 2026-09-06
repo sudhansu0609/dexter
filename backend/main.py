@@ -10,8 +10,6 @@ this module is only transport: endpoints, lifecycle, and streaming.
 import asyncio
 import json
 import os
-import queue as sync_queue
-import re
 import secrets
 import sys
 import threading
@@ -29,10 +27,10 @@ import logging_setup
 # console, so without this every diagnostic it emits is lost.
 _LOG_PATH = logging_setup.setup()
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -43,7 +41,6 @@ import media_tools
 import router as intent_router
 import runtime_health
 import settings_store
-import voice_pipeline
 import tools_assistant  # noqa: F401  - registers reminder/memory tools
 import windows_tools
 from buzzcaf_client import buzzcaf_client
@@ -64,16 +61,11 @@ from tools_core import (
     AppLauncherTool,
     PlaywrightBrowserTool,
     day_planner,
-    spilled_coffee,
     sticky_notes,
     youtube_tool,
 )
-from voice_engine import DexterVoiceEngine
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-AUDIO_DIR = os.path.join(ROOT_DIR, "data", "audio")
-
-voice_engine = DexterVoiceEngine()
 
 # Macro recording captures tool calls as they execute.
 intent_router.TOOL_OBSERVERS.append(macros.observe_tool_call)
@@ -106,17 +98,6 @@ async def lifespan(app: FastAPI):
         import reflection
 
         reflection.catch_up()
-        # Warm the STT model off the request path so the first spoken command
-        # does not eat the one-time load. Guarded: a missing model or blocked
-        # download just leaves the local pipeline reporting "not ready".
-        if os.getenv("DEXTER_LOCAL_STT", "1") != "0":
-            try:
-                from stt_engine import stt_engine
-
-                if stt_engine.available():
-                    stt_engine._ensure_model()
-            except Exception as exc:
-                print(f"[Startup] STT warm-up skipped: {exc}")
 
     threading.Thread(target=_warm_health, name="dexter-health-warm", daemon=True).start()
 
@@ -181,10 +162,8 @@ try:
 except Exception as _exc:
     print(f"[Auth] Could not persist session token: {_exc}")
 
-# Reachable without the token: the health probe, the token bootstrap itself,
-# and generated TTS clips - those are played through Audio()/EventSource-style
-# APIs that cannot attach headers, and contain only Dexter's own speech.
-_TOKEN_EXEMPT = ("/api/dexter/health", "/api/dexter/auth/token", "/api/dexter/audio/")
+# Reachable without the token: the health probe and the token bootstrap itself.
+_TOKEN_EXEMPT = ("/api/dexter/health", "/api/dexter/auth/token")
 _ALLOWED_HOSTNAMES = {"127.0.0.1", "localhost", "::1", os.getenv("DEXTER_HOST", "127.0.0.1")}
 
 
@@ -249,8 +228,6 @@ class ChatRequest(BaseModel):
     message: str
     provider: Optional[str] = "auto"
     model: Optional[str] = None
-    voiceEnabled: Optional[bool] = True
-    voiceKey: Optional[str] = "michael"
     session: Optional[str] = "default"
 
 
@@ -289,18 +266,6 @@ class CreateFolderRequest(BaseModel):
     path: str
 
 
-class CurateRequest(BaseModel):
-    niche: Optional[str] = "AI Tech & Viral Trends"
-    count: Optional[int] = 3
-
-
-class TTSRequest(BaseModel):
-    text: str
-    voiceKey: Optional[str] = "michael"
-    emotion: Optional[str] = None
-    isReminder: Optional[bool] = False
-
-
 class CreateNoteRequest(BaseModel):
     content: str
     title: Optional[str] = "Sticky Note"
@@ -335,7 +300,6 @@ async def get_status():
     providers = await run_in_threadpool(llm_router.get_available_providers)
     planner = await run_in_threadpool(day_planner.get_agenda)
     skills = await run_in_threadpool(macros.list_skills)
-    overnight = await run_in_threadpool(spilled_coffee.get_overnight_content)
     notes = await run_in_threadpool(sticky_notes.list_notes)
     buzzcaf_status = await run_in_threadpool(buzzcaf_client.get_status)
 
@@ -354,13 +318,11 @@ async def get_status():
         "providers": providers,
         "preferredProvider": llm_router.default_provider,
         "runtime": runtime,
-        "voiceDebug": _voice_debug,
         "toolCount": len(all_tools()),
         "intentMode": intent_router._embedder.mode,
         "appsIndexed": app_index.size(),
         "skillsCount": len(skills),
         "tasksCount": len(planner.get("tasks", [])),
-        "overnightQueueCount": len(overnight),
         "notesCount": len(notes),
         "scheduler": scheduler.status(),
         "memory": memory.stats(),
@@ -369,10 +331,6 @@ async def get_status():
             "windows": windows_tools.availability(),
             "media": media_tools.availability(),
             "google": google_tools.availability(),
-        },
-        "voice": {
-            "enabled": os.getenv("DEXTER_LOCAL_STT", "1") != "0",
-            **voice_pipeline.capabilities(),
         },
         "buzzcafAI": {
             "online": buzzcaf_status.get("online", False),
@@ -463,22 +421,13 @@ async def process_chat(req: ChatRequest):
     return await run_in_threadpool(_run_route, req)
 
 
-# A sentence is speakable once its terminator is followed by whitespace; the
-# minimum offset keeps abbreviations and tiny fragments from triggering a chunk.
-_SENTENCE_END = re.compile(r"[.!?][\"'\)\]]*\s")
-_MIN_STREAM_SENTENCE = 12
-
-
 @app.post("/api/dexter/chat/stream")
 async def process_chat_stream(req: ChatRequest):
     """
-    Chat with incremental delivery.
-
-    LLM tokens stream to the UI as they are generated (`token` events), and
-    completed sentences are synthesised while later ones are still being
-    written - so speech starts before the model has finished the reply, not
-    after. Fast-path replies (no LLM, so no tokens) fall back to synthesising
-    the finished reply sentence by sentence as before.
+    Chat with incremental delivery: LLM tokens stream to the UI as they are
+    generated (`token` events, plus `tool_start` / `provider_switched`), then
+    the authoritative `reply`, then `done`. Fast-path replies skip straight to
+    `reply` because no model ran.
     """
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -486,122 +435,20 @@ async def process_chat_stream(req: ChatRequest):
     def emit(event_type: str, payload: Any) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, (event_type, payload))
 
-    # Synthesis runs on its own thread so a 300ms Kokoro call never stalls the
-    # token stream. Sentences go in; audio events come out.
-    tts_queue: "sync_queue.Queue[Optional[str]]" = sync_queue.Queue()
-    state = {"pending": "", "spoke_stream": False, "emotion": None}
-
     session_id = req.session or "default"
-
-    def tts_worker() -> None:
-        while True:
-            sentence = tts_queue.get()
-            if sentence is None:
-                return
-            # Barge-in: once the session is cancelled, drain the queue silently
-            # instead of speaking sentences the user has already talked over.
-            if cancellation.is_cancelled(session_id):
-                continue
-            try:
-                delivery, chunks = voice_engine.plan_speech(
-                    sentence, "", None, False, False, state["emotion"]
-                )
-                if state["emotion"] is None:
-                    # Lock the register decided for the first sentence so the
-                    # reply does not change mood halfway through.
-                    state["emotion"] = delivery.emotion
-                    emit("delivery", {"emotion": delivery.emotion, "speed": delivery.speed})
-                for chunk in chunks:
-                    path = voice_engine.synthesize_chunk(chunk, delivery, req.voiceKey or "michael")
-                    if path:
-                        emit("audio", {
-                            "text": chunk,
-                            "emotion": delivery.emotion,
-                            "url": f"/api/dexter/audio/{os.path.basename(path)}",
-                        })
-            except Exception as exc:
-                print(f"[Stream] Incremental TTS failed: {exc}")
-
-    def routed_emit(event_type: str, payload: Any) -> None:
-        """Pass events through, feeding completed sentences to the TTS thread."""
-        if event_type == "token" and req.voiceEnabled and not cancellation.is_cancelled(session_id):
-            state["pending"] += payload.get("text", "")
-            while True:
-                match = _SENTENCE_END.search(state["pending"], _MIN_STREAM_SENTENCE)
-                if not match:
-                    break
-                sentence = state["pending"][: match.end()].strip()
-                state["pending"] = state["pending"][match.end():]
-                if sentence:
-                    state["spoke_stream"] = True
-                    tts_queue.put(sentence)
-        elif event_type == "provider_switched":
-            # The retry regenerates the reply from scratch; drop the partial.
-            state["pending"] = ""
-        emit(event_type, payload)
 
     async def worker() -> None:
         cancellation.begin(session_id)
-        tts_thread = threading.Thread(target=tts_worker, daemon=True, name="dexter-stream-tts")
-        tts_thread.start()
         try:
-            result = await run_in_threadpool(_run_route, req, routed_emit)
-
-            # Barge-in: the user talked over the reply. Skip the answer and the
-            # remaining speech; the frontend has already stopped playback.
+            result = await run_in_threadpool(_run_route, req, emit)
             if result.get("action") == "interrupted" or cancellation.is_cancelled(session_id):
                 emit("interrupted", {})
                 return
-
             emit("reply", result)
-
-            if req.voiceEnabled:
-                if state["spoke_stream"]:
-                    # Streamed sentences are already voiced; finish the tail.
-                    tail = state["pending"].strip()
-                    if tail:
-                        tts_queue.put(tail)
-                else:
-                    calls = result.get("toolCalls") or []
-                    # A failed tool should sound apologetic, not chirpy.
-                    tool_ok = all(c.get("ok", True) for c in calls) if calls else None
-                    reply_text = result.get("reply", "")
-
-                    # A tool can ask for a specific delivery - read_aloud wants
-                    # narration rather than the clipped confirmation tone.
-                    requested = (result.get("details") or {}).get("speechEmotion")
-                    if not requested:
-                        requested = next(
-                            (c.get("speechEmotion") for c in calls if c.get("speechEmotion")), None
-                        )
-
-                    delivery, chunks = await run_in_threadpool(
-                        voice_engine.plan_speech,
-                        reply_text,
-                        result.get("action", ""),
-                        tool_ok,
-                        False,
-                        len(reply_text) > 600,
-                        requested,
-                    )
-                    emit("delivery", {"emotion": delivery.emotion, "speed": delivery.speed})
-
-                    for chunk in chunks:
-                        path = await run_in_threadpool(
-                            voice_engine.synthesize_chunk, chunk, delivery, req.voiceKey or "michael"
-                        )
-                        if path:
-                            emit("audio", {
-                                "text": chunk,
-                                "emotion": delivery.emotion,
-                                "url": f"/api/dexter/audio/{os.path.basename(path)}",
-                            })
         except Exception as exc:
             emit("error", {"message": str(exc)})
         finally:
             cancellation.clear(session_id)
-            tts_queue.put(None)
-            await run_in_threadpool(tts_thread.join)
             emit("done", {})
 
     async def generate():
@@ -648,114 +495,6 @@ async def event_stream(request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
-
-
-# ───────────────────────── voice pipeline (Phase 4) ─────────────────────────
-
-
-def _ws_authorized(ws: WebSocket) -> bool:
-    """
-    Authorise a WebSocket by hand.
-
-    The HTTP auth middleware does not run for the WebSocket scope, so the same
-    two checks are repeated here: the Host header must be a local name (defeats
-    DNS rebinding) and the per-run token must be presented as a query param
-    (WebSocket, like EventSource, cannot attach custom headers).
-    """
-    hostname = (ws.headers.get("host") or "").split(":")[0].lower()
-    if hostname and hostname not in _ALLOWED_HOSTNAMES:
-        return False
-    supplied = ws.query_params.get("token")
-    return bool(supplied) and secrets.compare_digest(supplied, SESSION_TOKEN)
-
-
-# Lightweight capture diagnostics so "the mic isn't heard" can be checked from
-# /status: if `peak` stays ~0 while the user speaks, no real audio is arriving
-# (suspended AudioContext, muted/wrong device) rather than a wake/STT problem.
-_voice_debug: Dict[str, Any] = {
-    "connected": False,
-    "frames": 0,
-    "peak": 0,        # loudest sample seen this run (int16, 0-32767)
-    "lastPeak": 0,    # loudest sample in the most recent frame
-}
-
-
-def _record_voice_debug(data: bytes) -> None:
-    try:
-        import numpy as np
-
-        arr = np.frombuffer(data, dtype=np.int16)
-        if arr.size:
-            peak = int(np.abs(arr).max())
-            _voice_debug["frames"] += 1
-            _voice_debug["lastPeak"] = peak
-            if peak > _voice_debug["peak"]:
-                _voice_debug["peak"] = peak
-    except Exception:
-        pass
-
-
-@app.websocket("/api/dexter/voice/ws")
-async def voice_socket(ws: WebSocket):
-    """
-    Inbound audio channel: the renderer streams 16 kHz mono int16 PCM as binary
-    frames; the backend runs wake word -> VAD -> STT and pushes back JSON voice
-    events (wake / speech_start / transcript / interrupt). This is the app's
-    first WebSocket - SSE stays the outbound push channel for everything else.
-    """
-    if not _ws_authorized(ws):
-        await ws.close(code=1008)
-        return
-    await ws.accept()
-
-    session_id = ws.query_params.get("session") or "default"
-    vsession = voice_pipeline.VoiceSession(session=session_id)
-    _voice_debug["connected"] = True
-    caps = voice_pipeline.capabilities()
-    print(f"[Voice WS] Mic connected (session={session_id}): {caps}")
-    await ws.send_json({"type": "status", **caps})
-
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg.get("type") == "websocket.disconnect":
-                break
-
-            data = msg.get("bytes")
-            if data is not None:
-                _record_voice_debug(data)
-                events = await run_in_threadpool(vsession.feed, data)
-                for event in events:
-                    await ws.send_json(event)
-                continue
-
-            text = msg.get("text")
-            if text:
-                try:
-                    ctrl = json.loads(text)
-                except Exception:
-                    continue
-                kind = ctrl.get("type")
-                if kind == "speaking":
-                    vsession.set_speaking(bool(ctrl.get("on")))
-                elif kind == "reset":
-                    vsession.reset()
-    except WebSocketDisconnect:
-        print(f"[Voice WS] Mic disconnected (session={session_id}).")
-    except Exception as exc:
-        print(f"[Voice WS] closed on error: {exc}")
-
-
-class InterruptRequest(BaseModel):
-    session: Optional[str] = "default"
-
-
-@app.post("/api/dexter/voice/interrupt")
-async def voice_interrupt(req: InterruptRequest = InterruptRequest()):
-    """Manual barge-in (stop button / keyword) - cancels the session's stream."""
-    session = req.session or "default"
-    cancellation.request_cancel(session)
-    return {"ok": True, "session": session}
 
 
 # ───────────────────────── planner ─────────────────────────
@@ -1021,44 +760,6 @@ async def open_file_path(req: FileOpenRequest):
     return await run_in_threadpool(FileSystemTool.open_local_path, req.path)
 
 
-# ───────────────────────── voice ─────────────────────────
-
-
-@app.post("/api/dexter/tts/generate")
-async def generate_expressive_tts(req: TTSRequest):
-    # Reminders arrive here from the SSE handler and should sound urgent, so
-    # this endpoint runs the same prosody pipeline as streaming chat rather
-    # than the old flat synthesis.
-    paths, _delivery = await run_in_threadpool(
-        voice_engine.speak_expressive,
-        req.text,
-        "",
-        None,
-        bool(req.isReminder),
-        len(req.text or "") > 600,
-        req.emotion,
-        req.voiceKey or "michael",
-    )
-    file_path = paths[0] if paths else None
-    if not file_path or not os.path.exists(file_path):
-        raise HTTPException(status_code=503, detail="Speech synthesis unavailable")
-    # Kokoro emits WAV and edge-tts emits MP3; the old handler hardcoded mpeg
-    # for both, which made some players reject the Kokoro output.
-    media_type = "audio/wav" if file_path.lower().endswith(".wav") else "audio/mpeg"
-    return FileResponse(file_path, media_type=media_type)
-
-
-@app.get("/api/dexter/audio/{filename}")
-async def get_audio(filename: str):
-    """Serve a generated clip for the streaming chat endpoint."""
-    safe = os.path.basename(filename)
-    path = os.path.join(AUDIO_DIR, safe)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Audio not found")
-    media_type = "audio/wav" if safe.lower().endswith(".wav") else "audio/mpeg"
-    return FileResponse(path, media_type=media_type)
-
-
 # ───────────────────────── notes / media / content ─────────────────────────
 
 
@@ -1082,20 +783,6 @@ async def delete_sticky_note(note_id: str):
 @app.get("/api/dexter/playlists")
 async def get_playlists():
     return youtube_tool.get_playlists()
-
-
-@app.get("/api/dexter/spilledcoffee/overnight-queue")
-async def get_spilled_coffee_queue():
-    return await run_in_threadpool(spilled_coffee.get_overnight_content)
-
-
-@app.post("/api/dexter/spilledcoffee/curate")
-async def curate_spilled_coffee(req: CurateRequest):
-    return await run_in_threadpool(
-        spilled_coffee.run_overnight_curation,
-        req.niche or "AI Tech & Viral Trends",
-        req.count or 3,
-    )
 
 
 # ───────────────────────── BuzzcafAI ─────────────────────────

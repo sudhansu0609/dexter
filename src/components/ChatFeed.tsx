@@ -10,7 +10,6 @@ interface Props {
   setInputMsg: (v: string) => void;
   onSend: () => void;
   isExpanded: boolean;
-  isVoiceMuted: boolean;
 }
 
 // Chat feed + prompt input. Renders the live token stream (each Dexter message
@@ -23,7 +22,6 @@ export function ChatFeed({
   setInputMsg,
   onSend,
   isExpanded,
-  isVoiceMuted,
 }: Props) {
   const chatEndRef = useRef<HTMLDivElement | null>(null);
 
@@ -113,7 +111,7 @@ export function ChatFeed({
       <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px' }}>
         <input
           type="text"
-          placeholder={isVoiceMuted ? 'Type command (Voice is muted)' : 'Speak hands-free or type here...'}
+          placeholder="Ask Dexter anything, or tell it what to do..."
           value={inputMsg}
           onChange={(e) => setInputMsg(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && onSend()}

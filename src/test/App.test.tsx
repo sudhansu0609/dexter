@@ -7,15 +7,11 @@ vi.mock('../api', () => ({
   API_BASE: 'http://localhost:8098',
   apiFetch: vi.fn(async () => new Response('{}')),
   eventsUrl: vi.fn(async () => 'http://localhost:8098/events'),
-  voiceWsUrl: vi.fn(async () => 'ws://localhost:8098/voice/ws'),
-  audioUrl: (url: string) => url,
   getStatus: vi.fn(async () => ({ status: 'online', runtime: mockRuntime })),
   getHistory: vi.fn(async () => ({ session: 'default', turns: mockTurns })),
   getPlanner: vi.fn(async () => ({ tasks: [] })),
   addPlannerTask: vi.fn(async () => {}),
   togglePlannerTask: vi.fn(async () => {}),
-  getOvernightQueue: vi.fn(async () => []),
-  curateOvernight: vi.fn(async () => []),
   getSkills: vi.fn(async () => []),
   getBuzzcafHealth: vi.fn(async () => ({ online: false })),
   getBuzzcafProjects: vi.fn(async () => []),
@@ -28,7 +24,6 @@ vi.mock('../api', () => ({
   confirmTask: vi.fn(async () => {}),
   cancelTask: vi.fn(async () => {}),
   addReminder: vi.fn(async () => {}),
-  generateTts: vi.fn(async () => null),
   getModels: vi.fn(async () => ({ providers: {} })),
   chatStream: vi.fn(async () => {}),
   getWorkbook: vi.fn(async () => mockWorkbook),
@@ -64,7 +59,7 @@ describe('App', () => {
     // "Dexter" appears in several places; anchor on the title bar heading and
     // the chat composer, which together prove the tree actually mounted.
     expect(await screen.findByRole('heading', { level: 1 })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText(/Speak hands-free or type here/i)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/Ask Dexter anything/i)).toBeInTheDocument();
   });
 
   it('restores the previous conversation instead of a blank welcome', async () => {

@@ -4,7 +4,7 @@ Reminder and maintenance scheduler.
 Dexter had no scheduler at all: day_planner.json stored times as display strings
 like "09:00 AM" that nothing ever parsed, so no reminder could ever fire. This
 module adds a real APScheduler background job store plus the recurring
-housekeeping the app needs (audio cleanup, app index refresh, memory pruning).
+housekeeping the app needs (app index refresh, memory pruning).
 
 When a reminder fires it goes out on all three channels at once - SSE for the
 spoken reply and in-app banner, and a Windows toast that lands even if the
@@ -27,9 +27,6 @@ from timeparse import format_display, humanize, parse_recurrence, parse_when
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 REMINDERS_FILE = os.path.join(DATA_DIR, "reminders.json")
-AUDIO_DIR = os.path.join(DATA_DIR, "audio")
-
-AUDIO_MAX_AGE_SECONDS = 2 * 3600
 PLANNER_LEAD_MINUTES = 5
 REMINDER_RETENTION_DAYS = 7
 
@@ -358,10 +355,6 @@ class DexterScheduler:
 
     def _register_maintenance(self) -> None:
         self._scheduler.add_job(
-            self._cleanup_audio, CronTrigger(minute=17),
-            id="maint-audio", replace_existing=True,
-        )
-        self._scheduler.add_job(
             self._refresh_app_index, CronTrigger(day_of_week="sun", hour=4),
             id="maint-appindex", replace_existing=True,
         )
@@ -433,24 +426,6 @@ class DexterScheduler:
         # get_agenda() rolls the planner onto today's date as a side effect,
         # so calling it just after midnight both rolls and re-arms.
         self.rearm_planner()
-
-    def _cleanup_audio(self) -> int:
-        """Generated TTS files accumulated forever; nothing ever removed them."""
-        if not os.path.isdir(AUDIO_DIR):
-            return 0
-        cutoff = time.time() - AUDIO_MAX_AGE_SECONDS
-        removed = 0
-        for filename in os.listdir(AUDIO_DIR):
-            path = os.path.join(AUDIO_DIR, filename)
-            try:
-                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
-                    os.remove(path)
-                    removed += 1
-            except Exception:
-                pass
-        if removed:
-            print(f"[Scheduler] Cleaned up {removed} old audio file(s).")
-        return removed
 
     def _refresh_app_index(self) -> None:
         import app_index

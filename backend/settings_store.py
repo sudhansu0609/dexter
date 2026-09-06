@@ -60,35 +60,10 @@ class Setting:
 
 SETTINGS: List[Setting] = [
     Setting(
-        "bargeIn", "DEXTER_VOICE_BARGE_IN", "bool", False,
-        "Interrupt while speaking",
-        "Let a new command cut Dexter off mid-sentence. Off by default because "
-        "Dexter used to answer its own echo.",
-        module="voice_pipeline", attr="BARGE_IN_ENABLED", group="voice",
-    ),
-    Setting(
-        "followUpWindow", "DEXTER_FOLLOWUP_WINDOW", "float", 9.0,
-        "Follow-up window (seconds)",
-        "How long after Dexter speaks you can reply without the wake word.",
-        module="voice_pipeline", attr="FOLLOWUP_WINDOW", group="voice",
-    ),
-    Setting(
-        "echoGuardMs", "DEXTER_ECHO_GUARD_MS", "float", 800.0,
-        "Echo guard (ms)",
-        "How long the mic stays deaf after Dexter finishes speaking.",
-        module="voice_pipeline", attr="ECHO_GUARD_MS", group="voice",
-    ),
-    Setting(
-        "wakeWordThreshold", "DEXTER_WAKEWORD_THRESHOLD", "float", 0.5,
-        "Wake word sensitivity",
-        "Lower triggers more easily; higher means fewer false wakes.",
-        module="wakeword", attr="_THRESHOLD", group="voice",
-    ),
-    Setting(
         "llmProvider", "DEXTER_LLM_PROVIDER", "choice", "auto",
         "Preferred model backend",
         "Which local server to prefer for 'auto' requests.",
-        module="hybrid_llm", attr=None, options=["auto", "ollama", "lmstudio"], group="model",
+        module="hybrid_llm", attr=None, options=["auto", "llamacpp", "ollama", "lmstudio"], group="model",
     ),
     Setting(
         "tieredLlm", "DEXTER_TIERED_LLM", "bool", True,

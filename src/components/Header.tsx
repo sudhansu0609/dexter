@@ -1,19 +1,15 @@
-import { Maximize2, MicOff, Minimize2, Radio, Settings, WifiOff, X } from 'lucide-react';
+import { Maximize2, Minimize2, Settings, WifiOff, X } from 'lucide-react';
 
 interface Props {
-  isVoiceMuted: boolean;
-  onToggleMute: () => void;
   isExpanded: boolean;
   onToggleExpand: () => void;
   online: boolean;
   onToggleSettings: () => void;
 }
 
-// Frameless desktop window title bar: brand, connectivity, voice mute, and the
-// window action controls.
+// Desktop window title bar: brand, connectivity, settings, and the window
+// action controls.
 export function Header({
-  isVoiceMuted,
-  onToggleMute,
   isExpanded,
   onToggleExpand,
   online,
@@ -94,34 +90,8 @@ export function Header({
         </div>
       </div>
 
-      {/* Window Action Controls & Voice Mute */}
+      {/* Window action controls */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', appRegion: 'no-drag' } as any}>
-        {/* Dedicated Voice Mute Button */}
-        <button
-          type="button"
-          onClick={onToggleMute}
-          style={{
-            background: isVoiceMuted ? 'rgba(239, 68, 68, 0.2)' : 'rgba(16, 185, 129, 0.2)',
-            color: isVoiceMuted ? '#f87171' : '#10b981',
-            border: isVoiceMuted ? '1px solid rgba(239, 68, 68, 0.4)' : '1px solid rgba(16, 185, 129, 0.4)',
-            padding: '6px 10px',
-            borderRadius: '10px',
-            fontSize: '11px',
-            fontWeight: 700,
-            display: 'flex',
-            alignItems: 'center',
-            gap: '4px',
-          }}
-          title={isVoiceMuted ? 'Unmute Voice' : 'Disable/Mute Voice'}
-        >
-          {isVoiceMuted ? <MicOff size={14} /> : <Radio className="brain-active-pulse" size={14} />}
-          {/* The wake phrase is openWakeWord's stock "hey jarvis" model - no
-              Dexter model exists and training one was declined. Telling the user
-              to say "Dexter" made every interaction start with a word that does
-              not wake anything. */}
-          {isVoiceMuted ? 'Muted' : 'Say "Hey Jarvis"'}
-        </button>
-
         <button
           type="button"
           onClick={onToggleSettings}

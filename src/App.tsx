@@ -2,10 +2,8 @@ import { useRef, useState } from 'react';
 import { Maximize2 } from 'lucide-react';
 import { launchApp } from './api';
 
-import { useVoice } from './hooks/useVoice';
 import { useChat } from './hooks/useChat';
 import { usePlanner } from './hooks/usePlanner';
-import { useOvernight } from './hooks/useOvernight';
 import { useSkills } from './hooks/useSkills';
 import { useBuzzcaf } from './hooks/useBuzzcaf';
 import { useFileSearch } from './hooks/useFileSearch';
@@ -21,36 +19,26 @@ import { RuntimeBanner } from './components/RuntimeBanner';
 import { WorkbookPanel } from './components/WorkbookPanel';
 import { SettingsPanel } from './components/SettingsPanel';
 import { TaskTray } from './components/TaskTray';
-import { VoiceVisualizer } from './components/VoiceVisualizer';
 import { ChatFeed } from './components/ChatFeed';
 import { DayPlanner } from './components/DayPlanner';
 import { FileExplorer } from './components/FileExplorer';
 import { BuzzcafPanel } from './components/BuzzcafPanel';
-import { OvernightQueue } from './components/OvernightQueue';
 import { AppLauncher } from './components/AppLauncher';
 import { SkillsPanel } from './components/SkillsPanel';
 
-// App is now composition + layout only. Every unit of behaviour lives in a hook
+// App is composition + layout only. Every unit of behaviour lives in a hook
 // (src/hooks) and every unit of UI in a component (src/components); this file
-// wires them together (roadmap Phase 6, item 1).
-//
-// Two shared refs break the natural voice<->chat cycle without merging the two
-// back into one object: the mic (registered once, in useVoice) reads the current
-// thinking flag and dispatches recognised commands through them, while chat owns
-// and updates both.
+// wires them together (roadmap Phase 6, item 1). Voice was removed in v5: the
+// chat box is the way in.
 export default function App() {
   const [isExpanded, setIsExpanded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
-  const isThinkingRef = useRef(false);
-  const commandHandlerRef = useRef<(text: string) => void>(() => {});
   // Buzzcaf/app-launch narration is pushed into chat; a ref lets those hooks
   // reach the chat sink even though chat is created after them.
   const pushMessageRef = useRef<(text: string) => void>(() => {});
 
-  const voice = useVoice({ isThinkingRef, commandHandlerRef });
   const planner = usePlanner();
-  const overnight = useOvernight();
   const skills = useSkills();
   const buzzcaf = useBuzzcaf((text) => pushMessageRef.current(text));
   const fileSearch = useFileSearch();
@@ -59,20 +47,16 @@ export default function App() {
   const workbook = useWorkbook();
 
   const chat = useChat({
-    voice,
-    isThinkingRef,
-    commandHandlerRef,
     onTurnComplete: () => {
       planner.refresh();
       workbook.refresh();
-      overnight.refresh();
       skills.refresh();
       buzzcaf.refresh();
     },
   });
   pushMessageRef.current = chat.pushDexterMessage;
 
-  const events = useServerEvents({ voice, refreshPlanner: planner.refresh });
+  const events = useServerEvents({ refreshPlanner: planner.refresh });
 
   const toggleExpandWindow = () => {
     const nextState = !isExpanded;
@@ -97,7 +81,7 @@ export default function App() {
     <div
       style={{
         padding: '14px',
-        maxWidth: isExpanded ? '1440px' : '460px',
+        maxWidth: isExpanded ? '1440px' : '520px',
         margin: '0 auto',
         transition: 'max-width 0.3s ease',
       }}
@@ -129,8 +113,6 @@ export default function App() {
       />
 
       <Header
-        isVoiceMuted={voice.isVoiceMuted}
-        onToggleMute={voice.toggleVoiceMute}
         isExpanded={isExpanded}
         onToggleExpand={toggleExpandWindow}
         online={online}
@@ -142,15 +124,8 @@ export default function App() {
 
       {/* Main grid: compact by default, three columns when expanded. */}
       <div style={{ display: 'grid', gridTemplateColumns: isExpanded ? '340px 1fr 340px' : '1fr', gap: '16px' }}>
-        {/* Synaptic visualizer + continuous voice workspace */}
+        {/* The conversation */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-          <VoiceVisualizer
-            isSpeaking={voice.isSpeaking}
-            isThinking={chat.isThinking}
-            isVoiceMuted={voice.isVoiceMuted}
-            isListening={voice.isListening}
-          />
-
           <ChatFeed
             chatLog={chat.chatLog}
             isThinking={chat.isThinking}
@@ -159,7 +134,6 @@ export default function App() {
             setInputMsg={chat.setInputMsg}
             onSend={() => chat.handleSendMessage()}
             isExpanded={isExpanded}
-            isVoiceMuted={voice.isVoiceMuted}
           />
 
           {!isExpanded && (
@@ -182,7 +156,7 @@ export default function App() {
                   gap: '6px',
                 }}
               >
-                <Maximize2 size={12} /> Open Full Day Planner & Curation Dashboard
+                <Maximize2 size={12} /> Open Full Dashboard
               </button>
             </div>
           )}
@@ -210,7 +184,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Expanded right column: BuzzcafAI, overnight queue, launcher, skills */}
+        {/* Expanded right column: the Studio, launcher, skills */}
         {isExpanded && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
             <BuzzcafPanel
@@ -221,7 +195,6 @@ export default function App() {
               onExecute={buzzcaf.executeStep}
               onStart={buzzcaf.start}
             />
-            <OvernightQueue items={overnight.items} isCurating={overnight.isCurating} onCurate={overnight.curate} />
             <AppLauncher onLaunch={handleLaunchApp} />
             <SkillsPanel skills={skills.skills} />
           </div>

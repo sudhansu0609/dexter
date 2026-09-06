@@ -12,7 +12,6 @@ import type {
   BuzzcafProject,
   DexterStatus,
   FileResult,
-  OverNightItem,
   SettingRow,
   SettingsUpdateResult,
   SkillItem,
@@ -68,16 +67,6 @@ export async function apiFetch(url: string, init: RequestInit = {}): Promise<Res
 export async function eventsUrl(): Promise<string> {
   const t = await ensureToken();
   return `${DEXTER}/events${t ? `?token=${encodeURIComponent(t)}` : ''}`;
-}
-
-// WebSocket cannot send headers either; the voice audio channel authenticates
-// the same way (roadmap Phase 4, item 4.2).
-export async function voiceWsUrl(session = 'default'): Promise<string> {
-  const t = await ensureToken();
-  const wsBase = API_BASE.replace(/^http/, 'ws');
-  return `${wsBase}/api/dexter/voice/ws?session=${encodeURIComponent(session)}${
-    t ? `&token=${encodeURIComponent(t)}` : ''
-  }`;
 }
 
 // ─────────────────────────── helpers ───────────────────────────
@@ -142,13 +131,6 @@ export const getPlanner = () => getJson<{ tasks?: Task[] }>('/planner');
 export const addPlannerTask = (title: string) => post('/planner/add', { title });
 export const togglePlannerTask = (taskId: string) => post(`/planner/toggle/${taskId}`);
 
-// ───────────────────────── overnight queue ─────────────────────
-
-export const getOvernightQueue = () =>
-  getJson<OverNightItem[]>('/spilledcoffee/overnight-queue');
-export const curateOvernight = (niche: string, count: number) =>
-  post('/spilledcoffee/curate', { niche, count });
-
 // ─────────────────────────── skills ────────────────────────────
 
 export const getSkills = () => getJson<SkillItem[]>('/skills');
@@ -184,25 +166,6 @@ export const cancelTask = (taskId: string) => post(`/tasks/${taskId}/cancel`);
 export const addReminder = (text: string, when: string) =>
   post('/reminders', { text, when });
 
-// ───────────────────────────── TTS ─────────────────────────────
-
-export async function generateTts(
-  text: string,
-  emotion: string | undefined,
-  isReminder: boolean,
-): Promise<Blob> {
-  const res = await apiFetch(`${DEXTER}/tts/generate`, {
-    method: 'POST',
-    headers: jsonHeaders,
-    body: JSON.stringify({ text, voiceKey: 'michael', emotion, isReminder }),
-  });
-  if (!res.ok) throw new Error('TTS fetch failed');
-  return res.blob();
-}
-
-// Absolute URL for a streamed audio clip (the backend returns a relative path).
-export const audioUrl = (url: string) => (url.startsWith('http') ? url : `${API_BASE}${url}`);
-
 // ─────────────────────── LLM provider / models ─────────────────
 
 export interface LlmProviderInfo {
@@ -212,8 +175,8 @@ export interface LlmProviderInfo {
 }
 
 export interface LlmModelsResponse {
-  providers: Record<string, LlmProviderInfo>; // keyed 'lmstudio' | 'ollama'
-  preferred: string; // configured default: 'auto' | 'lmstudio' | 'ollama'
+  providers: Record<string, LlmProviderInfo>; // keyed 'llamacpp' | 'lmstudio' | 'ollama'
+  preferred: string; // configured default: 'auto' | 'llamacpp' | 'lmstudio' | 'ollama'
   defaultModel: Record<string, string | null>;
 }
 
@@ -223,18 +186,17 @@ export const getModels = () => getJson<LlmModelsResponse>('/llm/models');
 // ─────────────────────── streaming chat ────────────────────────
 
 // Returns the raw streaming Response; the caller decodes the SSE body itself so
-// tokens/audio can be rendered as they arrive. `provider`/`model` let the UI
-// route a turn to a specific backend; 'auto' + null falls back to the server's
+// tokens can be rendered as they arrive. `provider`/`model` let the UI route a
+// turn to a specific backend; 'auto' + null falls back to the server's
 // configured preference (DEXTER_LLM_PROVIDER).
 export function chatStream(
   message: string,
-  voiceEnabled: boolean,
   provider: string = 'auto',
   model: string | null = null,
 ): Promise<Response> {
   return apiFetch(`${DEXTER}/chat/stream`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ message, provider: provider || 'auto', model: model || null, voiceEnabled }),
+    body: JSON.stringify({ message, provider: provider || 'auto', model: model || null }),
   });
 }

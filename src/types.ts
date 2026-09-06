@@ -9,16 +9,6 @@ export interface Task {
   completed: boolean;
 }
 
-export interface OverNightItem {
-  id: string;
-  timestamp: string;
-  title: string;
-  hook: string;
-  scriptOutline: string[];
-  targetAudience: string;
-  ctrScore: string;
-}
-
 export interface SkillItem {
   name: string;
   description: string;

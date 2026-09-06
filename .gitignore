@@ -48,3 +48,4 @@ data/dexter.log.*
 data/dexter_workbook.db
 data/dexter_workbook.db-*
 data/settings.json
+data/window.json

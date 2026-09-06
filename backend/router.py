@@ -1273,8 +1273,13 @@ def route(
     # Only when the caller has not pinned a specific model (an explicit UI pick
     # is honoured exactly). Pin both passes to one resolved backend so the fast
     # and smart model names are valid for the same provider.
-    if TIERED_ENABLED and FAST_MODEL and model is None:
-        backend = llm_router.resolve_provider(provider)
+    backend = (
+        llm_router.resolve_provider(provider)
+        if TIERED_ENABLED and FAST_MODEL and model is None else None
+    )
+    # The shared llama-server serves exactly one (large) model, so the small
+    # fast-model tier has nothing to run on there; go straight to the loop.
+    if backend and backend != "llamacpp":
         fast = _fast_reply(
             text, history=history, provider=backend,
             context_note=context_note, on_event=on_event, session=session,

@@ -84,7 +84,6 @@ INTENT_CASES = [
     # ── media and content ──
     ("play some lofi music", "play_on_youtube"),
     ("put on some jazz", "play_on_youtube"),
-    ("generate video titles", "curate_video_ideas"),
     # ── buzzcaf ──
     ("run the next step", "buzzcaf_execute_step"),
     ("show my video projects", "buzzcaf_list_projects"),
@@ -224,9 +223,9 @@ def test_openai_schema_shape():
 
 
 def test_validate_args_coerces_and_rejects():
-    spec = REGISTRY["curate_video_ideas"]
-    ok, cleaned, _ = validate_args(spec, {"count": "3"})
-    assert ok and cleaned["count"] == 3
+    spec = REGISTRY["set_volume"]
+    ok, cleaned, _ = validate_args(spec, {"level": "30"})
+    assert ok and cleaned["level"] == 30
 
     spec = REGISTRY["launch_app"]
     ok, _cleaned, err = validate_args(spec, {})
@@ -236,77 +235,6 @@ def test_validate_args_coerces_and_rejects():
 def test_tool_result_legacy_adapter():
     result = ToolResult.from_legacy({"success": False, "error": "nope"})
     assert not result.ok and result.summary == "nope"
-
-
-# ───────────────────────── speech delivery ─────────────────────────
-
-from prosody import build_delivery, normalize_for_speech, say_number  # noqa: E402
-
-
-@pytest.mark.parametrize("value,expected", [
-    (0, "zero"), (7, "seven"), (13, "thirteen"), (40, "forty"),
-    (25, "twenty five"), (100, "one hundred"), (342, "three hundred forty two"),
-    (1500, "one thousand five hundred"),
-])
-def test_say_number(value, expected):
-    assert say_number(value) == expected
-
-
-NORMALIZE_CASES = [
-    # Times must be spoken, not spelled out digit by digit.
-    ("Meeting at 10:30 AM", "ten thirty"),
-    ("Call at 3pm", "three"),
-    ("Volume set to 40%", "forty percent"),
-    # Opaque ids should never be read aloud at all.
-    ("Added task t-1786555392658 today", "1786555392658"),
-    # Paths collapse to a filename; the timestamp inside it is dropped.
-    (r"Saved to C:\Users\singh\data\screenshot_1786554297.png.", "1786554297"),
-    ("task(s) remaining", "tasks"),
-]
-
-
-@pytest.mark.parametrize("raw,fragment", NORMALIZE_CASES)
-def test_normalize_for_speech(raw, fragment):
-    spoken = normalize_for_speech(raw)
-    if fragment.isdigit():
-        assert fragment not in spoken, f"{fragment!r} should not be spoken: {spoken!r}"
-    else:
-        assert fragment in spoken, f"expected {fragment!r} in {spoken!r}"
-
-
-def test_semicolon_list_becomes_sentences():
-    """A run-on agenda is the main thing that made narration sound robotic."""
-    spoken = build_delivery("2 tasks: 10:30 AM - Review; 02:00 PM - Ship").text
-    assert ";" not in spoken
-    assert spoken.count(".") >= 2
-
-
-EMOTION_CASES = [
-    ("You asked me to remind you: stand up", {"is_reminder": True}, "urgent"),
-    ("Opening chrome.", {"action": "fast_path"}, "upbeat"),
-    ("I couldn't find that file.", {"tool_ok": False}, "apologetic"),
-    ("Hey. What do you need?", {"action": "chitchat"}, "warm"),
-    ("Some long narration.", {"long_form": True}, "reading"),
-]
-
-
-@pytest.mark.parametrize("text,kwargs,expected", EMOTION_CASES)
-def test_emotion_inference(text, kwargs, expected):
-    assert build_delivery(text, **kwargs).emotion == expected
-
-
-def test_inline_cue_sets_emotion_and_is_not_spoken():
-    """*excited* used to be deleted outright; it should steer delivery instead."""
-    delivery = build_delivery("*excited* The render finished!")
-    assert delivery.emotion == "upbeat"
-    assert "excited" not in delivery.text
-
-
-def test_emotions_differ_in_speed():
-    urgent = build_delivery("x", is_reminder=True)
-    calm = build_delivery("y", long_form=True)
-    assert urgent.speed > 1.0 > calm.speed
-    assert urgent.blend_with != calm.blend_with
 
 
 # ───────────────────────── tiered fast/smart models ─────────────────────────

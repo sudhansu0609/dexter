@@ -5,11 +5,6 @@ pydantic
 requests
 python-dotenv
 
-# ── Voice (imported by voice_engine.py) ──
-edge-tts
-kokoro-onnx
-soundfile
-
 # ── Scheduling & reminders ──
 apscheduler
 dateparser
@@ -45,14 +40,6 @@ google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2
 tzlocal  # IANA timezone name for Calendar events ("Asia/Kolkata", not "IST")
-
-# ── Local voice pipeline (Phase 4) ──
-# All optional: each detector degrades gracefully when its dep is absent, and
-# the frontend automatically falls back to the browser recognizer if the server
-# reports STT/VAD unavailable. Install these for the fully-local pipeline.
-faster-whisper   # server-side STT
-openwakeword     # fully-local wake word ("hey jarvis" stock model)
-silero-vad       # voice-activity detection (pulls in torch)
 
 # ── Tests ──
 pytest
