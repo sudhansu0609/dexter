@@ -643,6 +643,23 @@ class BuzzcafAIClient:
         data = self._post(f"/api/projects/{pid}/approve", body, timeout=240)
         return data if isinstance(data, dict) else {"error": "unexpected reply"}
 
+    # ── BuzzBrain snapshots the Studio keeps (roadmap v5, 5.1) ──
+
+    def buzzbrain_channels(self) -> Dict[str, Any]:
+        data = self._get("/api/buzzbrain/channels")
+        return data if isinstance(data, dict) else {"error": "unexpected reply"}
+
+    def buzzbrain_latest(self, n: int = 5, mine: Optional[bool] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {"n": n}
+        if mine is not None:
+            params["mine"] = "true" if mine else "false"
+        data = self._get("/api/buzzbrain/latest", **params)
+        return data if isinstance(data, dict) else {"error": "unexpected reply"}
+
+    def buzzbrain_video(self, video_id: str) -> Dict[str, Any]:
+        data = self._get(f"/api/buzzbrain/videos/{video_id}")
+        return data if isinstance(data, dict) else {"error": "unexpected reply"}
+
     # ── events: the Studio pushes, Dexter listens ──
 
     def start_event_listener(self, on_event) -> None:

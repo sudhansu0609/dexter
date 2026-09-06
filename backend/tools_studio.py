@@ -487,3 +487,129 @@ def studio_agents() -> ToolResult:
         summary=f"The Studio has {len(agents)} agent personas, for example {names}.",
         data={"agents": agents},
     )
+
+
+# ───────────────────────── YouTube status via BuzzBrain ─────────────────────────
+
+
+def _fmt_num(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M"
+    if number >= 1_000:
+        return f"{number / 1_000:.1f}K"
+    return str(int(number))
+
+
+def _describe_video(record: Dict[str, Any]) -> str:
+    bits = [f"'{record.get('title') or record.get('video_id')}' ({record.get('channel_name') or '?'})"]
+    if record.get("views") is not None:
+        bits.append(f"{_fmt_num(record['views'])} views")
+    if record.get("vph"):
+        bits.append(f"{_fmt_num(record['vph'])} views/hour")
+    if record.get("likes") is not None:
+        bits.append(f"{_fmt_num(record['likes'])} likes")
+    if record.get("published_ago"):
+        bits.append(f"published {record['published_ago']}")
+    if record.get("outlier"):
+        bits.append(str(record["outlier"]))
+    when = str(record.get("captured_at") or "")[:16].replace("T", " ")
+    return ", ".join(bits) + (f" (seen {when})" if when else "")
+
+
+@tool(
+    name="youtube_channel_status",
+    description=(
+        "How the owner's YouTube channels are doing, from the BuzzBrain snapshots the Studio keeps: "
+        "subscribers, videos seen, best views-per-hour, the latest video."
+    ),
+    params={},
+    examples=[
+        "how are my channels doing", "youtube channel status", "how is my youtube doing",
+        "what does buzzbrain say about my channels", "channel stats from buzzbrain",
+    ],
+    category="buzzcaf",
+)
+def youtube_channel_status() -> ToolResult:
+    if not buzzcaf_client.health_check():
+        return _offline()
+    data = buzzcaf_client.buzzbrain_channels()
+    if data.get("error"):
+        return _offline(data)
+    channels = data.get("channels") or []
+    if not channels:
+        return ToolResult(
+            ok=True,
+            summary=(
+                "No BuzzBrain snapshots yet. Open one of your videos on YouTube with the "
+                "BuzzBrain extension installed and it will start reporting."
+            ),
+            data=data,
+        )
+    mine = [c for c in channels if c.get("mine")]
+    lines = []
+    for channel in (mine or channels)[:5]:
+        latest = channel.get("latest_video") or {}
+        line = f"{channel.get('name') or channel.get('key')}: {_fmt_num(channel.get('subscribers'))} subscribers, {channel.get('videos_seen', 0)} video(s) seen"
+        if channel.get("best_vph"):
+            line += f", best {_fmt_num(channel['best_vph'])} views/hour"
+        if latest:
+            line += f"; latest {_describe_video(latest)}"
+        lines.append(line)
+    prefix = "Your channels" if mine else "Channels seen (none marked as yours yet)"
+    return ToolResult(ok=True, summary=f"{prefix}: " + " | ".join(lines), data=data)
+
+
+@tool(
+    name="youtube_video_stats",
+    description=(
+        "Stats for the owner's latest YouTube video (or a named one) from BuzzBrain: views, "
+        "views per hour, likes, and how the view count moved across snapshots."
+    ),
+    params={
+        "video": {
+            "type": "string",
+            "description": "A video id or part of the title; defaults to the latest of your videos",
+            "required": False,
+        }
+    },
+    examples=[
+        "how is my latest video doing", "views on my last video", "how did the bhangarh video do",
+        "latest video stats", "what are the numbers on my new upload", "video performance from buzzbrain",
+    ],
+    category="buzzcaf",
+)
+def youtube_video_stats(video: Optional[str] = None) -> ToolResult:
+    if not buzzcaf_client.health_check():
+        return _offline()
+    latest = buzzcaf_client.buzzbrain_latest(n=25)
+    if latest.get("error"):
+        return _offline(latest)
+    videos = latest.get("videos") or []
+    if not videos:
+        return ToolResult(ok=True, summary="No BuzzBrain snapshots yet, so I have no video numbers.", data=latest)
+    chosen = None
+    if video:
+        needle = video.lower().strip()
+        chosen = next((v for v in videos if needle == str(v.get("video_id", "")).lower()
+                       or needle in str(v.get("title", "")).lower()), None)
+        if not chosen:
+            return ToolResult.fail(f"I have no snapshot of a video matching '{video}'.")
+    else:
+        chosen = next((v for v in videos if v.get("mine")), videos[0])
+    detail = buzzcaf_client.buzzbrain_video(str(chosen.get("video_id")))
+    history = detail.get("history") or [] if isinstance(detail, dict) else []
+    summary = _describe_video(chosen)
+    if len(history) >= 2:
+        first, last = history[0], history[-1]
+        if first.get("views") is not None and last.get("views") is not None:
+            summary += (
+                f". Views moved {_fmt_num(first['views'])} -> {_fmt_num(last['views'])} "
+                f"across {len(history)} snapshots"
+            )
+    if not chosen.get("mine"):
+        summary += " (not marked as one of your channels)"
+    return ToolResult(ok=True, summary=summary + ".", data={"latest": chosen, "history": history})

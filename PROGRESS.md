@@ -21,7 +21,7 @@ Nothing is marked done on intent.
 | 4.1 knowledge ingestion (**I6/I7**) | ✅ built | `knowledge_ingest.py` (roots `tag=path;…`, mtime/size fingerprints, pdf/docx/json→prose, excludes for caches/venvs/code-repo docs), `memory.documents` + `ingest_sources`, `search_documents` with tag/file citations, nightly 02:30 job + 60 s startup pass, tools `search_knowledge`/`reindex_knowledge`; `test_knowledge_ingest.py` 6 tests. Live scan 2026-09-06: 338 files / 79 MB across youtube, docs, studio |
 | 4.2 profile (**I8**) | ✅ built | `user_profile.py` → `data/profile.json`; block injected into both router prompts; tools `show_profile`/`update_profile`; `/api/dexter/profile`; Settings → "About you". Profile is empty until you fill it |
 | 4.3 Google connected | ⬜ blocked on owner | needs `data/google_credentials.json` |
-| 5.1 YouTube status tools (**I9**) | ⬜ open | |
+| 5.1 YouTube status tools (**I9**) | ✅ built | `youtube_channel_status`, `youtube_video_stats` over the Studio's `/api/buzzbrain/*`; client `buzzbrain_channels/latest/video`; tests in `test_tools_studio.py`. **I9** live check needs the extension reloaded in Chrome and one of your videos opened |
 | 5.2 one agenda (**I10**) | ⬜ open | |
 | 5.3 tray + hotkey | ⬜ open | |
 

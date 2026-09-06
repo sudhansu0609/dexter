@@ -101,6 +101,26 @@ class FakeClient:
     def start_studio(self, wait_for_ready=True, timeout=30):
         return {"ready": True}
 
+    # buzzbrain
+    def buzzbrain_channels(self):
+        return {"channels": [
+            {"key": "UCme", "channel_id": "UCme", "name": "Beyond3Baje", "mine": True, "subscribers": 12400,
+             "videos_seen": 3, "best_vph": 320, "latest_video": {"video_id": "v9", "title": "The Vanishing Guard",
+             "channel_name": "Beyond3Baje", "views": 15200, "vph": 320, "likes": 900, "captured_at": "2026-09-06T10:00:00"}},
+            {"key": "other", "channel_id": "UCx", "name": "Someone Else", "mine": False, "subscribers": 1000,
+             "videos_seen": 1, "best_vph": 5, "latest_video": None},
+        ]}
+
+    def buzzbrain_latest(self, n=5, mine=None):
+        return {"videos": [
+            {"video_id": "s1", "title": "Stranger video", "channel_name": "Someone Else", "mine": False, "views": 100},
+            {"video_id": "v9", "title": "The Vanishing Guard", "channel_name": "Beyond3Baje", "mine": True,
+             "views": 15200, "vph": 320, "likes": 900, "published_ago": "2 days ago", "captured_at": "2026-09-06T10:00:00"},
+        ]}
+
+    def buzzbrain_video(self, video_id):
+        return {"video_id": video_id, "history": [{"views": 4000}, {"views": 9000}, {"views": 15200}]}
+
 
 @pytest.fixture
 def fake(monkeypatch):
@@ -174,3 +194,21 @@ def test_status_summarises_counts_and_pending(fake):
     result = execute("buzzcaf_status", {})
     assert result.ok
     assert "2 project(s)" in result.summary and "1 waiting for your approval" in result.summary
+
+
+def test_channel_status_reports_only_the_owners_channels(fake):
+    result = execute("youtube_channel_status", {})
+    assert result.ok
+    assert result.summary.startswith("Your channels")
+    assert "Beyond3Baje" in result.summary and "12.4K subscribers" in result.summary
+    assert "Someone Else" not in result.summary
+
+
+def test_video_stats_prefers_the_owners_latest_video_and_shows_the_trend(fake):
+    result = execute("youtube_video_stats", {})
+    assert result.ok
+    assert "The Vanishing Guard" in result.summary
+    assert "15.2K views" in result.summary
+    assert "4.0K -> 15.2K" in result.summary
+    named = execute("youtube_video_stats", {"video": "stranger"})
+    assert named.ok and "not marked as one of your channels" in named.summary
