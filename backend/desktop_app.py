@@ -41,6 +41,12 @@ MIN_WIDTH, MIN_HEIGHT = 380, 520
 
 MB_ERROR, MB_WARNING = 0x10, 0x30
 
+# Closing the window used to end the process, and with it the scheduler: no
+# reminder could fire once Dexter was out of the way. With the tray on, close
+# hides the window and everything keeps running; Quit lives in the tray menu.
+TRAY_ENABLED = os.getenv("DEXTER_TRAY", "1") != "0"
+HOTKEY = os.getenv("DEXTER_HOTKEY", "ctrl+alt+d")
+
 
 def _message_box(title: str, text: str, icon: int = MB_ERROR) -> None:
     """A dialog the user can actually see; pythonw has no console to print to."""
@@ -189,6 +195,93 @@ def _save_window(window: Any) -> None:
         print(f"[Desktop] Could not remember window size: {exc}")
 
 
+# ───────────────────────── tray + hotkey (roadmap v5, 5.3) ─────────────────────────
+
+
+def _tray_icon_image():
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGBA", (64, 64), (9, 13, 22, 255))
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((6, 6, 58, 58), fill=(56, 189, 248, 255))
+    draw.ellipse((22, 22, 42, 42), fill=(9, 13, 22, 255))
+    return image
+
+
+def _install_tray(window) -> Optional[Dict[str, Any]]:
+    """
+    A tray icon with Show / Reindex knowledge / Quit, and a global hotkey that
+    brings the window back. Returns the shared state dict, or None when the
+    optional packages are missing (the window then closes normally).
+    """
+    if not TRAY_ENABLED:
+        return None
+    try:
+        import pystray
+    except Exception as exc:
+        print(f"[Desktop] Tray unavailable ({exc}); close will quit.")
+        return None
+
+    state: Dict[str, Any] = {"quit": False, "icon": None}
+
+    def show(icon=None, item=None) -> None:
+        try:
+            window.show()
+            try:
+                window.restore()
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"[Desktop] Could not show the window: {exc}")
+
+    def reindex(icon=None, item=None) -> None:
+        def _run() -> None:
+            try:
+                import knowledge_ingest
+
+                stats = knowledge_ingest.reindex()
+                print(f"[Desktop] Reindex from tray: {stats['updated']} updated, {stats['removed']} removed.")
+            except Exception as exc:
+                print(f"[Desktop] Reindex failed: {exc}")
+
+        threading.Thread(target=_run, name="dexter-tray-reindex", daemon=True).start()
+
+    def quit_dexter(icon=None, item=None) -> None:
+        state["quit"] = True
+        try:
+            if state["icon"] is not None:
+                state["icon"].stop()
+        except Exception:
+            pass
+        try:
+            window.destroy()
+        except Exception:
+            os._exit(0)
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Show Dexter", show, default=True),
+        pystray.MenuItem("Reindex knowledge", reindex),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit Dexter", quit_dexter),
+    )
+    try:
+        icon = pystray.Icon("dexter", _tray_icon_image(), "Dexter", menu)
+    except Exception as exc:
+        print(f"[Desktop] Tray icon failed ({exc}); close will quit.")
+        return None
+    state["icon"] = icon
+    threading.Thread(target=icon.run, name="dexter-tray", daemon=True).start()
+
+    try:
+        import keyboard
+
+        keyboard.add_hotkey(HOTKEY, show)
+        print(f"[Desktop] Hotkey {HOTKEY} shows the window.")
+    except Exception as exc:
+        print(f"[Desktop] Global hotkey unavailable: {exc}")
+    return state
+
+
 # ───────────────────────── backend ─────────────────────────
 
 
@@ -248,9 +341,24 @@ def launch_desktop() -> None:
         on_top=False,
         background_color="#090d16",
     )
-    window.events.closing += lambda: _save_window(window)
+    tray_state: Dict[str, Any] = {}
+
+    def on_closing():
+        _save_window(window)
+        if tray_state.get("state") and not tray_state["state"]["quit"]:
+            # Hide instead of closing: reminders, the scheduler and the Studio
+            # event bridge keep running; the tray icon brings the window back.
+            window.hide()
+            return False
+        return True
+
+    window.events.closing += on_closing
+
+    def after_start() -> None:
+        tray_state["state"] = _install_tray(window)
+
     print(f"[Desktop] Window opening after {time.perf_counter() - started:.1f}s.")
-    webview.start(debug=False)
+    webview.start(after_start, debug=False)
 
 
 def main() -> int:

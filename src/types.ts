@@ -7,6 +7,9 @@ export interface Task {
   time: string;
   title: string;
   completed: boolean;
+  kind?: 'commitment' | 'reminder' | 'event';
+  overdue?: boolean;
+  rollCount?: number;
 }
 
 export interface SkillItem {

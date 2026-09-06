@@ -55,6 +55,7 @@ import tools_files  # noqa: F401  - registers rename/move/copy/delete
 import tools_web  # noqa: F401  - registers web search and weather
 import tools_studio  # noqa: F401  - registers the Buzzcaf Studio control tools
 import tools_knowledge  # noqa: F401  - registers knowledge search/reindex and profile tools
+import agenda
 import knowledge_ingest
 import user_profile
 from workbook import workbook
@@ -65,8 +66,7 @@ from tool_registry import all_tools, execute
 from tools_core import (
     AppLauncherTool,
     PlaywrightBrowserTool,
-    day_planner,
-    sticky_notes,
+    notes,
     youtube_tool,
 )
 
@@ -133,9 +133,9 @@ async def lifespan(app: FastAPI):
         print(f"[Startup] Applied {restored} saved setting(s).")
 
     scheduler.start()
-    armed = scheduler.rearm_planner()
+    armed = scheduler.rearm_commitments()
     if armed:
-        print(f"[Startup] Armed {armed} planner reminder(s).")
+        print(f"[Startup] Armed {armed} commitment heads-up(s).")
     armed_goals = tasks.rearm_scheduled()
     if armed_goals:
         print(f"[Startup] Re-armed {armed_goals} scheduled goal(s).")
@@ -325,9 +325,9 @@ class BuzzcafFeedbackRequest(BaseModel):
 @app.get("/api/dexter/status")
 async def get_status():
     providers = await run_in_threadpool(llm_router.get_available_providers)
-    planner = await run_in_threadpool(day_planner.get_agenda)
+    planner = await run_in_threadpool(agenda.compose)
     skills = await run_in_threadpool(macros.list_skills)
-    notes = await run_in_threadpool(sticky_notes.list_notes)
+    note_list = await run_in_threadpool(notes.list_notes)
     buzzcaf_status = await run_in_threadpool(buzzcaf_client.get_status)
 
     active_provider = llm_router.resolve_provider("auto")
@@ -350,7 +350,7 @@ async def get_status():
         "appsIndexed": app_index.size(),
         "skillsCount": len(skills),
         "tasksCount": len(planner.get("tasks", [])),
-        "notesCount": len(notes),
+        "notesCount": len(note_list),
         "scheduler": scheduler.status(),
         "memory": memory.stats(),
         "profile": {"name": user_profile.load().get("name") or None, "known": not user_profile.is_empty()},
@@ -531,25 +531,22 @@ async def event_stream(request: Request):
 
 @app.get("/api/dexter/planner")
 async def get_planner():
-    return await run_in_threadpool(day_planner.get_agenda)
+    """Today, composed: commitments (workbook), reminders, calendar events."""
+    return await run_in_threadpool(agenda.compose)
 
 
 @app.post("/api/dexter/planner/add")
 async def add_planner_task(req: AddTaskRequest):
-    task = await run_in_threadpool(day_planner.add_task, req.title, req.time or "12:00 PM")
-    from timeparse import parse_when
-
-    parsed = parse_when(req.time or "")
-    if parsed:
-        task = day_planner.update_task(task["id"], {"at": parsed.isoformat(timespec="seconds")}) or task
-        scheduler.sync_planner_task(task)
-    return task
+    try:
+        item = await run_in_threadpool(agenda.add, req.title, req.time)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return item
 
 
 @app.post("/api/dexter/planner/toggle/{task_id}")
 async def toggle_planner_task(task_id: str):
-    success = await run_in_threadpool(day_planner.toggle_task, task_id)
-    return {"success": success}
+    return await run_in_threadpool(agenda.toggle, task_id)
 
 
 # ───────────────────────── reminders ─────────────────────────
@@ -813,20 +810,18 @@ async def open_file_path(req: FileOpenRequest):
 
 
 @app.get("/api/dexter/notes")
-async def get_sticky_notes():
-    return await run_in_threadpool(sticky_notes.list_notes)
+async def get_notes():
+    return await run_in_threadpool(notes.list_notes)
 
 
 @app.post("/api/dexter/notes/add")
-async def create_sticky_note(req: CreateNoteRequest):
-    return await run_in_threadpool(
-        sticky_notes.create_note, req.content, req.title or "Sticky Note"
-    )
+async def create_note_endpoint(req: CreateNoteRequest):
+    return await run_in_threadpool(notes.create_note, req.content, req.title)
 
 
 @app.post("/api/dexter/notes/delete/{note_id}")
-async def delete_sticky_note(note_id: str):
-    return {"success": await run_in_threadpool(sticky_notes.delete_note, note_id)}
+async def delete_note_endpoint(note_id: str):
+    return {"success": await run_in_threadpool(notes.delete_note, note_id)}
 
 
 @app.get("/api/dexter/playlists")

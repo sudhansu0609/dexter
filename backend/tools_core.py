@@ -15,6 +15,7 @@ per process and lets the scheduler and router import them without cycles.
 
 import difflib
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -31,112 +32,10 @@ from timeparse import format_display, parse_when
 from tool_registry import ToolResult, tool
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-PLANNER_FILE = os.path.join(DATA_DIR, "day_planner.json")
 PLAYLIST_FILE = os.path.join(DATA_DIR, "playlists.json")
-NOTES_FILE = os.path.join(DATA_DIR, "sticky_notes.json")
 
 
 # ───────────────────────── implementations ─────────────────────────
-
-
-class DayPlannerTool:
-    def __init__(self):
-        os.makedirs(DATA_DIR, exist_ok=True)
-        if not os.path.exists(PLANNER_FILE):
-            # An empty day, not a demo one: seeded sample tasks used to show up
-            # as if the owner had planned them.
-            self._save_planner({"date": time.strftime("%Y-%m-%d"), "tasks": []})
-
-    def _load_planner(self) -> Dict[str, Any]:
-        planner = load_json(PLANNER_FILE, {"date": time.strftime("%Y-%m-%d"), "tasks": []})
-        return self._migrate(planner)
-
-    def _migrate(self, planner: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Backfill the ISO 'at' timestamp on legacy rows.
-
-        Tasks used to store only a display string like "09:00 AM", which nothing
-        could ever schedule against. Existing data is preserved - we just derive
-        a real datetime alongside it so the scheduler has something to fire on.
-        """
-        changed = False
-        date_str = planner.get("date") or time.strftime("%Y-%m-%d")
-        for task in planner.get("tasks", []):
-            if task.get("at"):
-                continue
-            display = task.get("time", "")
-            parsed = None
-            try:
-                base = datetime.strptime(date_str, "%Y-%m-%d")
-                parsed = datetime.combine(
-                    base.date(), datetime.strptime(display.strip(), "%I:%M %p").time()
-                )
-            except Exception:
-                parsed = parse_when(display) if display else None
-            if parsed:
-                task["at"] = parsed.isoformat(timespec="seconds")
-                changed = True
-        if changed:
-            save_json(PLANNER_FILE, planner)
-        return planner
-
-    def _save_planner(self, data: Dict[str, Any]):
-        save_json(PLANNER_FILE, data)
-
-    def get_agenda(self) -> Dict[str, Any]:
-        planner = self._load_planner()
-        today = time.strftime("%Y-%m-%d")
-        if planner.get("date") != today:
-            # Carry over incomplete tasks, dropping their stale 'at' datetimes so
-            # _migrate re-derives them against today - otherwise the scheduler
-            # sees times days in the past and never fires them again.
-            incomplete = []
-            for t in planner.get("tasks", []):
-                if t.get("completed", False):
-                    continue
-                t.pop("at", None)
-                incomplete.append(t)
-            planner = {"date": today, "tasks": incomplete}
-            self._save_planner(planner)
-            planner = self._migrate(planner)
-        return planner
-
-    def add_task(self, title: str, task_time: str = "12:00 PM") -> Dict[str, Any]:
-        planner = self._load_planner()
-        new_task = {
-            "id": f"t-{int(time.time() * 1000)}",
-            "time": task_time,
-            "title": title,
-            "completed": False
-        }
-        planner.setdefault("tasks", []).append(new_task)
-        self._save_planner(planner)
-        return new_task
-
-    def update_task(self, task_id: str, patch: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Merge fields into an existing task. Used to attach ISO 'at' timestamps."""
-        planner = self._load_planner()
-        for t in planner.get("tasks", []):
-            if t.get("id") == task_id:
-                t.update(patch)
-                self._save_planner(planner)
-                return t
-        return None
-
-    def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
-        for t in self._load_planner().get("tasks", []):
-            if t.get("id") == task_id:
-                return t
-        return None
-
-    def toggle_task(self, task_id: str) -> bool:
-        planner = self._load_planner()
-        for t in planner.get("tasks", []):
-            if t["id"] == task_id:
-                t["completed"] = not t.get("completed", False)
-                self._save_planner(planner)
-                return True
-        return False
 
 
 class YouTubeMusicTool:
@@ -179,48 +78,107 @@ class YouTubeMusicTool:
         return self._load_playlists()
 
 
-class StickyNotesTool:
-    def __init__(self):
-        os.makedirs(DATA_DIR, exist_ok=True)
-        if not os.path.exists(NOTES_FILE):
-            self._save_notes([
-                {"id": "n1", "title": "Welcome Note", "content": "Dexter AI Super Assistant Quick Note", "color": "#fef08a", "created": time.strftime("%Y-%m-%d %H:%M")}
-            ])
+def _ingest_note(path: str) -> None:
+    """Make a fresh note recallable right away instead of waiting for the nightly pass."""
+    try:
+        import knowledge_ingest
 
-    def _load_notes(self) -> List[Dict[str, Any]]:
-        return load_json(NOTES_FILE, [])
+        knowledge_ingest.ingest_file(path, "notes", force=True)
+    except Exception as exc:
+        print(f"[Notes] Could not index {os.path.basename(path)}: {exc}")
 
-    def _save_notes(self, data: List[Dict[str, Any]]):
-        save_json(NOTES_FILE, data)
 
-    def create_note(self, content: str, title: str = "Sticky Note", color: str = "#fef08a") -> Dict[str, Any]:
-        notes = self._load_notes()
-        note = {
-            "id": f"n-{int(time.time())}",
-            "title": title,
-            "content": content,
-            "color": color,
-            "created": time.strftime("%Y-%m-%d %H:%M")
-        }
-        notes.insert(0, note)
-        self._save_notes(notes)
-        # Open Windows Sticky Notes app
+class NotesTool:
+    """
+    Notes are Markdown files in the notes folder (the `notes` knowledge root,
+    or data/notes when none is configured), so they are readable in any
+    editor, indexed by knowledge_ingest, and never trapped in a JSON blob.
+    The old sticky-notes store also popped open Windows Sticky Notes on every
+    note; that is gone.
+    """
+
+    @staticmethod
+    def notes_dir() -> str:
         try:
-            os.startfile("ms-stk:")
+            import knowledge_ingest
+
+            for tag, path in knowledge_ingest.parse_roots():
+                if tag == "notes":
+                    return path
         except Exception:
             pass
-        return note
+        path = os.path.join(DATA_DIR, "notes")
+        os.makedirs(path, exist_ok=True)
+        return path
 
-    def list_notes(self) -> List[Dict[str, Any]]:
-        return self._load_notes()
+    @staticmethod
+    def _slug(text: str) -> str:
+        words = re.findall(r"[a-z0-9]+", (text or "").lower())
+        return "-".join(words[:6]) or "note"
+
+    def create_note(self, content: str, title: Optional[str] = None) -> Dict[str, Any]:
+        content = (content or "").strip()
+        title = (title or "").strip() or (content.split("\n")[0][:60] if content else "Note")
+        folder = self.notes_dir()
+        os.makedirs(folder, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d-%H%M")
+        name = f"{stamp}-{self._slug(title)}.md"
+        path = os.path.join(folder, name)
+        counter = 2
+        while os.path.exists(path):
+            path = os.path.join(folder, f"{stamp}-{self._slug(title)}-{counter}.md")
+            counter += 1
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"# {title}\n\n{content}\n")
+        _ingest_note(path)
+        return {
+            "id": os.path.basename(path), "title": title, "content": content,
+            "path": path, "created": time.strftime("%Y-%m-%d %H:%M"),
+        }
+
+    def list_notes(self, limit: int = 20) -> List[Dict[str, Any]]:
+        folder = self.notes_dir()
+        try:
+            names = [n for n in os.listdir(folder) if n.lower().endswith(".md")]
+        except OSError:
+            return []
+        entries = []
+        for name in names:
+            path = os.path.join(folder, name)
+            try:
+                mtime = os.path.getmtime(path)
+                with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                    text = handle.read(4000)
+            except OSError:
+                continue
+            lines = [l for l in text.splitlines() if l.strip()]
+            title = lines[0].lstrip("# ").strip() if lines else name
+            body = "\n".join(lines[1:]).strip()
+            entries.append({
+                "id": name, "title": title, "content": body[:400], "path": path,
+                "created": time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime)), "_mtime": mtime,
+            })
+        entries.sort(key=lambda e: e["_mtime"], reverse=True)
+        for entry in entries:
+            entry.pop("_mtime", None)
+        return entries[:limit]
 
     def delete_note(self, note_id: str) -> bool:
-        notes = self._load_notes()
-        new_notes = [n for n in notes if n["id"] != note_id]
-        if len(new_notes) < len(notes):
-            self._save_notes(new_notes)
-            return True
-        return False
+        name = os.path.basename(note_id or "")
+        if not name.lower().endswith(".md"):
+            return False
+        path = os.path.join(self.notes_dir(), name)
+        if not os.path.exists(path):
+            return False
+        os.remove(path)
+        try:
+            from memory import memory
+
+            memory.remove_document(path)
+            memory.remove_ingest_source(path)
+        except Exception:
+            pass
+        return True
 
 
 class AppLauncherTool:
@@ -372,9 +330,8 @@ class PlaywrightBrowserTool:
 
 # ───────────────────────── shared singletons ─────────────────────────
 
-day_planner = DayPlannerTool()
 youtube_tool = YouTubeMusicTool()
-sticky_notes = StickyNotesTool()
+notes = NotesTool()
 
 
 # ───────────────────────── applications ─────────────────────────
@@ -524,30 +481,9 @@ def open_path(path: str) -> ToolResult:
 # ───────────────────────── day planner ─────────────────────────
 
 
-def _find_task(title_fragment: str) -> Optional[Dict[str, Any]]:
-    """Match a task by fuzzy title, because the model never knows task ids."""
-    tasks = day_planner.get_agenda().get("tasks", [])
-    if not tasks:
-        return None
-    fragment = title_fragment.lower().strip()
-
-    for task in tasks:
-        if fragment == task.get("title", "").lower():
-            return task
-    for task in tasks:
-        if fragment and fragment in task.get("title", "").lower():
-            return task
-
-    titles = [t.get("title", "") for t in tasks]
-    close = difflib.get_close_matches(title_fragment, titles, n=1, cutoff=0.55)
-    if close:
-        return next((t for t in tasks if t.get("title") == close[0]), None)
-    return None
-
-
 @tool(
     name="get_agenda",
-    description="Get the user's schedule and task list for today.",
+    description="Today's agenda: commitments due or overdue, reminders, and calendar events, in one list.",
     params={},
     examples=[
         "what's on my agenda", "plan my day", "what do I have today",
@@ -557,30 +493,32 @@ def _find_task(title_fragment: str) -> Optional[Dict[str, Any]]:
     category="planner",
 )
 def get_agenda() -> ToolResult:
-    agenda = day_planner.get_agenda()
-    tasks = agenda.get("tasks", [])
-    if not tasks:
-        return ToolResult(ok=True, summary="Your agenda is empty for today.", data=agenda)
+    import agenda as agenda_module
 
+    snapshot = agenda_module.compose()
+    tasks = snapshot.get("tasks", [])
     pending = [t for t in tasks if not t.get("completed")]
-    done_count = len(tasks) - len(pending)
+    done_count = snapshot["counts"].get("done", 0)
+    if not tasks:
+        return ToolResult(ok=True, summary="Nothing on your agenda today.", data=snapshot)
     if not pending:
-        return ToolResult(
-            ok=True,
-            summary=f"All {len(tasks)} tasks for today are complete.",
-            data=agenda,
-        )
+        return ToolResult(ok=True, summary=f"Everything is done: {done_count} commitment(s) kept today.", data=snapshot)
 
-    lines = [f"{t.get('time', '')} - {t.get('title', '')}" for t in pending[:6]]
-    summary = f"{len(pending)} task(s) remaining today ({done_count} done): " + "; ".join(lines)
-    return ToolResult(ok=True, summary=summary, data=agenda)
+    def line(t):
+        marker = "overdue: " if t.get("overdue") else ""
+        kind = " (reminder)" if t["kind"] == "reminder" else " (calendar)" if t["kind"] == "event" else ""
+        rolled = f" [moved {t['rollCount']}x]" if t.get("rollCount") else ""
+        return f"{marker}{t.get('time') or 'anytime'} - {t.get('title', '')}{kind}{rolled}"
+
+    summary = f"{len(pending)} thing(s) today ({done_count} done): " + "; ".join(line(t) for t in pending[:8])
+    return ToolResult(ok=True, summary=summary, data=snapshot)
 
 
 @tool(
     name="add_task",
     description=(
-        "Add a task to the user's day planner at a given time. "
-        "Use this for scheduling something, not for a one-off reminder alert."
+        "Commit to a task today (or on a given day/time). It goes into the workbook; "
+        "with a time, a reminder is set too."
     ),
     params={
         "title": {"type": "string", "description": "What the task is"},
@@ -598,24 +536,23 @@ def get_agenda() -> ToolResult:
     category="planner",
 )
 def add_task(title: str, when: Optional[str] = None) -> ToolResult:
-    parsed = parse_when(when) if when else None
-    display = format_display(parsed) if parsed else (when or "12:00 PM")
+    import agenda as agenda_module
 
-    task = day_planner.add_task(title, display)
-    if parsed:
-        task["at"] = parsed.isoformat(timespec="seconds")
-        day_planner.update_task(task["id"], {"at": task["at"]})
-
+    try:
+        item = agenda_module.add(title, when)
+    except ValueError as exc:
+        return ToolResult.fail(str(exc))
+    reminder = " I'll remind you before it." if item.get("reminder") else ""
     return ToolResult(
         ok=True,
-        summary=f"Added '{title}' to your plan at {display}.",
-        data=task,
+        summary=f"Committed to '{title}' {item.get('display', 'today')}.{reminder}",
+        data=item,
     )
 
 
 @tool(
     name="complete_task",
-    description="Mark a task in the day planner as done, matched by its title.",
+    description="Mark an open commitment as done, matched by its title.",
     params={"title": {"type": "string", "description": "Title or part of the task title"}},
     examples=[
         "mark the gym task as done", "I finished reviewing the script",
@@ -624,12 +561,12 @@ def add_task(title: str, when: Optional[str] = None) -> ToolResult:
     category="planner",
 )
 def complete_task(title: str) -> ToolResult:
-    task = _find_task(title)
-    if not task:
-        return ToolResult.fail(f"I couldn't find a task matching '{title}' on today's plan.")
-    day_planner.toggle_task(task["id"])
-    state = "not done" if task.get("completed") else "done"
-    return ToolResult(ok=True, summary=f"Marked '{task['title']}' as {state}.", data=task)
+    import agenda as agenda_module
+
+    done = agenda_module.complete(title)
+    if not done:
+        return ToolResult.fail(f"I couldn't find an open commitment matching '{title}'.")
+    return ToolResult(ok=True, summary=f"Marked '{done.get('text', title)}' as done.", data=done)
 
 
 # ───────────────────────── notes ─────────────────────────
@@ -637,7 +574,7 @@ def complete_task(title: str) -> ToolResult:
 
 @tool(
     name="create_note",
-    description="Write a sticky note to capture an idea or piece of information.",
+    description="Write a note (a Markdown file in your notes folder) to capture an idea or piece of information.",
     params={
         "content": {"type": "string", "description": "The text of the note"},
         "title": {"type": "string", "description": "Short title", "required": False},
@@ -649,26 +586,26 @@ def complete_task(title: str) -> ToolResult:
     category="notes",
 )
 def create_note(content: str, title: Optional[str] = None) -> ToolResult:
-    note = sticky_notes.create_note(content, title or "Sticky Note")
-    return ToolResult(ok=True, summary=f"Noted: {content[:120]}", data=note)
+    note = notes.create_note(content, title)
+    return ToolResult(ok=True, summary=f"Noted in {os.path.basename(note['path'])}: {content[:120]}", data=note)
 
 
 @tool(
     name="list_notes",
-    description="List the user's saved sticky notes.",
+    description="List the user's notes (Markdown files in the notes folder), newest first.",
     params={},
     examples=["show my notes", "what notes do I have", "read my sticky notes", "list my notes"],
     category="notes",
 )
 def list_notes() -> ToolResult:
-    notes = sticky_notes.list_notes()
-    if not notes:
-        return ToolResult(ok=True, summary="You have no notes saved.", data={"notes": []})
-    preview = "; ".join(n.get("content", "")[:60] for n in notes[:5])
+    entries = notes.list_notes()
+    if not entries:
+        return ToolResult(ok=True, summary="You have no notes yet.", data={"notes": [], "folder": notes.notes_dir()})
+    preview = "; ".join(f"{n['title']}" for n in entries[:6])
     return ToolResult(
         ok=True,
-        summary=f"You have {len(notes)} note(s): {preview}",
-        data={"notes": notes},
+        summary=f"You have {len(entries)} note(s) in {notes.notes_dir()}: {preview}",
+        data={"notes": entries, "folder": notes.notes_dir()},
     )
 
 

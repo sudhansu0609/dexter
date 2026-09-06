@@ -17,7 +17,7 @@ export function DayPlanner({ tasks, newTaskTitle, setNewTaskTitle, onAdd, onTogg
     <div className="dexter-panel" style={{ padding: '16px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
         <h3 style={{ fontSize: '13px', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: '6px' }}>
-          <Calendar size={15} /> Day Planner Agenda
+          <Calendar size={15} /> Today
         </h3>
         <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>{tasks.length} Tasks</span>
       </div>
@@ -25,7 +25,7 @@ export function DayPlanner({ tasks, newTaskTitle, setNewTaskTitle, onAdd, onTogg
       <form onSubmit={onAdd} style={{ display: 'flex', gap: '6px', marginBottom: '12px' }}>
         <input
           type="text"
-          placeholder="Add goal or task..."
+          placeholder="Commit to something today..."
           value={newTaskTitle}
           onChange={(e) => setNewTaskTitle(e.target.value)}
           style={{ flex: 1, fontSize: '11px', padding: '6px 10px' }}

@@ -55,3 +55,8 @@ ddgs             # DuckDuckGo search; without it web_search reports unavailable
 # ── Knowledge ingestion (roadmap v5, 4.1) ──
 pypdf            # text from PDFs in the knowledge folders
 python-docx      # text from .docx files
+
+# ── Tray icon + global hotkey (backend/desktop_app.py, roadmap v5 5.3) ──
+pystray
+pillow
+keyboard

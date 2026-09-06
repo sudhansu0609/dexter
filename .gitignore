@@ -49,3 +49,5 @@ data/dexter_workbook.db
 data/dexter_workbook.db-*
 data/settings.json
 data/window.json
+data/notes/
+data/day_planner.migrated.json

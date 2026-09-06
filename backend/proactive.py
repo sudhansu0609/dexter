@@ -138,19 +138,25 @@ def _email_suggestions() -> List[Dict[str, Any]]:
 
 
 def _planner_suggestions() -> List[Dict[str, Any]]:
-    from tools_core import day_planner
+    from workbook import workbook
 
     overdue = []
     now = datetime.now()
-    for task in day_planner.get_agenda().get("tasks", []):
-        if task.get("completed") or not task.get("at"):
+    try:
+        snapshot = workbook.today()
+    except Exception:
+        return []
+    overdue += [c.get("text", "a commitment") for c in snapshot.get("overdue", [])]
+    for commitment in snapshot.get("due", []):
+        due_time = commitment.get("due_time")
+        if not due_time:
             continue
         try:
-            task_at = datetime.fromisoformat(task["at"])
+            at = datetime.strptime(f"{commitment.get('due_date')} {due_time}", "%Y-%m-%d %H:%M")
         except Exception:
             continue
-        if (now - task_at).total_seconds() > 30 * 60:
-            overdue.append(task.get("title", "a task"))
+        if (now - at).total_seconds() > 30 * 60:
+            overdue.append(commitment.get("text", "a commitment"))
     if overdue:
         preview = "', '".join(overdue[:2])
         return [{

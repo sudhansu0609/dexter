@@ -1,7 +1,7 @@
 """
 Reminder and maintenance scheduler.
 
-Dexter had no scheduler at all: day_planner.json stored times as display strings
+Dexter had no scheduler at all: the old day planner stored times as display strings
 like "09:00 AM" that nothing ever parsed, so no reminder could ever fire. This
 module adds a real APScheduler background job store plus the recurring
 housekeeping the app needs (app index refresh, memory pruning).
@@ -293,63 +293,65 @@ class DexterScheduler:
 
     # ───────────────────────── planner integration ─────────────────────────
 
-    def sync_planner_task(self, task: Dict[str, Any]) -> bool:
-        """Arm a reminder a few minutes before a scheduled day-planner task."""
-        if not task.get("at") or task.get("completed"):
+    def sync_commitment(self, commitment: Dict[str, Any]) -> bool:
+        """Arm a heads-up a few minutes before a timed commitment due today."""
+        due_date, due_time = commitment.get("due_date"), commitment.get("due_time")
+        if not due_time or commitment.get("status") != "open":
             return False
         try:
-            task_at = datetime.fromisoformat(task["at"])
+            at = datetime.strptime(f"{due_date} {due_time}", "%Y-%m-%d %H:%M")
         except Exception:
             return False
-
-        fire_at = task_at - timedelta(minutes=PLANNER_LEAD_MINUTES)
+        fire_at = at - timedelta(minutes=PLANNER_LEAD_MINUTES)
         if fire_at <= datetime.now() or not self._started:
             return False
-
-        job_id = f"task-{task['id']}"
         try:
             self._scheduler.add_job(
-                self._fire_planner_task,
+                self._fire_commitment,
                 trigger=DateTrigger(run_date=fire_at),
-                args=[task["id"], task.get("title", ""), format_display(task_at)],
-                id=job_id,
+                args=[int(commitment["id"]), commitment.get("text", ""), format_display(at)],
+                id=f"commit-{commitment['id']}",
                 replace_existing=True,
                 misfire_grace_time=300,
             )
             return True
         except Exception as exc:
-            print(f"[Scheduler] Could not arm planner task {task.get('id')}: {exc}")
+            print(f"[Scheduler] Could not arm commitment {commitment.get('id')}: {exc}")
             return False
 
-    def _fire_planner_task(self, task_id: str, title: str, when_display: str) -> None:
-        from tools_core import day_planner
+    def _fire_commitment(self, commitment_id: int, text: str, when_display: str) -> None:
+        from workbook import workbook
 
-        task = day_planner.get_task(task_id)
-        if not task or task.get("completed"):
+        commitment = workbook.get_commitment(commitment_id)
+        if not commitment or commitment.get("status") != "open":
             return
+        notify.toast_async("Dexter - Upcoming", f"{text} at {when_display}")
+        bus.publish("reminder", {
+            "id": f"commit-{commitment_id}",
+            "text": f"{text} at {when_display}",
+            "spoken": f"Coming up in {PLANNER_LEAD_MINUTES} minutes: {text}",
+            "speak": False,
+            "banner": True,
+            "commitmentId": commitment_id,
+        })
 
-        notify.toast_async("Dexter - Upcoming", f"{title} at {when_display}")
-        bus.publish(
-            "reminder",
-            {
-                "id": job_id_safe(task_id),
-                "text": f"{title} at {when_display}",
-                "spoken": f"Coming up in {PLANNER_LEAD_MINUTES} minutes: {title}",
-                "speak": True,
-                "banner": True,
-                "taskId": task_id,
-            },
-        )
-
-    def rearm_planner(self) -> int:
-        """Arm reminders for every future task on today's plan."""
-        from tools_core import day_planner
+    def rearm_commitments(self) -> int:
+        """Arm heads-ups for every timed commitment still ahead today."""
+        from workbook import workbook
 
         armed = 0
-        for task in day_planner.get_agenda().get("tasks", []):
-            if self.sync_planner_task(task):
+        try:
+            snapshot = workbook.today()
+        except Exception:
+            return 0
+        for commitment in snapshot.get("due", []):
+            if self.sync_commitment(commitment):
                 armed += 1
         return armed
+
+    def rearm_planner(self) -> int:
+        """Kept for callers of the old name."""
+        return self.rearm_commitments()
 
     # ───────────────────────── maintenance ─────────────────────────
 
@@ -427,9 +429,8 @@ class DexterScheduler:
         return removed
 
     def _roll_and_rearm_planner(self) -> None:
-        # get_agenda() rolls the planner onto today's date as a side effect,
-        # so calling it just after midnight both rolls and re-arms.
-        self.rearm_planner()
+        # Just after midnight: arm heads-ups for the new day's timed commitments.
+        self.rearm_commitments()
 
     def _reindex_knowledge(self) -> None:
         """Nightly: bring the folder index up to date (roadmap v5, 4.1)."""
@@ -479,10 +480,9 @@ class DexterScheduler:
             print(f"[Scheduler] Evening reflection failed: {exc}")
 
     def _morning_brief(self) -> None:
-        from tools_core import day_planner
         from workbook import workbook
 
-        tasks = [t for t in day_planner.get_agenda().get("tasks", []) if not t.get("completed")]
+        tasks: List[Dict[str, Any]] = []
 
         # What the user actually committed to, which is the thing a briefing is
         # about. The bare task count this used to open with told them nothing.

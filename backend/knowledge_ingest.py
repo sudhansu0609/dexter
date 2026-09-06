@@ -84,6 +84,11 @@ def parse_roots(spec: Optional[str] = None) -> List[Tuple[str, str]]:
         path = os.path.realpath(os.path.expanduser(path.strip().strip('"')))
         if os.path.isdir(path):
             roots.append((tag, path))
+    # Notes always have a home: data/notes when no notes vault is configured.
+    if not any(tag == "notes" for tag, _ in roots):
+        default_notes = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "notes")
+        if os.path.isdir(default_notes):
+            roots.append(("notes", default_notes))
     return roots
 
 
@@ -159,9 +164,19 @@ def scan(roots: Optional[Iterable[Tuple[str, str]]] = None) -> List[Tuple[str, s
 
 
 def _read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="ignore") as handle:
-        return handle.read()
-
+    """UTF-8 by default; UTF-16 exports (Windows tools, YouTube keyword CSVs) are detected by BOM or NULs."""
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", errors="ignore")
+    sample = raw[:4096]
+    if sample and sample.count(b"\x00") > len(sample) // 8:
+        for encoding in ("utf-16-le", "utf-16-be"):
+            try:
+                return raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+    return raw.decode("utf-8-sig", errors="ignore")
 
 def _read_pdf(path: str) -> str:
     from pypdf import PdfReader  # type: ignore
