@@ -809,6 +809,9 @@ def list_notes() -> ToolResult:
     examples=[
         "play some lofi music", "put on jazz", "play the latest video from that channel",
         "search youtube for python tutorials", "play relaxing music",
+        # The README advertises this exact phrasing as a Tier-1 example, but it
+        # scored below the confidence floor and fell through to the agent loop.
+        "put on some music", "put some music on",
     ],
     category="media",
 )

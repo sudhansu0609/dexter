@@ -379,6 +379,246 @@ def send_email(to: str, subject: str, body: str) -> ToolResult:
         return ToolResult.fail(f"Could not send the email: {exc}")
 
 
+def _find_event(service, needle: str, days: int = 14):
+    """The event a person means when they say 'my three o'clock' or 'the call'."""
+    from datetime import datetime as _dt, timedelta as _td
+
+    now = _dt.now()
+    result = service.events().list(
+        calendarId="primary",
+        timeMin=now.astimezone().isoformat(),
+        timeMax=(now + _td(days=days)).astimezone().isoformat(),
+        singleEvents=True,
+        orderBy="startTime",
+        maxResults=50,
+    ).execute()
+    events = result.get("items", [])
+    if not events:
+        return None
+
+    needle = (needle or "").strip().lower()
+    if not needle:
+        return events[0]
+
+    for event in events:
+        if needle in (event.get("summary") or "").lower():
+            return event
+
+    # "my 3pm" refers to the time, not the title.
+    for event in events:
+        start = event["start"].get("dateTime") or ""
+        if not start:
+            continue
+        try:
+            label = _dt.fromisoformat(start).strftime("%I:%M %p").lstrip("0").lower()
+            compact = label.replace(":00", "").replace(" ", "")
+        except ValueError:
+            continue
+        if label in needle or compact in needle.replace(" ", ""):
+            return event
+
+    words = set(needle.split())
+    best, best_score = None, 0
+    for event in events:
+        score = len(words & set((event.get("summary") or "").lower().split()))
+        if score > best_score:
+            best, best_score = event, score
+    return best if best_score else None
+
+
+@tool(
+    name="reschedule_event",
+    description="Move an existing calendar event to a new time.",
+    params={
+        "event": {"type": "string", "description": "Which event, by title or time"},
+        "when": {"type": "string", "description": "The new time, e.g. 'tomorrow at 4pm'"},
+    },
+    examples=[
+        "move my 3pm to 4", "reschedule the client call to tomorrow",
+        "push the standup to 10am", "shift my meeting to friday afternoon",
+        "change the dentist appointment to next week",
+    ],
+    confirm=True,
+    category="google",
+)
+def reschedule_event(event: str, when: str) -> ToolResult:
+    service = _service("calendar", "v3")
+    if not service:
+        return ToolResult.fail(SETUP_HINT)
+
+    import timeparse
+
+    target = timeparse.parse_when(when) or timeparse.parse_date(when)
+    if target is None:
+        return ToolResult.fail(f"I couldn't work out when '{when}' is.")
+
+    try:
+        found = _find_event(service, event)
+        if not found:
+            return ToolResult.fail(f"I couldn't find an event matching '{event}'.")
+
+        start_raw = found["start"].get("dateTime")
+        if not start_raw:
+            return ToolResult.fail("That's an all-day event; I can't move it to a time.")
+
+        original = datetime.fromisoformat(start_raw)
+        end_raw = found["end"].get("dateTime")
+        # Preserve the meeting's length rather than assuming an hour.
+        duration = (
+            datetime.fromisoformat(end_raw) - original if end_raw else timedelta(hours=1)
+        )
+
+        zone = _local_timezone()
+        body = {
+            "start": {"dateTime": target.astimezone().isoformat()},
+            "end": {"dateTime": (target + duration).astimezone().isoformat()},
+        }
+        if zone:
+            body["start"]["timeZone"] = zone
+            body["end"]["timeZone"] = zone
+
+        service.events().patch(
+            calendarId="primary", eventId=found["id"], body=body
+        ).execute()
+
+        label = target.strftime("%A at %I:%M %p").replace(" 0", " ")
+        return ToolResult(
+            ok=True,
+            summary=f"Moved '{found.get('summary', 'that event')}' to {label}.",
+            data={"eventId": found["id"], "newStart": body["start"]["dateTime"]},
+        )
+    except Exception as exc:
+        return ToolResult.fail(f"Could not reschedule it: {exc}")
+
+
+@tool(
+    name="cancel_event",
+    description="Delete an event from the user's calendar.",
+    params={"event": {"type": "string", "description": "Which event, by title or time"}},
+    examples=[
+        "cancel my 3pm", "delete the client call from my calendar",
+        "cancel tomorrow's standup", "remove the dentist appointment",
+    ],
+    confirm=True,
+    category="google",
+)
+def cancel_event(event: str) -> ToolResult:
+    service = _service("calendar", "v3")
+    if not service:
+        return ToolResult.fail(SETUP_HINT)
+
+    try:
+        found = _find_event(service, event)
+        if not found:
+            return ToolResult.fail(f"I couldn't find an event matching '{event}'.")
+
+        service.events().delete(calendarId="primary", eventId=found["id"]).execute()
+        return ToolResult(
+            ok=True,
+            summary=f"Cancelled '{found.get('summary', 'that event')}'.",
+            data={"eventId": found["id"]},
+        )
+    except Exception as exc:
+        return ToolResult.fail(f"Could not cancel it: {exc}")
+
+
+@tool(
+    name="search_email",
+    description=(
+        "Search the user's Gmail for specific messages - by sender, subject, or "
+        "content. Use when they are looking for a particular email rather than "
+        "checking the inbox."
+    ),
+    params={
+        "query": {"type": "string", "description": "What to look for, in plain words"},
+        "count": {"type": "integer", "description": "How many to fetch", "required": False},
+    },
+    examples=[
+        "find the email from the accountant", "search my email for the invoice",
+        "did anyone email me about the shoot", "look for that message about the contract",
+        "find emails from last week about the relaunch",
+    ],
+    category="google",
+)
+def search_email(query: str, count: Optional[int] = None) -> ToolResult:
+    query = (query or "").strip()
+    if not query:
+        return ToolResult.fail("What should I look for?")
+
+    # Gmail's own operators pass through untouched; plain words become a
+    # full-text search, which is what "find the email about X" means.
+    return check_email(query=query, count=count or 5)
+
+
+@tool(
+    name="reply_to_email",
+    description=(
+        "Reply to a message already found in the inbox, keeping it in the same "
+        "thread."
+    ),
+    params={
+        "about": {"type": "string", "description": "Which email - sender or subject"},
+        "body": {"type": "string", "description": "What to say"},
+    },
+    examples=[
+        "reply to the accountant saying I'll send it tomorrow",
+        "respond to that email", "reply to the client and say yes",
+        "answer the email from the editor",
+    ],
+    confirm=True,
+    category="google",
+)
+def reply_to_email(about: str, body: str) -> ToolResult:
+    service = _service("gmail", "v1")
+    if not service:
+        return ToolResult.fail(SETUP_HINT)
+
+    import base64
+    from email.message import EmailMessage
+
+    try:
+        listing = service.users().messages().list(
+            userId="me", q=about or "is:unread", maxResults=1,
+        ).execute()
+        messages = listing.get("messages", [])
+        if not messages:
+            return ToolResult.fail(f"I couldn't find an email matching '{about}'.")
+
+        detail = service.users().messages().get(
+            userId="me", id=messages[0]["id"], format="metadata",
+            metadataHeaders=["From", "Subject", "Message-ID", "References"],
+        ).execute()
+        payload = detail.get("payload", {})
+        sender = _header(payload, "From")
+        subject = _header(payload, "Subject")
+        message_id = _header(payload, "Message-ID")
+
+        message = EmailMessage()
+        message.set_content(body)
+        message["To"] = sender
+        message["Subject"] = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+        # Without these headers the reply starts a new thread rather than
+        # continuing the conversation.
+        if message_id:
+            message["In-Reply-To"] = message_id
+            references = _header(payload, "References")
+            message["References"] = f"{references} {message_id}".strip()
+
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        service.users().messages().send(
+            userId="me", body={"raw": raw, "threadId": detail.get("threadId")},
+        ).execute()
+
+        who = sender.split("<")[0].strip().strip('"') or sender
+        return ToolResult(
+            ok=True,
+            summary=f"Replied to {who}.",
+            data={"to": sender, "subject": message["Subject"]},
+        )
+    except Exception as exc:
+        return ToolResult.fail(f"Could not send the reply: {exc}")
+
+
 def availability() -> Dict[str, Any]:
     return {
         "librariesInstalled": _available(),

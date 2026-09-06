@@ -14,6 +14,9 @@ accurate than sending everything to the model.
 """
 
 import math
+import os
+
+import env_boot  # noqa: F401  - loads .env for every entry point
 import re
 import threading
 import time
@@ -131,6 +134,46 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         re.compile(r"^(?:go to|navigate to|browse to|visit|open (?:the )?(?:website|url|site))\s+(.+)$", re.I),
         "open_website",
         lambda m: {"url": m.group(1).strip()},
+    ),
+    # ── file mutation ──
+    # "move X to Y" and "copy X to Y" are the same sentence with one verb
+    # changed, which the embedding matcher cannot reliably separate; both are
+    # rigid enough to match deterministically instead.
+    (
+        re.compile(
+            r"^(?:rename|call)\s+(?:the\s+|that\s+|this\s+|my\s+)?(?P<what>.+?)\s+"
+            r"(?:to|as)\s+(?P<name>[^\s].*)$",
+            re.I,
+        ),
+        "rename_file",
+        lambda m: {
+            "path": m.group("what").strip(" .!?,"),
+            "new_name": m.group("name").strip(" .!?,"),
+        },
+    ),
+    (
+        re.compile(
+            r"^(?:move|shift|put)\s+(?:the\s+|that\s+|this\s+|my\s+)?(?P<what>.+?)\s+"
+            r"(?:to|into|in|onto)\s+(?:the\s+|my\s+)?(?P<where>[^\s].*)$",
+            re.I,
+        ),
+        "move_file",
+        lambda m: {
+            "path": m.group("what").strip(" .!?,"),
+            "destination": m.group("where").strip(" .!?,"),
+        },
+    ),
+    (
+        re.compile(
+            r"^(?:copy|duplicate|back\s+up)\s+(?:the\s+|that\s+|this\s+|my\s+)?(?P<what>.+?)\s+"
+            r"(?:to|into|in|onto)\s+(?:the\s+|my\s+)?(?P<where>[^\s].*)$",
+            re.I,
+        ),
+        "copy_file",
+        lambda m: {
+            "path": m.group("what").strip(" .!?,"),
+            "destination": m.group("where").strip(" .!?,"),
+        },
     ),
     (
         re.compile(r"^(?:create|make|new)\s+(?:a\s+)?(?:new\s+)?(?:folder|directory)\s+(?:called\s+|named\s+)?(.+)$", re.I),
@@ -528,6 +571,133 @@ def _primary_param(spec) -> Optional[str]:
     return None
 
 
+# ───────────────────────── workbook slots ─────────────────────────
+
+# "I'm committing to ...", "put me down for ...", "hold me to ..."
+_RE_COMMIT_LEAD = re.compile(
+    r"^(?:i(?:'m| am)?\s+)?(?:committing|commit)\s+(?:me\s+)?(?:to\s+)?"
+    r"|^put\s+me\s+down\s+(?:for\s+)?"
+    r"|^hold\s+me\s+to\s+"
+    r"|^add\s+a\s+commitment\s+(?:to\s+)?"
+    r"|^(?:i\s+)?(?:will|'ll)\s+"
+    r"|^i\s+am\s+going\s+to\s+",
+    re.IGNORECASE,
+)
+
+# "I finished ...", "done with ...", "mark ... as done", "check off ..."
+_RE_KEPT_LEAD = re.compile(
+    r"^(?:i\s+)?(?:have\s+|just\s+)?(?:finished|completed|did|done\s+with)\s+"
+    r"|^mark\s+(?:the\s+|my\s+)?"
+    r"|^check\s+off\s+(?:the\s+|my\s+)?",
+    re.IGNORECASE,
+)
+_RE_KEPT_TAIL = re.compile(
+    r"\s+(?:as\s+)?(?:done|complete|completed|finished|off)\s*$", re.IGNORECASE
+)
+
+# "push X to tomorrow", "move X to Friday", "bump X to Monday"
+_RE_MOVE = re.compile(
+    r"^(?:push|move|bump|reschedule|postpone|shift)\s+(?:the\s+|my\s+)?(?P<what>.+?)"
+    r"(?:\s+(?:to|until|till)\s+(?P<when>.+?))?\s*$",
+    re.IGNORECASE,
+)
+
+# "log that I worked 90 minutes on X", "note that I'm blocked on Y"
+_RE_LOG_LEAD = re.compile(
+    r"^(?:log|note|record)\s+(?:that\s+|some\s+progress\s+(?:on\s+)?)?"
+    r"|^make\s+a\s+log\s+(?:that\s+)?",
+    re.IGNORECASE,
+)
+_RE_MINUTES = re.compile(
+    r"\b(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>minutes?|mins?|hours?|hrs?)\b", re.IGNORECASE
+)
+
+# "my goal is to X", "set a goal to X"
+_RE_GOAL_LEAD = re.compile(
+    r"^(?:my\s+)?(?:new\s+)?goal(?:\s+this\s+\w+)?\s+is\s+(?:to\s+)?"
+    r"|^set\s+a\s+goal\s+(?:to\s+|of\s+)?"
+    r"|^new\s+goal\s*:?\s*"
+    r"|^i\s+want\s+to\s+work\s+towards\s+",
+    re.IGNORECASE,
+)
+
+_RE_TRAILING_WHEN = re.compile(
+    r"\s+(?:by|on|before|due)\s+(?P<when>today|tomorrow|tonight|next\s+week|"
+    r"this\s+week|end\s+of\s+(?:the\s+)?week|monday|tuesday|wednesday|thursday|"
+    r"friday|saturday|sunday|in\s+\d+\s+days?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _split_due(text: str):
+    """('script episode three', 'friday') from 'script episode three by friday'."""
+    match = _RE_TRAILING_WHEN.search(text)
+    if not match:
+        # A bare trailing "tomorrow"/"today" with no preposition is just as common.
+        bare = re.search(
+            r"\s+(today|tomorrow|tonight|next\s+week|this\s+week|monday|tuesday|"
+            r"wednesday|thursday|friday|saturday|sunday)\s*$",
+            text, re.IGNORECASE,
+        )
+        if bare:
+            return text[: bare.start()].strip(" .!?,"), bare.group(1)
+        return text.strip(" .!?,"), ""
+    return text[: match.start()].strip(" .!?,"), match.group("when")
+
+
+def _workbook_slots(tool_name: str, text: str):
+    """Arguments for the workbook tools, or None to let Tier 2 reason it out."""
+    if tool_name == "my_commitments":
+        lowered = text.lower()
+        if "week" in lowered:
+            return {"scope": "week"}
+        if any(word in lowered for word in ("all", "everything", "outstanding")):
+            return {"scope": "all"}
+        return {"scope": "today"}
+
+    if tool_name == "make_commitment":
+        body = _RE_COMMIT_LEAD.sub("", text).strip(" .!?,")
+        if not body:
+            return None
+        what, when = _split_due(body)
+        return {"text": what, "when": when} if what else None
+
+    if tool_name == "keep_commitment":
+        body = _RE_KEPT_LEAD.sub("", text)
+        body = _RE_KEPT_TAIL.sub("", body).strip(" .!?,")
+        return {"text": body} if body else None
+
+    if tool_name == "reschedule_commitment":
+        match = _RE_MOVE.match(text)
+        if not match:
+            return None
+        what = (match.group("what") or "").strip(" .!?,")
+        when = (match.group("when") or "tomorrow").strip(" .!?,")
+        return {"text": what, "when": when} if what else None
+
+    if tool_name == "log_progress":
+        body = _RE_LOG_LEAD.sub("", text).strip(" .!?,")
+        if not body:
+            return None
+        args = {"text": body}
+        minutes = _RE_MINUTES.search(body)
+        if minutes:
+            value = float(minutes.group("num"))
+            if minutes.group("unit").lower().startswith(("hour", "hr")):
+                value *= 60
+            args["minutes"] = int(value)
+        return args
+
+    if tool_name == "set_goal":
+        body = _RE_GOAL_LEAD.sub("", text).strip(" .!?,")
+        if not body:
+            return None
+        title, by = _split_due(body)
+        return {"title": title, "by": by} if title else None
+
+    return None
+
+
 def _extract_slots(tool_name: str, message: str) -> Optional[Dict[str, Any]]:
     """
     Fill a tool's arguments from the raw utterance without calling the model.
@@ -545,6 +715,10 @@ def _extract_slots(tool_name: str, message: str) -> Optional[Dict[str, Any]]:
     # with nothing and merely report the current level.
     if tool_name in ("set_volume", "set_brightness"):
         return _level_slots(tool_name, text)
+
+    workbook_args = _workbook_slots(tool_name, text)
+    if workbook_args is not None:
+        return workbook_args
 
     if not spec.required:
         # Nothing required means the tool is callable as-is; optional args can
@@ -701,6 +875,44 @@ def _speech_hint(result: ToolResult) -> Dict[str, Any]:
 MAX_ITERATIONS = 5
 TOOLS_PER_CALL = 8
 
+# ── Tiered models: a small fast model answers simple turns instantly and hands
+# off ("escalates") to a bigger model for anything needing tools/actions. Both
+# are optional; unset DEXTER_FAST_MODEL disables the tier (single-model as
+# before). SMART model, when unset, falls back to the provider's default.
+FAST_MODEL = os.getenv("DEXTER_FAST_MODEL", "").strip()
+SMART_MODEL = os.getenv("DEXTER_SMART_MODEL", "").strip()
+TIERED_ENABLED = os.getenv("DEXTER_TIERED_LLM", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
+
+# The sentinel the fast model returns instead of answering when a turn needs the
+# big model. Kept short and unlikely to appear in a genuine reply.
+_ESCALATE = "<ESCALATE>"
+
+_FAST_SYSTEM = (
+    "You are only the instant-response layer of Dexter, a capable assistant that "
+    "CAN take actions on the user's PC through tools (apps, files, media, email, "
+    "calendar, reminders, memory, the web, and more) via its larger model. Your "
+    "job is a fast first pass. Reply yourself ONLY when the message is simple "
+    "conversation, chit-chat, or general knowledge you can fully and correctly "
+    "answer in 1-2 short sentences with no tools and no external or personal data.\n\n"
+    "For ANYTHING else, reply with exactly "
+    f"{_ESCALATE} and nothing else - so the bigger model can handle it. In "
+    "particular escalate (never refuse, never say you cannot do it) when the "
+    "message asks you to DO or perform anything, or needs:\n"
+    "- opening, closing, or controlling apps, windows, media, volume, or brightness\n"
+    "- files, the clipboard, screenshots, or the screen's current contents\n"
+    "- the web, app data, email, calendar, reminders, scheduling, or the news/time/date\n"
+    "- the user's saved notes, memories, tasks, or anything personal or current\n"
+    "- multi-step work, or anything you are not fully certain you can answer alone\n\n"
+    f"You must NEVER say you can't do something - reply {_ESCALATE} instead. When "
+    f"in doubt, reply {_ESCALATE}. Never explain the escalation."
+)
+
 AGENT_SYSTEM_PROMPT = """You are Dexter, a personal AI assistant running on the user's Windows PC.
 
 You can act on the computer by calling tools. Rules:
@@ -773,6 +985,61 @@ class _TokenGate:
             return
         self._decided = True
         self._on_event("token", {"text": self._buffer})
+
+
+def _fast_reply(
+    message: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    provider: str = "auto",
+    context_note: str = "",
+    on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    session: str = "default",
+) -> Optional[RouteResult]:
+    """
+    First pass with the small/fast model, no tools.
+
+    Returns a RouteResult when the fast model confidently answers a simple turn
+    (streamed for an instant reply), or None to signal "escalate" - the caller
+    then runs the full agent loop on the bigger model. Any failure also returns
+    None so the smart model is the safe fallback.
+    """
+    system = _FAST_SYSTEM
+    if context_note:
+        system += f"\n\nContext you may use:\n{context_note}"
+
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
+    for turn in (history or [])[-6:]:
+        role = turn.get("role")
+        content = turn.get("content")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": message})
+
+    response = llm_router.chat(
+        messages,
+        provider=provider,
+        model=FAST_MODEL,
+        temperature=0.3,
+        max_tokens=200,
+        tools=None,
+        should_cancel=lambda: cancellation.is_cancelled(session),
+    )
+
+    if response.cancelled:
+        return RouteResult(reply="", action="interrupted", tier=1)
+    if not response.ok:
+        return None  # fall through to the smart model
+
+    answer = (response.content or "").strip()
+    # Escalate on the sentinel, an empty reply, or a model that leaked the tag.
+    if not answer or "ESCALATE" in answer.upper():
+        return None
+
+    # A confident quick answer: emit it as a token so the frontend renders it and
+    # streamed-sentence TTS can start immediately, mirroring the agent loop.
+    if on_event:
+        on_event("token", {"text": answer})
+    return RouteResult(reply=answer, action="fast_chat", tier=1, data={"model": FAST_MODEL})
 
 
 def agent_loop(
@@ -1001,6 +1268,24 @@ def route(
                 data={**result.data, "score": round(score, 3), **_speech_hint(result)},
                 needs_confirmation=awaiting,
             )
+
+    # ── Tier 1.5: instant fast-model reply, escalate to the smart model ──
+    # Only when the caller has not pinned a specific model (an explicit UI pick
+    # is honoured exactly). Pin both passes to one resolved backend so the fast
+    # and smart model names are valid for the same provider.
+    if TIERED_ENABLED and FAST_MODEL and model is None:
+        backend = llm_router.resolve_provider(provider)
+        fast = _fast_reply(
+            text, history=history, provider=backend,
+            context_note=context_note, on_event=on_event, session=session,
+        )
+        if fast is not None:
+            return fast
+        # Escalated: run the full tool-enabled loop on the bigger model.
+        return agent_loop(
+            text, history=history, provider=backend, model=SMART_MODEL or None,
+            context_note=context_note, on_event=on_event, session=session,
+        )
 
     # ── Tier 2 ──
     return agent_loop(text, history=history, provider=provider, model=model,

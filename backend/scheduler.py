@@ -17,7 +17,7 @@ failing silently.
 
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import notify
@@ -390,6 +390,25 @@ class DexterScheduler:
             id="maint-rearm", replace_existing=True,
         )
 
+        # ── the daily loop ──
+        # A planner that only ever adds is a to-do list. The loop is what makes
+        # it a practice: plan in the morning, close out in the evening, review
+        # on Sunday. The evening prompt asks; the late job records regardless,
+        # so a day is never silently lost the way the old midnight roll lost it.
+        self._scheduler.add_job(
+            self._evening_prompt,
+            CronTrigger(hour=int(os.getenv("DEXTER_CLOSEOUT_HOUR", "21")), minute=0),
+            id="loop-closeout-prompt", replace_existing=True,
+        )
+        self._scheduler.add_job(
+            self._auto_close_out, CronTrigger(hour=23, minute=50),
+            id="loop-closeout-auto", replace_existing=True,
+        )
+        self._scheduler.add_job(
+            self._weekly_review, CronTrigger(day_of_week="sun", hour=18, minute=0),
+            id="loop-weekly-review", replace_existing=True,
+        )
+
     def _prune_reminders(self) -> int:
         """Fired one-shot reminders accumulated forever in reminders.json."""
         reminders = self._load()
@@ -469,8 +488,19 @@ class DexterScheduler:
 
     def _morning_brief(self) -> None:
         from tools_core import day_planner
+        from workbook import workbook
 
         tasks = [t for t in day_planner.get_agenda().get("tasks", []) if not t.get("completed")]
+
+        # What the user actually committed to, which is the thing a briefing is
+        # about. The bare task count this used to open with told them nothing.
+        try:
+            snapshot = workbook.today()
+            commitments = snapshot["due"]
+            overdue = snapshot["overdue"]
+            slipping = workbook.slipping()
+        except Exception:
+            commitments, overdue, slipping = [], [], []
 
         # Open with yesterday's episodic summary when there is one - the brief
         # should feel like a colleague catching you up, not a bare task count.
@@ -485,19 +515,107 @@ class DexterScheduler:
         except Exception:
             pass
 
-        if not tasks and not yesterday_line:
+        if not tasks and not yesterday_line and not commitments and not overdue:
             return
-        headline = (
-            f"{len(tasks)} task(s) today, starting with {tasks[0].get('title', '')}"
-            if tasks else "Nothing scheduled today."
-        )
+
+        if commitments:
+            headline = f"{len(commitments)} commitment(s) today, starting with {commitments[0]['text']}"
+        elif tasks:
+            headline = f"{len(tasks)} task(s) today, starting with {tasks[0].get('title', '')}"
+        else:
+            headline = "Nothing committed today."
+
         spoken = "Good morning. "
         if yesterday_line:
             spoken += f"Yesterday: {yesterday_line} "
         spoken += f"{headline}."
+        if overdue:
+            spoken += f" You're still carrying {len(overdue)} from before."
+        if slipping:
+            worst = slipping[0]
+            if worst.get("roll_count", 0) >= 3:
+                spoken += f" {worst['text']} has moved {worst['roll_count']} times now."
         notify.toast_async("Dexter - Good morning", headline)
         bus.publish("reminder", {
             "id": "morning-brief",
+            "text": headline,
+            "spoken": spoken,
+            "speak": True,
+            "banner": True,
+        })
+
+
+    # ───────────────────────── the daily loop ─────────────────────────
+
+    def _evening_prompt(self) -> None:
+        """Ask to close out the day - never close it silently."""
+        from workbook import workbook
+
+        today = date.today().isoformat()
+        if workbook.was_closed_out(today):
+            return
+
+        snapshot = workbook.today(today)
+        open_items = snapshot["due"] + snapshot["overdue"]
+        done = snapshot["done"]
+        if not open_items and not done:
+            return
+
+        if open_items:
+            headline = f"{len(done)} done, {len(open_items)} still open. Close out the day?"
+        else:
+            headline = f"All {len(done)} kept today. Close out the day?"
+
+        notify.toast_async("Dexter - end of day", headline)
+        bus.publish("reminder", {
+            "id": "evening-closeout",
+            "text": headline,
+            "spoken": f"That's the day. {headline}",
+            "speak": True,
+            "banner": True,
+        })
+
+    def _auto_close_out(self) -> None:
+        """Record the day even if nobody answered the prompt."""
+        from workbook import workbook
+
+        today = date.today().isoformat()
+        if workbook.was_closed_out(today):
+            return
+        try:
+            result = workbook.close_out(today, note="auto")
+            if result["done"] or result["rolled"]:
+                print(
+                    f"[Loop] Auto-closed {today}: {result['done']} kept, "
+                    f"{result['rolled']} rolled."
+                )
+        except Exception as exc:
+            print(f"[Loop] Auto close-out failed: {exc}")
+
+    def _weekly_review(self) -> None:
+        from workbook import workbook
+
+        try:
+            card = workbook.scorecard()
+        except Exception as exc:
+            print(f"[Loop] Weekly review failed: {exc}")
+            return
+
+        if not card["committed"]:
+            return
+
+        headline = f"This week: {card['done']} of {card['committed']} commitments kept."
+        spoken = headline
+        untouched = [g["title"] for g in card["goals"] if g["untouched"]]
+        if untouched:
+            spoken += f" Nothing moved on {untouched[0]}."
+        if card["slipping"]:
+            spoken += f" {len(card['slipping'])} item(s) are slipping."
+        spoken += " Want to run the full review?"
+
+        notify.toast_async("Dexter - weekly review", headline)
+        bus.publish("reminder", {
+            "id": "weekly-review",
             "text": headline,
             "spoken": spoken,
             "speak": True,

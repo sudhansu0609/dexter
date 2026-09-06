@@ -173,6 +173,102 @@ def parse_when(text: str, base: Optional[datetime] = None) -> Optional[datetime]
             },
         )
         if parsed:
+            # dateparser resolves a bare day like "friday" to midnight on that
+            # day. Returning it would turn "remind me to call mom friday" into an
+            # alarm at 00:00, while the caller believed a real time had been
+            # given. This function's contract is "a moment a reminder can fire";
+            # None means "no time given" and lets the caller ask. Use parse_date
+            # when a day on its own is a complete answer.
+            midnight_with_no_clock = (
+                parsed.hour == 0
+                and parsed.minute == 0
+                and not _RE_CLOCK_SIGNAL.search(lowered)
+            )
+            if not midnight_with_no_clock:
+                return parsed
+
+    return None
+
+
+# Does this phrase name a time of day at all? Used by parse_date to decide
+# whether the timed parser should have first refusal.
+_RE_CLOCK_SIGNAL = re.compile(
+    r"\b\d{1,2}:\d{2}"
+    r"|\d\s*(?:am|pm|a\.m\.|p\.m\.)\b"
+    r"|\b(?:am|pm)\b"
+    r"|\bat\s+\d{1,2}"
+    r"|\b(?:noon|midnight|tonight|morning|afternoon|evening|night)\b"
+    r"|\bin\s+\d+\s*(?:sec|min|hour|hr)",
+    re.IGNORECASE,
+)
+
+
+def parse_date(text: str, base: Optional[datetime] = None) -> Optional[datetime]:
+    """
+    Resolve a spoken expression to a *day*, with no clock time required.
+
+    parse_when() deliberately returns None for "friday" or "tomorrow", because a
+    reminder without a time cannot fire. A due date is the opposite case: "I'll
+    have it done by Friday" is a complete thought, and the commitments in the
+    workbook are dated, not timed. Midnight is returned as the day marker.
+
+    Falls back to parse_when() first, so "friday at 3pm" keeps its time.
+    """
+    if not text:
+        return None
+
+    now = base or datetime.now()
+    lowered = text.strip().lower()
+
+    # Only defer to parse_when when the phrase actually names a time. Otherwise
+    # "in 3 days" would come back stamped with the current clock, and a
+    # commitment would read as due "Wednesday at 11:16 PM".
+    if _RE_CLOCK_SIGNAL.search(lowered):
+        timed = parse_when(text, base=now)
+        if timed is not None:
+            return timed
+
+    def day(offset: int) -> datetime:
+        return (now + timedelta(days=offset)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+    if "day after tomorrow" in lowered:
+        return day(2)
+    if "tomorrow" in lowered:
+        return day(1)
+    if "today" in lowered or "tonight" in lowered:
+        return day(0)
+    if "next week" in lowered:
+        # The start of next week, not seven days from now: "next week" is a
+        # week, and Monday is where people mean it starts.
+        return day(7 - now.weekday())
+    if "end of the week" in lowered or "end of week" in lowered:
+        return day((4 - now.weekday()) % 7)  # Friday
+    if "this week" in lowered:
+        return day((4 - now.weekday()) % 7)
+
+    m = re.search(r"\bin\s+(\d+)\s+days?\b", lowered)
+    if m:
+        return day(int(m.group(1)))
+
+    for name, idx in _WEEKDAYS.items():
+        if re.search(rf"\b(?:next\s+|by\s+|on\s+)?{name}\b", lowered):
+            delta = (idx - now.weekday()) % 7
+            if delta == 0 or "next" in lowered:
+                delta = delta or 7
+            return day(delta)
+
+    if _HAS_DATEPARSER:
+        parsed = dateparser.parse(
+            text,
+            settings={
+                "PREFER_DATES_FROM": "future",
+                "RELATIVE_BASE": now,
+                "RETURN_AS_TIMEZONE_AWARE": False,
+            },
+        )
+        if parsed:
             return parsed
 
     return None

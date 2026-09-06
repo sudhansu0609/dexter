@@ -16,6 +16,8 @@ Proactivity that nags gets disabled, so this is conservative by design:
 
 import hashlib
 import os
+
+import env_boot  # noqa: F401  - loads .env for every entry point
 import time
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional

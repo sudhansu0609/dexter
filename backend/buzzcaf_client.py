@@ -9,6 +9,8 @@ BuzzcafAI API runs on http://localhost:8095 and provides:
 """
 
 import os
+
+import env_boot  # noqa: F401  - loads .env for every entry point
 import shutil
 import sys
 import time
