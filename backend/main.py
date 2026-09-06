@@ -16,19 +16,18 @@ import secrets
 import sys
 import threading
 from contextlib import asynccontextmanager
+from datetime import date
 from typing import Any, Dict, List, Optional
 
 # Ensure backend directory is importable when launched from anywhere.
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-try:
-    from dotenv import load_dotenv
+import env_boot  # noqa: F401  - loads .env for every entry point, not just this one
+import logging_setup
 
-    load_dotenv(
-        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-    )
-except ImportError:
-    pass
+# Before anything else prints: Dexter runs in a WebView2 window with no
+# console, so without this every diagnostic it emits is lost.
+_LOG_PATH = logging_setup.setup()
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
@@ -42,6 +41,8 @@ import cancellation
 import google_tools
 import media_tools
 import router as intent_router
+import runtime_health
+import settings_store
 import voice_pipeline
 import tools_assistant  # noqa: F401  - registers reminder/memory tools
 import windows_tools
@@ -51,10 +52,14 @@ from filesystem_tool import FileSystemTool
 import macros
 import tasks
 import tools_tasks  # noqa: F401  - registers background-task and macro tools
+import tools_workbook  # noqa: F401  - registers goal/commitment/review tools
+import tools_files  # noqa: F401  - registers rename/move/copy/delete
+import tools_web  # noqa: F401  - registers web search and weather
+from workbook import workbook
 from hybrid_llm import llm_router
 from memory import memory
 from scheduler import scheduler
-from tool_registry import all_tools
+from tool_registry import all_tools, execute
 from tools_core import (
     AppLauncherTool,
     PlaywrightBrowserTool,
@@ -115,6 +120,10 @@ async def lifespan(app: FastAPI):
 
     threading.Thread(target=_warm_health, name="dexter-health-warm", daemon=True).start()
 
+    restored = settings_store.load_at_startup()
+    if restored:
+        print(f"[Startup] Applied {restored} saved setting(s).")
+
     scheduler.start()
     armed = scheduler.rearm_planner()
     if armed:
@@ -124,6 +133,23 @@ async def lifespan(app: FastAPI):
         print(f"[Startup] Re-armed {armed_goals} scheduled goal(s).")
 
     print(f"[Startup] Dexter ready with {len(all_tools())} tools.")
+    print(f"[Startup] Logging to {_LOG_PATH}")
+
+    def _report_runtime() -> None:
+        # Dexter used to run a 7B on the CPU at 9s a turn and say nothing about
+        # it. Whatever is degraded, say so at startup with the cause.
+        try:
+            provider = llm_router.resolve_provider("auto")
+            diagnosis = runtime_health.diagnose(
+                provider, llm_router._model_for(provider, None), llm_router.ollama_url,
+                force=True,
+            )
+            for line in runtime_health.summary_lines(diagnosis):
+                print(f"[Startup] DEGRADED: {line}")
+        except Exception as exc:
+            print(f"[Startup] Runtime check skipped: {exc}")
+
+    threading.Thread(target=_report_runtime, name="dexter-runtime-check", daemon=True).start()
     yield
     scheduler.shutdown()
 
@@ -303,12 +329,22 @@ async def get_status():
     notes = await run_in_threadpool(sticky_notes.list_notes)
     buzzcaf_status = await run_in_threadpool(buzzcaf_client.get_status)
 
+    active_provider = llm_router.resolve_provider("auto")
+    runtime = await run_in_threadpool(
+        runtime_health.diagnose,
+        active_provider,
+        llm_router._model_for(active_provider, None),
+        llm_router.ollama_url,
+    )
+
     return {
         "status": "online",
         "assistantName": "Dexter Super Assistant",
         "version": "2.0.0",
         "providers": providers,
         "preferredProvider": llm_router.default_provider,
+        "runtime": runtime,
+        "voiceDebug": _voice_debug,
         "toolCount": len(all_tools()),
         "intentMode": intent_router._embedder.mode,
         "appsIndexed": app_index.size(),
@@ -318,6 +354,7 @@ async def get_status():
         "notesCount": len(notes),
         "scheduler": scheduler.status(),
         "memory": memory.stats(),
+        "workbook": workbook.stats(),
         "integrations": {
             "windows": windows_tools.availability(),
             "media": media_tools.availability(),
@@ -622,6 +659,32 @@ def _ws_authorized(ws: WebSocket) -> bool:
     return bool(supplied) and secrets.compare_digest(supplied, SESSION_TOKEN)
 
 
+# Lightweight capture diagnostics so "the mic isn't heard" can be checked from
+# /status: if `peak` stays ~0 while the user speaks, no real audio is arriving
+# (suspended AudioContext, muted/wrong device) rather than a wake/STT problem.
+_voice_debug: Dict[str, Any] = {
+    "connected": False,
+    "frames": 0,
+    "peak": 0,        # loudest sample seen this run (int16, 0-32767)
+    "lastPeak": 0,    # loudest sample in the most recent frame
+}
+
+
+def _record_voice_debug(data: bytes) -> None:
+    try:
+        import numpy as np
+
+        arr = np.frombuffer(data, dtype=np.int16)
+        if arr.size:
+            peak = int(np.abs(arr).max())
+            _voice_debug["frames"] += 1
+            _voice_debug["lastPeak"] = peak
+            if peak > _voice_debug["peak"]:
+                _voice_debug["peak"] = peak
+    except Exception:
+        pass
+
+
 @app.websocket("/api/dexter/voice/ws")
 async def voice_socket(ws: WebSocket):
     """
@@ -637,7 +700,10 @@ async def voice_socket(ws: WebSocket):
 
     session_id = ws.query_params.get("session") or "default"
     vsession = voice_pipeline.VoiceSession(session=session_id)
-    await ws.send_json({"type": "status", **voice_pipeline.capabilities()})
+    _voice_debug["connected"] = True
+    caps = voice_pipeline.capabilities()
+    print(f"[Voice WS] Mic connected (session={session_id}): {caps}")
+    await ws.send_json({"type": "status", **caps})
 
     try:
         while True:
@@ -647,6 +713,7 @@ async def voice_socket(ws: WebSocket):
 
             data = msg.get("bytes")
             if data is not None:
+                _record_voice_debug(data)
                 events = await run_in_threadpool(vsession.feed, data)
                 for event in events:
                     await ws.send_json(event)
@@ -664,7 +731,7 @@ async def voice_socket(ws: WebSocket):
                 elif kind == "reset":
                     vsession.reset()
     except WebSocketDisconnect:
-        pass
+        print(f"[Voice WS] Mic disconnected (session={session_id}).")
     except Exception as exc:
         print(f"[Voice WS] closed on error: {exc}")
 
@@ -748,6 +815,20 @@ async def delete_memory(key: str):
     return {"success": memory.forget(key)}
 
 
+@app.get("/api/dexter/memory/history")
+async def get_history(session: str = "default", limit: int = 20):
+    """
+    The recent conversation, so the UI can resume the thread on launch.
+
+    The turns were always persisted and fed to the model, but there was no way
+    to read them back - so every relaunch showed a blank welcome while Dexter
+    itself remembered the conversation. That mismatch read as amnesia.
+    """
+    limit = max(1, min(int(limit), 100))
+    turns = await run_in_threadpool(memory.recent_turns, limit, session)
+    return {"session": session, "turns": turns}
+
+
 @app.post("/api/dexter/memory/history/clear")
 async def clear_history(session: str = "default"):
     return {"cleared": memory.clear_history(session)}
@@ -775,6 +856,96 @@ class TaskSubmitRequest(BaseModel):
 
 class TaskConfirmRequest(BaseModel):
     approve: bool = True
+
+
+# ───────────────────────── workbook ─────────────────────────
+
+
+class CommitmentRequest(BaseModel):
+    text: str
+    when: Optional[str] = None
+    goal: Optional[str] = None
+
+
+class GoalRequest(BaseModel):
+    title: str
+    why: Optional[str] = ""
+
+
+class CloseOutRequest(BaseModel):
+    note: Optional[str] = ""
+    rollUnfinished: Optional[bool] = True
+
+
+@app.get("/api/dexter/workbook")
+async def get_workbook():
+    """Today, the goals it serves, and what is slipping - the cockpit view."""
+    def snapshot():
+        return {
+            "today": workbook.today(),
+            "goals": workbook.list_goals(status="active"),
+            "slipping": workbook.slipping(),
+            "stats": workbook.stats(),
+            "closedOut": workbook.was_closed_out(date.today().isoformat()),
+        }
+
+    return await run_in_threadpool(snapshot)
+
+
+@app.get("/api/dexter/workbook/review")
+async def get_workbook_review():
+    return await run_in_threadpool(workbook.scorecard)
+
+
+@app.post("/api/dexter/workbook/goals")
+async def create_goal(req: GoalRequest):
+    return await run_in_threadpool(workbook.add_goal, req.title, req.why or "")
+
+
+@app.post("/api/dexter/workbook/commitments")
+async def create_commitment(req: CommitmentRequest):
+    # Route through the tool rather than the store so the UI and the voice path
+    # share one set of rules (date parsing, goal matching, the spoken summary).
+    result = await run_in_threadpool(
+        execute, "make_commitment",
+        {"text": req.text, "when": req.when or "", "goal": req.goal or ""},
+    )
+    return {"ok": result.ok, "summary": result.summary, **result.data}
+
+
+@app.post("/api/dexter/workbook/commitments/{commitment_id}/done")
+async def finish_commitment(commitment_id: int):
+    return await run_in_threadpool(workbook.complete_commitment, commitment_id, "")
+
+
+@app.post("/api/dexter/workbook/commitments/{commitment_id}/roll")
+async def move_commitment(commitment_id: int):
+    return await run_in_threadpool(workbook.roll_commitment, commitment_id, None)
+
+
+@app.post("/api/dexter/workbook/close-out")
+async def close_out_today(req: CloseOutRequest):
+    return await run_in_threadpool(
+        workbook.close_out, None, bool(req.rollUnfinished), req.note or ""
+    )
+
+
+# ───────────────────────── settings ─────────────────────────
+
+
+class SettingsUpdate(BaseModel):
+    changes: Dict[str, Any]
+
+
+@app.get("/api/dexter/settings")
+async def read_settings():
+    """The tunable knobs, their current values, and whether each applies live."""
+    return {"settings": await run_in_threadpool(settings_store.describe)}
+
+
+@app.post("/api/dexter/settings")
+async def write_settings(req: SettingsUpdate):
+    return await run_in_threadpool(settings_store.update, req.changes)
 
 
 @app.get("/api/dexter/tasks/scheduled")

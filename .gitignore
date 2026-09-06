@@ -39,3 +39,12 @@ data/tasks.json
 data/scheduled_tasks.json
 *.corrupt
 test_kokoro_dexter.wav
+
+# Runtime log
+data/dexter.log
+data/dexter.log.*
+
+# Workbook + settings runtime state
+data/dexter_workbook.db
+data/dexter_workbook.db-*
+data/settings.json

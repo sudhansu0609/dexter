@@ -13,7 +13,17 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 from typing import Any
+
+# os.replace is atomic on Windows but not immune to sharing violations: an
+# antivirus scanner, the search indexer, or a concurrent reader holding the
+# destination open makes it raise PermissionError (WinError 5/32). That surfaced
+# as a silently dropped save - the planner, reminders, and task state just did
+# not persist. The handles are held for milliseconds, so a short bounded retry
+# turns a lost write into a slightly delayed one.
+_REPLACE_ATTEMPTS = 5
+_REPLACE_BACKOFF_SECONDS = 0.05
 
 _locks: dict = {}
 _locks_guard = threading.Lock()
@@ -25,6 +35,18 @@ def _lock_for(path: str) -> threading.Lock:
         if key not in _locks:
             _locks[key] = threading.Lock()
         return _locks[key]
+
+
+def _replace_with_retry(tmp_path: str, path: str) -> None:
+    """os.replace, retried through transient Windows sharing violations."""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF_SECONDS * (attempt + 1))
 
 
 def load_json(path: str, default: Any) -> Any:
@@ -70,7 +92,7 @@ def save_json(path: str, data: Any) -> bool:
                 json.dump(data, handle, indent=2, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(tmp_path, path)
+            _replace_with_retry(tmp_path, path)
             return True
         except Exception as exc:
             print(f"[jsonstore] Could not write {path}: {exc}")

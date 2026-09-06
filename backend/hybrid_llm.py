@@ -16,6 +16,8 @@ design choices here:
 
 import json
 import os
+
+import env_boot  # noqa: F401  - loads .env for every entry point
 import re
 import threading
 import time

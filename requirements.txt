@@ -23,6 +23,8 @@ sentence-transformers
 sqlite-vec
 
 # ── Desktop shell (backend/desktop_app.py) ──
+# NOT optional: start_dexter.bat launches desktop_app.py, which imports this.
+# Preflight now fails loudly if it is missing rather than dying at launch.
 pywebview
 
 # ── Optional cloud providers (only used if a key is set in .env) ──
@@ -54,3 +56,11 @@ silero-vad       # voice-activity detection (pulls in torch)
 
 # ── Tests ──
 pytest
+
+# ── File mutation (rename/move/copy/delete) ──
+# Delete goes to the Recycle Bin and refuses outright without this - an
+# assistant acting on a misheard command must never delete irreversibly.
+send2trash
+
+# ── Web search and weather (keyless, matching the local-first stance) ──
+ddgs             # DuckDuckGo search; without it web_search reports unavailable
