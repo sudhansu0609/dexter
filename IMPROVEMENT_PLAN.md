@@ -1,3 +1,7 @@
+> **Superseded by [`PLAN.md`](PLAN.md) (Roadmap v4) on 2026-08-23.** Phases 0-6
+> here are complete; this file is kept for history. Current work is tracked in
+> [`PROGRESS.md`](PROGRESS.md).
+
 # Dexter Roadmap v3 — From Rebuilt Assistant to Local-First Jarvis
 
 **Status date:** 2026-08-19

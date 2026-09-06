@@ -14,6 +14,19 @@ npm install && npm run build
 start_dexter.bat                     # native WebView2 window
 ```
 
+`start_dexter.bat` runs a **preflight check** first and refuses to launch on a
+real failure. Run it on its own any time you want to know whether Dexter can
+actually work:
+
+```bash
+python backend/preflight.py          # deps, model, GPU, voice, reminders
+npm run check                        # preflight + pytest + tsc + vitest
+```
+
+It reports the degradations that used to be silent — a missing APScheduler
+(reminders stored but never fired), a model that has fallen back to the CPU
+because something else holds the GPU, Kokoro assets it cannot find.
+
 Or run the pieces separately:
 
 ```bash
@@ -33,6 +46,47 @@ Dexter is local-first. Load a model in LM Studio with solid **function calling**
 from `/models`, so there is nothing to configure after you swap it.
 
 ---
+
+## The workbook — goals, commitments, and an honest week
+
+Dexter's day planner used to be a flat list of today's `{time, title, done}`:
+completed items were erased at midnight, and unfinished ones rolled forward
+forever, unchanged and unremarked. There was nothing to plan against, nothing to
+be held to, and no record of what actually happened.
+
+The workbook (`backend/workbook.py`) is the model of your work that everything
+else now reads from:
+
+```
+Goal         the outcome you want            "ship the channel relaunch"
+ └─ Project  a body of work under a goal     "record 8 videos"
+     └─ Commitment  something you said       "script ep.3 by Friday"
+         └─ Entry   what actually happened   "worked 90m, blocked on b-roll"
+```
+
+```
+"my goal this quarter is to ship the channel relaunch"
+"I'm committing to scripting episode three by Friday"
+"log that I worked ninety minutes on the edit"
+"what did I say I'd do today"        "what's due this week"
+"I finished scripting episode three" "push the edit to tomorrow"
+"what am I avoiding"                 "close out my day"   "how was my week"
+```
+
+Three things it does that a to-do list cannot:
+
+- **Rolling is counted.** Move something four times and Dexter says so, and asks
+  whether it is still real. A task you have been avoiding for a week must not
+  look like one written down this morning.
+- **Completed work survives the day.** The weekly scorecard reports what you
+  kept, what slipped, where the hours went, and — most usefully — which goals
+  got no attention at all.
+- **The day ends deliberately.** An evening check-in at 21:00 asks you to close
+  out; 23:50 records the day regardless so nothing is lost silently; Sunday
+  evening runs the review.
+
+All of it answers at **Tier 1**, in tens of milliseconds, without touching the
+language model.
 
 ## Architecture
 
@@ -79,7 +133,13 @@ Measured on this machine: Tier 0/1 answer in **3–30ms**; time-to-first-audio i
 | `hybrid_llm.py` | Provider routing, cached health, tool calling, streaming |
 | `timeparse.py` | Natural-language times ("in 20 minutes", "every weekday at 9") |
 | `app_index.py` | One-time scan of installed apps → instant launches |
-| `jsonstore.py` | Atomic JSON reads/writes |
+| `jsonstore.py` | Atomic JSON reads/writes (retried through Windows sharing violations) |
+| `workbook.py` | Goals, projects, commitments, entries — the spine of the planner/coach |
+| `runtime_health.py` | Detects and explains a degraded runtime (model on CPU, VRAM taken) |
+| `settings_store.py` | Runtime-tunable settings that apply without a restart |
+| `preflight.py` | Pre-launch check: deps, model, GPU, voice, reminders |
+| `logging_setup.py` | Rotating `data/dexter.log`; stdout/stderr tee'd into it |
+| `env_boot.py` | Loads `.env` for every entry point, not just the server |
 
 ---
 
@@ -167,17 +227,21 @@ hint that the speech layer honours.
 
 ### Listening
 
-- **Wake word** `"Dexter …"`, plus a **9-second follow-up window** after Dexter
-  speaks during which no wake word is needed — so "open chrome" → "now make it
-  full screen" works the way a conversation does.
+- **Wake word: say “hey Jarvis”.** Not “Dexter” — openWakeWord ships no Dexter
+  phrase and training one was deliberately skipped, so the stock `hey_jarvis`
+  model is what actually listens. Change it with `DEXTER_WAKEWORD_MODEL`
+  (another pretrained phrase, or a path to your own `.onnx`).
+- A **9-second follow-up window** after Dexter speaks, during which no wake word
+  is needed — so "open chrome" → "now make it full screen" works the way a
+  conversation does (`DEXTER_FOLLOWUP_WINDOW`).
 - **Barge-in**: "stop" / "quiet" / "cancel" interrupts mid-sentence and clears
-  the queued audio.
-- **Echo suppression**: mic aborts while speaking, 1.2s cooldown, and a
-  self-echo filter against the last spoken text.
+  the queued audio. **Off by default** (half-duplex) because Dexter used to
+  answer its own TTS echo; enable with `DEXTER_VOICE_BARGE_IN=1`.
+- **Echo suppression**: mic aborts while speaking, a cooldown
+  (`DEXTER_ECHO_GUARD_MS`), and a self-echo filter against the last spoken text.
 
-Still open on the input side: server-side wake word (Porcupine) and VAD would
-beat the current cooldown heuristics; the browser Speech API is also the weakest
-link in noisy rooms.
+The pipeline is fully local — openWakeWord → silero-vad → faster-whisper. The
+browser recognizer remains an automatic fallback when those deps are missing.
 
 ---
 
@@ -216,8 +280,10 @@ The token is stored at `data/google_token.json` and is gitignored.
 ## Testing
 
 ```bash
-pytest backend/test_router.py -v     # 90 routing tests, no server needed
-python test_dexter_suite.py          # 20 live end-to-end checks (server must be up)
+npm run check                        # everything: preflight, pytest, tsc, vitest
+pytest backend -q                    # 307 backend tests, no server needed
+npx vitest run                       # frontend smoke tests
+python test_dexter_suite.py          # live end-to-end checks (server must be up)
 ```
 
 `test_router.py` is the contract for intent handling. A new tool's example
@@ -249,15 +315,43 @@ pip install sentence-transformers
 
 ---
 
+## Settings
+
+The gear icon in the title bar changes voice, model, and behaviour settings
+**while Dexter is running** — barge-in, the follow-up window, echo guard, wake
+word sensitivity, preferred backend, the fast-model tier, proactive suggestions,
+and quiet hours. Anything that genuinely needs a restart says so instead of
+looking applied. Values persist in `data/settings.json` and override `.env`.
+
+## When something is wrong
+
+Dexter now tells you rather than just feeling slow:
+
+- A `[Startup] DEGRADED:` line, a `runtime` block on `/api/dexter/status`, and a
+  banner in the window whenever the model has fallen back to the CPU — naming
+  the process holding the GPU and how much VRAM is short.
+- `data/dexter.log` (rotating) captures startup, routing, tool calls, and
+  uncaught exceptions. Dexter runs in a WebView2 window with no console, so
+  before this every diagnostic it printed went nowhere.
+
 ## Security notes
 
 - The server binds **127.0.0.1** by default. The filesystem endpoints are
   unauthenticated, so do not bind `0.0.0.0` without adding auth first.
 - `.env` is gitignored (it was previously tracked — commit `.env.example` instead).
-- Tools marked `confirm=True` (`send_email`, `write_file`, `close_window`,
-  `sleep_pc`, `forget_fact`, `connect_google`) ask before running.
+- Tools marked `confirm=True` ask before running: `send_email`, `reply_to_email`,
+  `write_file`, `rename_file`, `move_file`, `copy_file`, `delete_file`,
+  `cancel_event`, `reschedule_event`, `close_window`, `sleep_pc`, `forget_fact`,
+  `connect_google`, `run_skill`.
+- `delete_file` sends to the Recycle Bin and **refuses outright** if `send2trash`
+  is missing. An assistant acting on an occasionally-misheard command has no
+  business deleting anything permanently.
+- Every file path — source *and* destination — is canonicalised and checked
+  against the `pathguard` allowlist. An unchecked destination on a move would be
+  an escape hatch out of it.
 
 Still open, by design of the current scope: API-key auth on the endpoints, a
 filesystem path allowlist, and removing `shell=True` from the launcher paths —
-all scheduled in [`IMPROVEMENT_PLAN.md`](IMPROVEMENT_PLAN.md) (Roadmap v3, the
-single living plan for everything above and beyond).
+all tracked in [`PLAN.md`](PLAN.md) (Roadmap v4) with the running record in
+[`PROGRESS.md`](PROGRESS.md). `IMPROVEMENT_PLAN.md` is Roadmap v3, complete and
+kept for history.
