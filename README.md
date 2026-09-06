@@ -138,6 +138,7 @@ which model server is up (see `ECOSYSTEM.md`) and streams its reply.
 | `mission.py` / `companion.py` / `tools_mission.py` | The mission, Dexter's stance and voice, check-ins, coaching tails (v7) |
 | `initiative.py` | Proposes the next move; the You lead / Dexter leads switch (v7) |
 | `activity.py` / `tools_activity.py` | What you are working on: foreground window sessions + recently changed files (v7) |
+| `claude_sessions.py` / `tools_claude.py` | What you and Claude Code did, from its transcripts (read-only) (v7) |
 | `knowledge_ingest.py` | Indexes your folders (md/txt/pdf/docx/csv, Studio JSON) into `memory.documents` with citations |
 | `user_profile.py` | `data/profile.json`: who you are, your channels; injected into every prompt |
 | `windows_tools.py` | Volume, brightness, clipboard, screenshots, windows, lock |
@@ -219,6 +220,12 @@ Dexter is a coworker on one mission, not a command line with notifications.
   and a long stretch in a work app on something that is not today's win gets
   one question. Settings → Activity awareness turns it off; the log stays on
   this PC for seven days.
+- **It knows what you did in Claude Code.** Dexter reads Claude Code's own
+  transcripts under `~/.claude/projects` (read-only, it never runs Claude):
+  "what was I doing in claude", "what did claude change in dexter", "show me
+  the last claude session" answer with the project, what you asked, the files
+  Claude wrote, the commands it ran and its last words. A session in progress
+  shows on the Right now line. Settings → Read Claude Code's logs turns it off.
 - **It keeps the thread.** What you say today is in the model's context; a
   finished code job or a Studio step waiting for approval arrives as a
   message with "Approve" / "Check it first", not a banner.

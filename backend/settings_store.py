@@ -91,6 +91,12 @@ SETTINGS: List[Setting] = [
         module="activity", attr="ENABLED", group="behaviour",
     ),
     Setting(
+        "claudeLog", "DEXTER_CLAUDE_LOG", "bool", True,
+        "Read Claude Code's logs",
+        "Let Dexter read ~/.claude/projects to know what you and Claude did there (read-only; Dexter never runs Claude Code).",
+        module="claude_sessions", attr="ENABLED", group="behaviour",
+    ),
+    Setting(
         "quietHours", "DEXTER_QUIET_HOURS", "string", "",
         "Quiet hours",
         "When Dexter stays silent, e.g. 22:00-07:00.",

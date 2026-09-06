@@ -59,6 +59,7 @@ import tools_browser  # noqa: F401  - registers Dexter's browser tools (v6)
 import tools_code  # noqa: F401  - registers buzzcode + local engine tools (v6)
 import tools_mission  # noqa: F401  - registers the mission tools (v7)
 import tools_activity  # noqa: F401  - registers what-am-I-doing (v7)
+import tools_claude  # noqa: F401  - registers the Claude Code log readers (v7)
 import activity
 import companion
 import mission

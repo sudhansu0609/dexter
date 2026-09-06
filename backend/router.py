@@ -225,6 +225,27 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         "add_task",
         lambda m: {"title": m.group(1).strip(" .!")},
     ),
+    # ── Claude Code's logs (v7) ──
+    (
+        re.compile(r"^(?:show\s+me\s+|tell\s+me\s+about\s+)?(?:the\s+)?(?:last|latest)\s+claude(?:\s+code)?\s+session\W*$|^what\s+was\s+claude'?s\s+last\s+(?:message|reply)\W*$", re.I),
+        "claude_session",
+        lambda m: {"which": "last"},
+    ),
+    (
+        re.compile(r"^(?:what\s+happened\s+in|show\s+me|tell\s+me\s+about)\s+the\s+claude(?:\s+code)?\s+session\s+(?:on|about|for|in)\s+(.+?)\W*$", re.I),
+        "claude_session",
+        lambda m: {"which": m.group(1).strip()},
+    ),
+    (
+        re.compile(
+            r"^(?:what\s+(?:was|am)\s+i\s+doing\s+in\s+claude(?:\s+code)?|what\s+(?:did|has)\s+claude(?:\s+code)?\s+(?:do|done|change|been\s+(?:doing|working\s+on)|work\s+on)|"
+            r"what\s+did\s+i\s+ask\s+claude(?:\s+code)?|claude(?:\s+code)?\s+sessions?)"
+            r"(?:\s+(?:in|on|for)\s+(?P<project>[\w.-]+))?(?:\s+(?P<when>today|yesterday|this\s+week))?(?:\s+(?:in|on|for)\s+(?P<project2>[\w.-]+))?\W*$",
+            re.I,
+        ),
+        "claude_activity",
+        lambda m: {"when": (m.group("when") or "today").lower(), "project": m.group("project") or m.group("project2")},
+    ),
     # ── activity awareness (v7) ──
     (
         re.compile(r"^(?:what\s+(?:am|was)\s+i\s+(?:doing|working on|on)(?:\s+(?:right\s+)?now)?|where\s+was\s+i|what\s+(?:did|do)\s+i\s+have\s+open|what\s+have\s+i\s+been\s+(?:doing|working\s+on))\W*$", re.I),

@@ -46,6 +46,7 @@ bridge keep running); `Ctrl+Alt+D` or the tray icon brings it back.
 | `DEXTER_CODE_ROOTS` | dexter `.env` | Folders whose child repositories buzzcode may work in, default `B:\youtubeProjects\Buzzcaf_Media` |
 | `BUZZCODE_BIN` | dexter `.env` | buzzcode executable, default `~/.cargo/bin/buzzcode.exe` |
 | `DEXTER_CHECKINS`, `DEXTER_MIDDAY_HOUR` | dexter `.env` / settings | Dexter's own check-ins in the chat (v7); `1` (default) on; midday hour default 13 |
+| `DEXTER_CLAUDE_LOG`, `CLAUDE_PROJECTS_DIR` | dexter `.env` / settings | Read Claude Code's transcripts (`~/.claude/projects`), default on; Dexter never runs Claude Code |
 | `DEXTER_ACTIVITY`, `DEXTER_ACTIVITY_ROOTS` | dexter `.env` / settings | Activity awareness (foreground window + recently changed files), default on; extra roots to watch, default `B:\youtubeProjects` |
 | `GEMINI_API_KEY`, `OPENAI_API_KEY` | both | Cloud fallbacks |
 

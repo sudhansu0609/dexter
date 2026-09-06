@@ -438,6 +438,14 @@ def now_line(log: Optional["ActivityLog"] = None) -> str:
     if files:
         f = files[0]
         parts.append(f"last saved {f['name']} ({f['project']}) {f['minutes_ago']} min ago" if f["minutes_ago"] else f"just saved {f['name']} ({f['project']})")
+    try:
+        import claude_sessions
+
+        fragment = claude_sessions.now_fragment()
+        if fragment:
+            parts.append(fragment)
+    except Exception:
+        pass
     return " · ".join(parts)
 
 
@@ -452,6 +460,12 @@ def context_lines(log: Optional["ActivityLog"] = None) -> List[str]:
     files = log.recent_files(hours=3, limit=4)
     if files:
         lines.append("Recently saved: " + "; ".join(f"{f['name']} in {f['project']} ({f['minutes_ago']} min ago)" for f in files))
+    try:
+        import claude_sessions
+
+        lines.extend(claude_sessions.context_lines())
+    except Exception:
+        pass
     start, _ = _day_bounds(date.today())
     totals = log.totals(start)
     if totals["minutes"]:
@@ -475,6 +489,14 @@ def narrative(when: str = "now", log: Optional["ActivityLog"] = None) -> str:
             where = f"{current['app']}" + (f" on {current['project']}" if current["project"] else "")
             title = f", window '{current['title']}'" if current["title"] else ""
             parts.append(f"You're in {where}{title}, {_mins(current['minutes'])} so far.")
+        try:
+            import claude_sessions
+
+            live = claude_sessions.active_session()
+            if live:
+                parts.append(f"Claude Code is open on {live['project']}: '{live['title']}'.")
+        except Exception:
+            pass
         if files:
             parts.append("Recently saved: " + "; ".join(f"{f['name']} in {f['project']} ({f['minutes_ago']} min ago)" for f in files) + ".")
         start, _ = _day_bounds(date.today())
