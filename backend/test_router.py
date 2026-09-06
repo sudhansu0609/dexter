@@ -307,3 +307,70 @@ def test_emotions_differ_in_speed():
     calm = build_delivery("y", long_form=True)
     assert urgent.speed > 1.0 > calm.speed
     assert urgent.blend_with != calm.blend_with
+
+
+# ───────────────────────── tiered fast/smart models ─────────────────────────
+
+
+def _stub_earlier_tiers(monkeypatch, router):
+    """Force a message past chitchat/fast-path/semantic so it reaches Tier 1.5."""
+    monkeypatch.setattr(router, "chitchat", lambda t: None)
+    monkeypatch.setattr(router, "fast_path", lambda t: None)
+    monkeypatch.setattr(router, "semantic_match", lambda t: None)
+    monkeypatch.setattr(router.llm_router, "resolve_provider", lambda p="auto": "ollama")
+
+
+def test_fast_tier_answers_simple_turn(monkeypatch):
+    import router
+    from hybrid_llm import LLMResponse
+
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    _stub_earlier_tiers(monkeypatch, router)
+
+    captured = {}
+
+    def fake_chat(messages, **kw):
+        captured["model"] = kw.get("model")
+        captured["tools"] = kw.get("tools")
+        return LLMResponse(provider="ollama", content="The moon is ~384,400 km away.")
+
+    monkeypatch.setattr(router.llm_router, "chat", fake_chat)
+    monkeypatch.setattr(
+        router, "agent_loop",
+        lambda *a, **k: pytest.fail("simple turn must not escalate to agent_loop"),
+    )
+
+    res = router.route("tell me a fun fact about the moon")
+    assert res.action == "fast_chat"
+    assert "moon" in res.reply.lower()
+    assert captured["model"] == "fast-model"   # answered by the small model
+    assert captured["tools"] is None           # fast pass carries no tools
+
+
+def test_fast_tier_escalates_to_smart_model(monkeypatch):
+    import router
+    from hybrid_llm import LLMResponse
+
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "SMART_MODEL", "smart-model")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(
+        router.llm_router, "chat",
+        lambda messages, **kw: LLMResponse(provider="ollama", content="<ESCALATE>"),
+    )
+
+    seen = {}
+
+    def fake_agent(message, **kw):
+        seen["provider"] = kw.get("provider")
+        seen["model"] = kw.get("model")
+        return router.RouteResult(reply="done", action="agent")
+
+    monkeypatch.setattr(router, "agent_loop", fake_agent)
+
+    res = router.route("open my email and summarise the latest three")
+    assert res.action == "agent"
+    assert seen["provider"] == "ollama"       # pinned to the resolved backend
+    assert seen["model"] == "smart-model"     # escalated to the bigger model

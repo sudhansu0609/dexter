@@ -38,6 +38,12 @@ class ScriptedLLM:
             return self.responses.pop(0)
         return self.responses[0]
 
+    def resolve_provider(self, provider="auto"):
+        # The tiered fast-model path pins both passes to one resolved backend.
+        # Stubbed so these tests exercise the same route() branch the app takes
+        # when DEXTER_FAST_MODEL is configured, instead of silently skipping it.
+        return provider if provider and provider != "auto" else "ollama"
+
 
 def answer(text):
     return LLMResponse(content=text, provider="fake", model="fake")
@@ -67,6 +73,18 @@ def use_llm(monkeypatch, *responses):
     llm = ScriptedLLM(responses)
     monkeypatch.setattr(router, "llm_router", llm)
     return llm
+
+
+@pytest.fixture()
+def no_tiering(monkeypatch):
+    """Route straight to Tier 2, bypassing the fast-model tier.
+
+    These tests assert Tier-2 behaviour. Whether the fast tier is configured is
+    a machine-local .env choice (DEXTER_FAST_MODEL), so pin it off here rather
+    than letting the suite's meaning depend on the developer's environment.
+    The fast tier has its own tests below.
+    """
+    monkeypatch.setattr(router, "FAST_MODEL", "")
 
 
 # ───────────────────────── plain answers ─────────────────────────
@@ -238,7 +256,7 @@ def test_pending_confirmation_expires(monkeypatch, executed):
 # ───────────────────────── fast-path fall-through (bug 4) ─────────────────────────
 
 
-def test_fast_rule_with_unusable_args_falls_through(monkeypatch, executed):
+def test_fast_rule_with_unusable_args_falls_through(monkeypatch, executed, no_tiering):
     # "remind me ..." matches the reminder rule, but without a parseable time
     # the arg builder returns None. Bug 4 made fast_path return None for the
     # whole tier immediately; the fix keeps trying later rules/tiers.
