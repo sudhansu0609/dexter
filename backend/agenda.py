@@ -10,6 +10,7 @@ commitment; completing one completes the commitment.
 """
 
 import os
+import re
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional
 
@@ -148,12 +149,31 @@ def add(title: str, when: Optional[str] = None) -> Dict[str, Any]:
     return item
 
 
+_STOPWORDS = {"the", "a", "an", "to", "of", "for", "on", "in", "and", "my", "our", "this", "that", "it", "with", "at", "is"}
+
+
+def _strong_match(needle: str, text: str) -> bool:
+    """Substring either way, or most of the meaningful words shared. 'the' alone never matches."""
+    n, t = needle.lower().strip(), text.lower().strip()
+    if not n or not t:
+        return False
+    if n in t or t in n:
+        return True
+    n_words = {w for w in re.findall(r"[a-z0-9]+", n) if w not in _STOPWORDS}
+    t_words = {w for w in re.findall(r"[a-z0-9]+", t) if w not in _STOPWORDS}
+    shared = n_words & t_words
+    return len(shared) >= 2 and len(shared) * 2 >= min(len(n_words), len(t_words))
+
+
 def find(needle: str) -> Optional[Dict[str, Any]]:
     needle = (needle or "").strip()
     if needle.startswith("c-") and needle[2:].isdigit():
         found = workbook.get_commitment(int(needle[2:]))
         return found or None
-    return workbook.find_commitment(needle, status="open")
+    for commitment in workbook.list_commitments(status="open"):
+        if _strong_match(needle, commitment.get("text", "")):
+            return commitment
+    return None
 
 
 def complete(needle: str, note: str = "") -> Optional[Dict[str, Any]]:

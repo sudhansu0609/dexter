@@ -45,6 +45,7 @@ bridge keep running); `Ctrl+Alt+D` or the tray icon brings it back.
 | `DEXTER_BROWSER_CDP` | dexter `.env` | Attach to an existing Chrome (`http://127.0.0.1:9222`) instead of launching Dexter's window |
 | `DEXTER_CODE_ROOTS` | dexter `.env` | Folders whose child repositories buzzcode may work in, default `B:\youtubeProjects\Buzzcaf_Media` |
 | `BUZZCODE_BIN` | dexter `.env` | buzzcode executable, default `~/.cargo/bin/buzzcode.exe` |
+| `DEXTER_CHECKINS`, `DEXTER_MIDDAY_HOUR` | dexter `.env` / settings | Dexter's own check-ins in the chat (v7); `1` (default) on; midday hour default 13 |
 | `GEMINI_API_KEY`, `OPENAI_API_KEY` | both | Cloud fallbacks |
 
 ## Control API: Dexter tool → Studio route
@@ -84,6 +85,7 @@ BuzzBrain → Studio: `POST /api/buzzbrain/snapshot` (5.1).
 | Dexter memory (conversations, facts, summaries, documents) | `dexter/data/dexter_memory.db` |
 | Dexter workbook (goals, commitments) | `dexter/data/dexter_workbook.db` |
 | Dexter profile | `dexter/data/profile.json` |
+| Dexter mission (north star, focus, today's win, blockers, wins) | `dexter/data/mission.json` |
 | Dexter knowledge index | `documents` + `ingest_sources` tables in `dexter_memory.db` |
 | Dexter notes | the `notes` knowledge root, default `dexter/data/notes/*.md` |
 | Dexter browser profile, screenshots, code-job logs | `dexter/data/browser_profile/`, `data/screenshots/`, `data/code_jobs/` |

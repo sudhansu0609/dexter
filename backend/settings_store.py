@@ -79,6 +79,12 @@ SETTINGS: List[Setting] = [
         module="proactive", attr=None, group="behaviour",
     ),
     Setting(
+        "checkins", "DEXTER_CHECKINS", "bool", True,
+        "Check-ins",
+        "Let Dexter start the conversation: the morning plan, midday progress, the evening close-out.",
+        module="companion", attr="ENABLED", group="behaviour",
+    ),
+    Setting(
         "quietHours", "DEXTER_QUIET_HOURS", "string", "",
         "Quiet hours",
         "When Dexter stays silent, e.g. 22:00-07:00.",

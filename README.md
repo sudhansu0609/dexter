@@ -135,6 +135,7 @@ which model server is up (see `ECOSYSTEM.md`) and streams its reply.
 | `code_agent.py` / `tools_code.py` | buzzcode jobs in your repos; start/stop the llama-server on 8089 |
 | `tools_assistant.py` | Reminders, memory, time |
 | `agenda.py` | Today, composed from the workbook + reminders + calendar |
+| `mission.py` / `companion.py` / `tools_mission.py` | The mission, Dexter's stance and voice, check-ins, coaching tails (v7) |
 | `knowledge_ingest.py` | Indexes your folders (md/txt/pdf/docx/csv, Studio JSON) into `memory.documents` with citations |
 | `user_profile.py` | `data/profile.json`: who you are, your channels; injected into every prompt |
 | `windows_tools.py` | Volume, brightness, clipboard, screenshots, windows, lock |
@@ -181,6 +182,27 @@ for Tier 1. Then add a case to `backend/test_router.py` so the phrasing is
 protected against drift as more tools are added.
 
 ---
+
+## Working with Dexter (v7)
+
+Dexter is a coworker on one mission, not a command line with notifications.
+
+- **Tell it the mission once.** "our mission is to get Beyond3Baje to 100k
+  subscribers", "this week's focus is the Bhangarh script", "today's win is
+  recording the voiceover". The Mission card above the chat shows them; empty
+  slots start the sentence for you.
+- **It speaks first, in the chat.** A morning message (at 06:00, or when you
+  open Dexter during the day): yesterday in a line, what we committed to, what
+  slipped, and one question: what makes today a win? A midday check on that
+  win, an evening close-out, a Sunday review. Answer with a tap or a word:
+  "done", "on it", "stuck", "later". "not now" pauses check-ins for two hours;
+  Settings → Check-ins turns them off.
+- **It coaches, briefly.** Finishing something reports the day's progress;
+  adding a task while an older one is overdue names it; something moved three
+  times gets a "break it down or drop it". One sentence, never a lecture.
+- **It keeps the thread.** What you say today is in the model's context; a
+  finished code job or a Studio step waiting for approval arrives as a
+  message with "Approve" / "Check it first", not a banner.
 
 ## Browser, coder, video intelligence (v6)
 

@@ -62,3 +62,9 @@ def test_notes_are_markdown_files_in_the_notes_folder(tmp_path, monkeypatch):
     assert listed and listed[0]["title"] == "Render rig"
     assert tool.delete_note(listed[0]["id"]) is True
     assert tool.list_notes() == []
+
+
+def test_complete_never_matches_on_stopwords_alone(isolated):
+    isolated.add_commitment("editing the intro")
+    assert agenda.complete("record the voiceover") is None          # only 'the' in common
+    assert agenda.complete("intro editing") is not None              # the real words match

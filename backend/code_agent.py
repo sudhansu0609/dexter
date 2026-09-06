@@ -353,14 +353,12 @@ class CodeAgent:
         except Exception:
             pass
         bus.publish("code", {"jobId": job.id, "status": job.status, "summary": job.summary(), "job": job.to_dict()})
-        bus.publish("reminder", {
-            "id": f"code-{job.id}",
-            "text": job.summary()[:500],
-            "spoken": f"The code task on {job.project['name']} has {'finished' if job.status == 'done' else 'failed'}.",
-            "speak": False,
-            "banner": True,
-            "codeJobId": job.id,
-        })
+        try:
+            import companion
+
+            companion.on_event("code_done", {**job.to_dict(), "project": job.project["name"]})
+        except Exception as exc:
+            print(f"[Code] companion message failed: {exc}")
 
     def cancel(self, job_id: Optional[str] = None) -> Optional[CodeJob]:
         job = self.jobs.get(job_id) if job_id else (self.running()[0] if self.running() else None)

@@ -19,7 +19,7 @@ import type {
   Task,
   UserProfile,
   WorkbookSnapshot,
-} from './types';
+ MissionStatus } from './types';
 
 export const API_BASE = 'http://localhost:8098';
 const DEXTER = `${API_BASE}/api/dexter`;
@@ -122,6 +122,7 @@ export const updateProfile = (profile: Partial<UserProfile>) =>
 export const reindexKnowledge = () => postJson<Record<string, unknown>>('/knowledge/reindex');
 
 export const getWorkbook = () => getJson<WorkbookSnapshot>('/workbook');
+export const getMission = () => getJson<MissionStatus>('/mission');
 
 export const addCommitment = (text: string, when?: string, goal?: string) =>
   postJson<{ ok: boolean; summary: string }>('/workbook/commitments', { text, when, goal });

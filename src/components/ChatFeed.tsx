@@ -9,6 +9,7 @@ interface Props {
   inputMsg: string;
   setInputMsg: (v: string) => void;
   onSend: () => void;
+  onQuickReply: (text: string) => void;
   isExpanded: boolean;
 }
 
@@ -21,6 +22,7 @@ export function ChatFeed({
   inputMsg,
   setInputMsg,
   onSend,
+  onQuickReply,
   isExpanded,
 }: Props) {
   const chatEndRef = useRef<HTMLDivElement | null>(null);
@@ -77,9 +79,31 @@ export function ChatFeed({
                   gap: '4px',
                 }}
               >
-                {m.sender === 'user' ? '👤 YOU' : '🧠 DEXTER AI'}
+                {m.sender === 'user' ? '👤 YOU' : '🧠 DEXTER'}
               </div>
-              <div>{m.text}</div>
+              <div style={{ whiteSpace: 'pre-wrap' }}>{m.text}</div>
+              {m.quickReplies && m.quickReplies.length > 0 && (
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '8px' }}>
+                  {m.quickReplies.map((q) => (
+                    <button
+                      key={q}
+                      type="button"
+                      onClick={() => onQuickReply(q)}
+                      style={{
+                        background: 'rgba(168, 85, 247, 0.15)',
+                        border: '1px solid rgba(168, 85, 247, 0.5)',
+                        color: '#e9d5ff',
+                        borderRadius: '999px',
+                        padding: '3px 10px',
+                        fontSize: '11px',
+                        cursor: 'pointer',
+                      }}
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         ))}
@@ -111,7 +135,7 @@ export function ChatFeed({
       <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px' }}>
         <input
           type="text"
-          placeholder="Ask Dexter anything, or tell it what to do..."
+          placeholder="Talk to Dexter..."
           value={inputMsg}
           onChange={(e) => setInputMsg(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && onSend()}

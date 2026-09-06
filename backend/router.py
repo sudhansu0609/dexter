@@ -27,6 +27,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import cancellation
 from hybrid_llm import extract_json, llm_router
 from tool_registry import ToolResult, all_tools, execute, get_tool, schemas_for
+import companion
 import user_profile
 
 # ───────────────────────── result type ─────────────────────────
@@ -219,6 +220,52 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
     ),
     # "open the studio" is the Buzzcaf Studio, not an installed app called
     # "studio"; it must win before the generic launcher below.
+    (
+        re.compile(r"^(?:add|put|create)\s+(?:a\s+|new\s+)?(?:task|todo|to-do|commitment)\s*[:\-]\s*(.+)$", re.I),
+        "add_task",
+        lambda m: {"title": m.group(1).strip(" .!")},
+    ),
+    # ── the mission (v7) ──
+    (
+        re.compile(r"^(?:today'?s win is|the one thing today is|my win (?:for )?today(?: is)?:?|if i do one thing today it'?s)\s+(.+)$", re.I),
+        "set_today_win",
+        lambda m: {"text": m.group(1).strip(" .!")},
+    ),
+    (
+        re.compile(r"^(?:our mission is|north star:?|the mission is|we'?re working towards|the big goal is)\s+(.+)$", re.I),
+        "set_mission",
+        lambda m: {"north_star": m.group(1).strip(" .!")},
+    ),
+    (
+        re.compile(r"^(?:this week'?s focus is|focus this week:?|the focus (?:for|of) (?:the|this) week is|this week (?:we'?re|i'?m) (?:on|focused on))\s+(.+)$", re.I),
+        "set_focus",
+        lambda m: {"text": m.group(1).strip(" .!")},
+    ),
+    (
+        re.compile(r"^(?:i'?m |i am )?(?:blocked (?:by|on)|stuck on|blocker:?)\s+(.+)$", re.I),
+        "add_blocker",
+        lambda m: {"text": m.group(1).strip(" .!")},
+    ),
+    (
+        re.compile(r"^(?:log a win:?|small win:?|win:?|big win:?)\s+(.+)$", re.I),
+        "log_win",
+        lambda m: {"text": m.group(1).strip(" .!")},
+    ),
+    (
+        re.compile(r"^(?:how are we doing|where are we(?: on the mission)?|what'?s (?:our|the) (?:plan|mission)|what are we working towards|status check on us)\W*$", re.I),
+        "mission_status",
+        lambda m: {},
+    ),
+    (
+        re.compile(r"^(?:not(?: now)?|leave me alone(?: for a bit)?|pause (?:the )?check-?ins|no check-?ins(?: for .*)?|i'?m in deep work)\W*$", re.I),
+        "snooze_checkins",
+        lambda m: {},
+    ),
+    (
+        re.compile(r"^(?:check in with me|let'?s check in|give me a check-?in|where do we stand(?: today)?)\W*$", re.I),
+        "check_in",
+        lambda m: {},
+    ),
     # ── Dexter's browser (v6) ──
     (
         re.compile(r"^(?:search|look up|find)\s+(?:on\s+)?youtube\s+(?:for\s+)?(.+)$", re.I),
@@ -335,10 +382,10 @@ _NOT_AN_APP = re.compile(
 # reasons: they are said constantly and deserve an instant reply, and "how are
 # you doing today" otherwise collides with the agenda tool on "doing/today".
 _CHITCHAT: List[Tuple[re.Pattern, str]] = [
-    (re.compile(r"^(?:hi|hey|hello|yo|sup)\b.{0,15}$", re.I), "Hey. What do you need?"),
-    (re.compile(r"^good (?:morning|afternoon|evening)\b.{0,15}$", re.I), "Good to see you. What's first?"),
-    (re.compile(r"^how (?:are|r) (?:you|u)\b.{0,20}$", re.I), "Running fine and ready. What do you need?"),
-    (re.compile(r"^(?:what'?s up|how'?s it going|you there|are you there)\b.{0,15}$", re.I), "I'm here. What do you need?"),
+    (re.compile(r"^(?:hi|hey|hello|yo|sup)\b.{0,15}$", re.I), "__greeting__"),
+    (re.compile(r"^good (?:morning|afternoon|evening)\b.{0,15}$", re.I), "__greeting__"),
+    (re.compile(r"^how (?:are|r) (?:you|u)\b.{0,20}$", re.I), "__greeting__"),
+    (re.compile(r"^(?:what'?s up|how'?s it going|you there|are you there)\b.{0,15}$", re.I), "__greeting__"),
     (re.compile(r"^(?:thanks|thank you|cheers|nice one|perfect|great)\b.{0,15}$", re.I), "Anytime."),
     (re.compile(r"^(?:bye|goodbye|good night|see you|later)\b.{0,15}$", re.I), "Talk soon."),
     (re.compile(r"^(?:dexter|hey dexter)\s*[?!.]*$", re.I), "Yes? I'm listening."),
@@ -349,7 +396,8 @@ def chitchat(message: str) -> Optional[str]:
     text = message.strip()
     for pattern, reply in _CHITCHAT:
         if pattern.match(text):
-            return reply
+            # A greeting from a colleague knows what today is about (v7).
+            return companion.greeting_reply() if reply == "__greeting__" else reply
     return None
 
 
@@ -1022,7 +1070,7 @@ You can act on the computer by calling tools. Rules:
 - Never invent file paths or results. If a tool fails, say so plainly.
 - When you use a passage from the user's files, name the file (the context shows it as "from ...").
 
-Keep replies short and natural."""
+Keep replies short and natural. The sections below say how you and the user work together; follow them."""
 
 JSON_PROTOCOL_HINT = """If you cannot use the native tool-calling format, respond with a single JSON object instead:
 {"tool": "tool_name", "args": {...}}
@@ -1107,6 +1155,10 @@ def _fast_reply(
     profile_block = user_profile.render_block()
     if profile_block:
         system += f"\n\n{profile_block}"
+    try:
+        system += "\n\n" + companion.fast_stance()
+    except Exception:
+        pass
     if context_note:
         system += f"\n\nContext you may use:\n{context_note}"
 
@@ -1168,6 +1220,10 @@ def agent_loop(
     profile_block = user_profile.render_block()
     if profile_block:
         system += f"\n\n{profile_block}"
+    try:
+        system += "\n\n" + companion.context_block()
+    except Exception as exc:
+        print(f"[Router] companion context skipped: {exc}")
     if context_note:
         system += f"\n\nContext you may use:\n{context_note}"
 

@@ -7,19 +7,21 @@ interface EventDeps {
   refreshPlanner: () => void;
   // Studio events (a step finished, approval needed) change the Studio panel.
   refreshBuzzcaf?: () => void;
+  // A message Dexter starts on its own (check-in, code/Studio event) → the chat feed.
+  onCompanion?: (payload: { kind: string; text: string; quickReplies: string[] }) => void;
 }
 
 // Owns the SSE push channel - the backend's only way to reach the user unprompted
 // - plus the reminder banners and background-task tray it feeds. Reconnects on
 // error (roadmap Phase 6, item 17). The listeners are registered once, so they
 // dispatch through a ref that always holds the current-render callbacks.
-export function useServerEvents({ refreshPlanner, refreshBuzzcaf }: EventDeps) {
+export function useServerEvents({ refreshPlanner, refreshBuzzcaf, onCompanion }: EventDeps) {
   const [reminders, setReminders] = useState<ReminderBanner[]>([]);
   const [bgTasks, setBgTasks] = useState<BgTask[]>([]);
   const [connected, setConnected] = useState(false);
 
-  const depsRef = useRef({ refreshPlanner, refreshBuzzcaf });
-  depsRef.current = { refreshPlanner, refreshBuzzcaf };
+  const depsRef = useRef({ refreshPlanner, refreshBuzzcaf, onCompanion });
+  depsRef.current = { refreshPlanner, refreshBuzzcaf, onCompanion };
 
   const dismissReminder = (id: string) => {
     setReminders((prev) => prev.filter((r) => r.id !== id));
@@ -109,6 +111,16 @@ export function useServerEvents({ refreshPlanner, refreshBuzzcaf }: EventDeps) {
 
       source.addEventListener('studio', () => {
         depsRef.current.refreshBuzzcaf?.();
+      });
+
+      source.addEventListener('companion', (evt: MessageEvent) => {
+        try {
+          const { payload } = JSON.parse(evt.data);
+          if (payload?.text) depsRef.current.onCompanion?.(payload);
+          depsRef.current.refreshPlanner();
+        } catch (e) {
+          console.warn('Malformed companion event', e);
+        }
       });
 
       source.onerror = () => {

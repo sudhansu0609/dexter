@@ -373,6 +373,10 @@ class DexterScheduler:
             id="maint-brief", replace_existing=True,
         )
         self._scheduler.add_job(
+            self._midday_checkin, CronTrigger(hour=int(os.getenv("DEXTER_MIDDAY_HOUR", "13")), minute=0),
+            id="loop-midday", replace_existing=True,
+        )
+        self._scheduler.add_job(
             self._prune_reminders, CronTrigger(hour=3, minute=40),
             id="maint-reminders", replace_existing=True,
         )
@@ -482,6 +486,15 @@ class DexterScheduler:
     def _morning_brief(self) -> None:
         from workbook import workbook
 
+        # The greeting in the chat carries the brief (v7); the toast below is the fallback.
+        try:
+            import companion
+
+            if companion.morning():
+                return
+        except Exception as exc:
+            print(f"[Scheduler] Companion morning failed: {exc}")
+
         tasks: List[Dict[str, Any]] = []
 
         # What the user actually committed to, which is the thing a briefing is
@@ -539,6 +552,15 @@ class DexterScheduler:
 
     # ───────────────────────── the daily loop ─────────────────────────
 
+    def _midday_checkin(self) -> None:
+        """How is today's win going? (v7)"""
+        try:
+            import companion
+
+            companion.midday()
+        except Exception as exc:
+            print(f"[Scheduler] Companion midday failed: {exc}")
+
     def _evening_prompt(self) -> None:
         """Ask to close out the day - never close it silently."""
         from workbook import workbook
@@ -552,6 +574,14 @@ class DexterScheduler:
         done = snapshot["done"]
         if not open_items and not done:
             return
+
+        try:
+            import companion
+
+            if companion.evening():
+                return
+        except Exception as exc:
+            print(f"[Scheduler] Companion evening failed: {exc}")
 
         if open_items:
             headline = f"{len(done)} done, {len(open_items)} still open. Close out the day?"
@@ -595,6 +625,14 @@ class DexterScheduler:
 
         if not card["committed"]:
             return
+
+        try:
+            import companion
+
+            if companion.weekly(card):
+                return
+        except Exception as exc:
+            print(f"[Scheduler] Companion weekly failed: {exc}")
 
         headline = f"This week: {card['done']} of {card['committed']} commitments kept."
         spoken = headline

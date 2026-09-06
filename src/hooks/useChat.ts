@@ -16,7 +16,7 @@ const HISTORY_TURNS = 12;
 const WELCOME: ChatMessage = {
   id: 'w1',
   sender: 'dexter',
-  text: 'Hello! I am Dexter. Ask me anything, or tell me what to do.',
+  text: "Hey. I'm Dexter, and we're on this together. Tell me what we're working towards, or just say what's next.",
 };
 
 // Owns the chat feed and the streaming /chat/stream turn loop: live token
@@ -63,8 +63,8 @@ export function useChat({ onTurnComplete }: ChatDeps) {
     };
   }, []);
 
-  const pushDexterMessage = (text: string, action?: string) => {
-    setChatLog((prev) => [...prev, { id: `d-${Date.now()}`, sender: 'dexter', text, action }]);
+  const pushDexterMessage = (text: string, action?: string, extra?: { kind?: string; quickReplies?: string[] }) => {
+    setChatLog((prev) => [...prev, { id: `d-${Date.now()}`, sender: 'dexter', text, action, ...(extra || {}) }]);
   };
 
   const handleSendMessage = async (customText?: string) => {
@@ -138,13 +138,13 @@ export function useChat({ onTurnComplete }: ChatDeps) {
               // Finalize the streamed message with the authoritative reply.
               setChatLog((prev) =>
                 prev.map((m) =>
-                  m.id === sid ? { ...m, text: evt.payload.reply, action: evt.payload.action } : m,
+                  m.id === sid ? { ...m, text: evt.payload.reply, action: evt.payload.action, quickReplies: evt.payload.details?.quickReplies } : m,
                 ),
               );
             } else {
               setChatLog((prev) => [
                 ...prev,
-                { id: `d-${Date.now()}`, sender: 'dexter', text: evt.payload.reply, action: evt.payload.action },
+                { id: `d-${Date.now()}`, sender: 'dexter', text: evt.payload.reply, action: evt.payload.action, quickReplies: evt.payload.details?.quickReplies },
               ]);
             }
             onTurnComplete();

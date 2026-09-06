@@ -20,6 +20,8 @@ import { WorkbookPanel } from './components/WorkbookPanel';
 import { SettingsPanel } from './components/SettingsPanel';
 import { TaskTray } from './components/TaskTray';
 import { ChatFeed } from './components/ChatFeed';
+import { MissionCard } from './components/MissionCard';
+import { useMission } from './hooks/useMission';
 import { DayPlanner } from './components/DayPlanner';
 import { FileExplorer } from './components/FileExplorer';
 import { BuzzcafPanel } from './components/BuzzcafPanel';
@@ -36,7 +38,7 @@ export default function App() {
 
   // Buzzcaf/app-launch narration is pushed into chat; a ref lets those hooks
   // reach the chat sink even though chat is created after them.
-  const pushMessageRef = useRef<(text: string) => void>(() => {});
+  const pushMessageRef = useRef<(text: string, action?: string, extra?: { kind?: string; quickReplies?: string[] }) => void>(() => {});
 
   const planner = usePlanner();
   const skills = useSkills();
@@ -45,6 +47,7 @@ export default function App() {
   const online = useOnlineStatus();
   const runtime = useRuntimeHealth();
   const workbook = useWorkbook();
+  const missionState = useMission();
 
   const chat = useChat({
     onTurnComplete: () => {
@@ -52,11 +55,21 @@ export default function App() {
       workbook.refresh();
       skills.refresh();
       buzzcaf.refresh();
+      missionState.refresh();
     },
   });
   pushMessageRef.current = chat.pushDexterMessage;
 
-  const events = useServerEvents({ refreshPlanner: planner.refresh, refreshBuzzcaf: buzzcaf.refresh });
+  const events = useServerEvents({
+    refreshPlanner: planner.refresh,
+    refreshBuzzcaf: buzzcaf.refresh,
+    // Dexter speaking first lands in the conversation, not in a banner (v7).
+    onCompanion: (p) => {
+      pushMessageRef.current(p.text, 'companion', { kind: p.kind, quickReplies: p.quickReplies });
+      missionState.refresh();
+      workbook.refresh();
+    },
+  });
 
   const toggleExpandWindow = () => {
     const nextState = !isExpanded;
@@ -126,6 +139,7 @@ export default function App() {
       <div style={{ display: 'grid', gridTemplateColumns: isExpanded ? '340px 1fr 340px' : '1fr', gap: '16px' }}>
         {/* The conversation */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+          <MissionCard mission={missionState.mission} onPrefill={(t) => chat.setInputMsg(t)} />
           <ChatFeed
             chatLog={chat.chatLog}
             isThinking={chat.isThinking}
@@ -133,6 +147,7 @@ export default function App() {
             inputMsg={chat.inputMsg}
             setInputMsg={chat.setInputMsg}
             onSend={() => chat.handleSendMessage()}
+            onQuickReply={(t) => chat.handleSendMessage(t)}
             isExpanded={isExpanded}
           />
 

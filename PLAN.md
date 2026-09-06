@@ -1,3 +1,27 @@
+# Dexter Roadmap v7 — A coworker, not a program
+
+**Status date:** 2026-09-06 · **Progress log:** `PROGRESS.md`
+**Owner's ask (2026-09-06):** "it seems like a program running and gives some
+notifications. I want it to talk to me, try to know my plans, work like a
+coworker, collaborate with me as if Dexter and I are together on a mission,
+guiding, coaching, supporting and assisting me."
+
+What was wrong: every unprompted word was a toast or a banner, every reply was
+a tool's one-line summary, and the model had no idea what we are working
+towards. The fix is a layer, not a rewrite:
+
+| # | Item | Design | Acceptance |
+|---|---|---|---|
+| K1 | The mission | `mission.py` → `data/mission.json`: north star + why, this week's focus, today's win, blockers, wins log; `open_loops()` (overdue/slipping commitments, running code job, Studio approvals). Tools: `set_mission`, `set_focus`, `set_today_win`, `log_win`, `add_blocker`, `clear_blocker`, `mission_status`, `snooze_checkins`, `check_in`, all with fast rules | **M1** "today's win is X" / "our mission is X" work without a model; the Mission card shows them |
+| K2 | The stance | `companion.context_block()` (how we work together + mission + today + open loops) in every agent prompt; a short stance in the fast layer; greetings ("hi", "good morning") answer with today's win or the first open loop | **M2** "hi" gets "Morning. Today's win is still 'X'. Where do we start?", never "How can I assist you" |
+| K3 | Dexter speaks first, in the chat | `companion.say()` → a Dexter turn in the conversation (stored in memory, SSE `companion`, quick replies), toast only as a wake-up. Morning (06:00 or first launch of the day), midday (13:00), evening (close-out hour), weekly (Sunday); event-driven for a finished code job and a Studio approval. Composed by the model from facts when a provider is up, template otherwise; quiet hours, snooze, once-per-day | **M3** the morning message is in the chat feed with a question and quick replies; "done" / "on it" / "stuck" / "later" are understood as answers |
+| K4 | Coaching tails | `companion.after_reply()` adds one sentence to tool replies when it moves things forward ("2 of 4 today", "'send invoice' is still open from 24 Aug; want it before this one?"), rate-limited | **M4** completing a task reports progress on the day; adding a task while something is overdue names it |
+| K5 | The Mission card | `MissionCard.tsx` above the chat: north star, this week, today's win, blockers, open loops; empty slots pre-fill the input with the phrase Dexter understands | **M5** visible on launch |
+
+Not doing: a separate "coach" persona or long pep talks (the stance says short, plain, one question at most).
+
+---
+
 # Dexter Roadmap v6 — Hands: the browser, the coder, video intelligence
 
 **Status date:** 2026-09-06 · **Progress log:** `PROGRESS.md` · **Contract:** `ECOSYSTEM.md`

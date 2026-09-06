@@ -4,6 +4,16 @@ Running record of what has actually landed, newest first. Plan: [`PLAN.md`](PLAN
 Every row is either **done** (with the evidence that proves it) or **open**.
 Nothing is marked done on intent.
 
+## v7 status at a glance (2026-09-06)
+
+| Item | Status | Evidence |
+|---|---|---|
+| K1 mission store + tools (**M1**) | ✅ done | `mission.py`, `tools_mission.py` (9 tools), fast rules; `test_companion.py` routes "today's win is ...", "our mission is ...", "this week's focus is ...", "I'm blocked by ...", "log a win: ...", "how are we doing", "not now", "check in with me" without a model |
+| K2 stance in every prompt (**M2**) | ✅ done | `companion.context_block()` injected in `agent_loop`, `fast_stance()` in `_fast_reply`; `chitchat` greetings → `greeting_reply()` (today's win / first open loop); test asserts the block carries mission, focus, win, blockers, wins and today |
+| K3 Dexter speaks first (**M3**) | ✅ done | `companion.say()` stores the turn and publishes SSE `companion` with quick replies; frontend renders it in the feed with tappable answers; morning/midday/evening/weekly wired into the scheduler, `greet_if_needed()` at launch, code-done and Studio approvals through `on_event`; short replies ("done" logs the win and closes the commitment, "later" snoozes 2 h) tested; quiet hours + snooze + once-per-day tested |
+| K4 coaching tails (**M4**) | ✅ done | `after_reply()`: "N of M today" on completion, overdue nudge on add (rate-limited 15 min); tested |
+| K5 Mission card (**M5**) | ✅ done | `MissionCard.tsx` + `useMission`, `/api/dexter/mission` GET/POST; `tsc` + `vite build` green |
+
 ## v6 status at a glance (2026-09-06)
 
 | Item | Status | Evidence |

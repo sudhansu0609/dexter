@@ -76,6 +76,22 @@ export interface ChatMessage {
   sender: ChatSender;
   text: string;
   action?: string;
+  // A message Dexter started (check-in, event) and the one-tap answers it offers.
+  kind?: string;
+  quickReplies?: string[];
+}
+
+export interface MissionStatus {
+  northStar: string;
+  why: string;
+  focus: string;
+  focusSetOn: string;
+  todayWin: string;
+  blockers: string[];
+  wins: { date: string; text: string }[];
+  snoozedUntil: number;
+  openLoops: string[];
+  sentToday: string[];
 }
 
 // A single frame decoded from the /chat/stream SSE body.

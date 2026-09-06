@@ -86,6 +86,9 @@ def test_code_task_launches_buzzcode_headless(monkeypatch, tmp_path):
     import notify
 
     monkeypatch.setattr(notify, "toast_async", lambda *a, **k: None)
+    import companion
+
+    monkeypatch.setattr(companion, "on_event", lambda kind, payload: True)
     monkeypatch.setattr(code_agent.code_agent, "_diff_stat", lambda path: "")
     monkeypatch.setattr(code_agent.code_agent, "engine_status", lambda: {"online": True})
     agent = code_agent.CodeAgent()

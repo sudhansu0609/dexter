@@ -57,6 +57,9 @@ import tools_studio  # noqa: F401  - registers the Buzzcaf Studio control tools
 import tools_knowledge  # noqa: F401  - registers knowledge search/reindex and profile tools
 import tools_browser  # noqa: F401  - registers Dexter's browser tools (v6)
 import tools_code  # noqa: F401  - registers buzzcode + local engine tools (v6)
+import tools_mission  # noqa: F401  - registers the mission tools (v7)
+import companion
+import mission
 import agenda
 import knowledge_ingest
 import user_profile
@@ -110,6 +113,11 @@ async def lifespan(app: FastAPI):
         import reflection
 
         reflection.catch_up()
+        # Say good morning in the chat when Dexter is opened during the day (v7).
+        try:
+            companion.greet_if_needed()
+        except Exception as exc:
+            print(f"[Startup] Greeting skipped: {exc}")
         # Studio events (a step waiting for approval, a failed step) arrive as
         # banners and toasts instead of being discovered on the next poll.
         try:
@@ -413,6 +421,13 @@ def _run_route(req: ChatRequest, on_event=None) -> Dict[str, Any]:
         memory.add_turn("assistant", task_answer["reply"], session=session)
         return task_answer
 
+    # "done", "on it", "later" after a check-in are answers, not commands (v7).
+    short = companion.handle_short_reply(req.message)
+    if short:
+        memory.add_turn("user", req.message, session=session)
+        memory.add_turn("assistant", short, session=session)
+        return intent_router.RouteResult(reply=short, action="checkin_reply", tier=0).to_dict()
+
     history = memory.recent_turns(session=session)
 
     context_parts = []
@@ -440,6 +455,14 @@ def _run_route(req: ChatRequest, on_event=None) -> Dict[str, Any]:
         on_event=on_event,
         session=session,
     )
+
+    # One coaching sentence on tool replies so they read like a colleague (v7).
+    if result.tier <= 1 and result.tool_calls and not result.needs_confirmation:
+        try:
+            last_call = result.tool_calls[-1]
+            result.reply = companion.after_reply(last_call.get("name"), bool(last_call.get("ok")), result.reply)
+        except Exception as exc:
+            print(f"[Chat] companion tail skipped: {exc}")
 
     memory.add_turn("user", req.message, session=session)
     memory.add_turn(
@@ -817,6 +840,38 @@ async def open_file_path(req: FileOpenRequest):
 # ───────────────────────── notes / media / content ─────────────────────────
 
 
+class MissionUpdate(BaseModel):
+    northStar: Optional[str] = None
+    why: Optional[str] = None
+    focus: Optional[str] = None
+    todayWin: Optional[str] = None
+
+
+@app.get("/api/dexter/mission")
+async def get_mission():
+    return await run_in_threadpool(mission.status)
+
+
+@app.post("/api/dexter/mission")
+async def update_mission(req: MissionUpdate):
+    if req.northStar is not None:
+        mission.set_mission(req.northStar, req.why or "")
+    elif req.why is not None:
+        mission.update(why=req.why)
+    if req.focus is not None:
+        mission.set_focus(req.focus)
+    if req.todayWin is not None:
+        mission.set_today_win(req.todayWin)
+    return await run_in_threadpool(mission.status)
+
+
+@app.post("/api/dexter/companion/checkin")
+async def companion_checkin(kind: str = "midday"):
+    """Fire a check-in now (the UI's 'check in' and for trying the voice)."""
+    fn = {"morning": companion.morning, "midday": companion.midday, "evening": companion.evening}.get(kind, companion.midday)
+    return {"sent": await run_in_threadpool(fn, True), "kind": kind}
+
+
 @app.get("/api/dexter/code/jobs")
 async def code_jobs():
     from code_agent import code_agent
@@ -848,29 +903,23 @@ async def get_playlists():
 
 
 def _on_studio_event(event_type: str, payload: Any) -> None:
-    """A Studio SSE frame → Dexter's own bus (UI refresh) and, when it matters, a reminder."""
+    """A Studio SSE frame → Dexter's own bus (UI refresh) and, when it matters, a word in the chat."""
     data = payload if isinstance(payload, dict) else {}
     bus.publish("studio", {"type": event_type, "payload": data})
-    text = None
-    if event_type == "approval_needed":
-        text = (
-            f"The Studio needs your approval: {data.get('step') or 'a step'} on "
-            f"'{data.get('name') or data.get('project_id')}'. Say 'approve' or give notes."
-        )
-    elif event_type == "step_failed":
-        text = f"A Studio step failed on '{data.get('project_id')}': {str(data.get('error'))[:160]}"
-    if text:
-        bus.publish("reminder", {
-            "id": f"studio-{event_type}-{data.get('project_id')}-{int(time.time())}",
-            "text": text, "spoken": text, "speak": False, "banner": True, "missed": False,
-        })
+    if event_type in ("approval_needed", "step_failed"):
+        try:
+            companion.on_event(event_type, data)
+        except Exception as exc:
+            print(f"[Studio events] companion message failed: {exc}")
         try:
             import notify
 
+            step = data.get("step") or "a step"
+            text = (f"{step} on '{data.get('name') or data.get('project_id')}' needs your approval"
+                    if event_type == "approval_needed" else f"A Studio step failed on '{data.get('project_id')}'")
             notify.toast_async("Buzzcaf Studio", text, urgent=(event_type == "step_failed"))
         except Exception as exc:
             print(f"[Studio events] toast failed: {exc}")
-
 
 
 @app.get("/api/dexter/buzzcaf/status")
