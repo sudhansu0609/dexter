@@ -1,3 +1,45 @@
+# Dexter Roadmap v5 — The assistant that runs the Studio
+
+**Status date:** 2026-09-06 · **Progress log:** `PROGRESS.md` · **Cross-project contract:** `ECOSYSTEM.md`
+**Decisions (owner, 2026-09-06):** Dexter is the personal assistant and controls
+BuzzcafAI. Voice is dropped for now. Local LLM first (codeBuzz `llama-server` on
+8089 when up, then LM Studio, Ollama, cloud). Index `B:\youtubeProjects`,
+`C:\Users\singh\Documents`, a notes vault, and the Studio's data.
+
+Acceptance bar (evidence goes in `PROGRESS.md`): **I1** one-click launch, no
+console · **I3** first token < 1.5 s p50 · **I4** starts offline · **I5**
+"open the studio and start a video about X" works end to end · **I6/I7/I8**
+knows the studio, notes/docs, and me, with citations · **I9** YouTube status
+via BuzzBrain · **I10** one agenda · **I12** nothing fabricated · **I13**
+`pre-v5` tag exists.
+
+| # | Item | Effort | Acceptance |
+|---|---|---|---|
+| 0.1 | Commit dirty tree in groups, `git tag pre-v5` | S | clean tree, tag |
+| 0.2 | `data/.session_token` ACL restricted to the current user (`icacls`) | S | `icacls data\.session_token` lists only the user |
+| 0.4 | `ECOSYSTEM.md` identical to `BuzzcafAI/ECOSYSTEM.md` | S | `diff` empty |
+| 1.1 | `buzzcaf_client.py`: port 8000, no MidnightBuzz, `pythonw` launch of `desktop_app.py`, `[]` brands on error, `/health` must say `app:"buzzcaf"`; `buzzcaf_execute_step` fails honestly and reports `paused_for_approval` | S | Studio up → real projects; Studio down → "offline", no invented brands |
+| 1.2 | Delete `SpilledCoffeeAIController`, `curate_video_ideas`, `run_overnight_curation`, demo seed tasks, `/spilledcoffee/*`, overnight UI, legacy skill file | S | `grep -rni "spilledcoffee\|overnight" backend src` empty; tests green |
+| 1.3 | `HF_HUB_OFFLINE` when the MiniLM cache exists; startup timing log lines; preflight WARN when cache missing | S | **I4** |
+| 1.4 | Remove voice (modules, WS route, TTS thread, mic patch, settings knobs, deps, UI) — one commit after the tag | M | `import main` ok; tests + build green; requirements without STT/TTS deps |
+| 1.5 | `hybrid_llm.py` provider `llamacpp` (`LLAMACPP_URL`, default 8089) first in chain when online; `runtime_health` reports it; hint when Ollama is on CPU | S | **I3** with 8089 up; clean fallback with it down |
+| 1.6 | `preflight --quiet` MessageBox; `desktop_app.py` runs preflight, stale-dist guard, window size persisted, try/except → MessageBox; `Dexter.vbs` hidden launcher | S | **I1** |
+| 3.2 | `buzzcaf_client.py` chat/state/topics/agents/approve + SSE reader → events bus + reminder on `approval_needed`; new `tools_studio.py` with 8 new tools; `BuzzcafPanel` approvals | M | **I5**; eval ≥ 13/15 |
+| 4.1 | `knowledge_ingest.py`: `DEXTER_KNOWLEDGE_ROOTS`, `ingest_sources` table, pdf/docx extract, nightly 02:30 + startup incremental + `reindex_knowledge`, citations, `search_knowledge` tool | M | **I6/I7**; idempotent reindex tests |
+| 4.2 | `profile.py` + `data/profile.json`, profile block in system prompt, `update_profile`/`show_profile`, Settings "About you"; channel ids pushed to Studio | S | **I8** |
+| 4.3 | Google connected (needs `data/google_credentials.json` from the owner) | S | 9 tools live; morning brief shows calendar |
+| 5.1 | `youtube_channel_status`, `youtube_video_stats` tools over the Studio's BuzzBrain routes | S | **I9** |
+| 5.2 | One agenda (workbook + reminders + calendar), planner migrated and deleted; notes as markdown in the notes root; automation folded | M | **I10**; eval ≥ 13/15 |
+| 5.3 | Tray icon, hide-on-close, `Ctrl+Alt+D` hotkey | M | close window → reminders still fire |
+
+## Not doing in v5
+
+- Training a wake word or any voice work.
+- Deleting the `MidnightBuzz` folder (references removed only).
+- Managing codeBuzz's GPU process: Dexter *uses* its server when up and falls back when not.
+
+---
+
 # Dexter Roadmap v4 — Make It the Coworker
 
 **Status date:** 2026-08-23

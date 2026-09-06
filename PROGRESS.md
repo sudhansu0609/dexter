@@ -4,7 +4,28 @@ Running record of what has actually landed, newest first. Plan: [`PLAN.md`](PLAN
 Every row is either **done** (with the evidence that proves it) or **open**.
 Nothing is marked done on intent.
 
-## Status at a glance
+## v5 status at a glance (2026-09-06)
+
+| Item | Status | Evidence |
+|---|---|---|
+| 0.1 commit + `pre-v5` tag | ✅ done | 6 commits `0a66577..83f7065`, `git tag -l` → `pre-v5` |
+| 0.2 session token ACL | ✅ done | `icacls data\.session_token` → `WARHEAD-MOTHERS\singh:(F)` only (2026-09-06) |
+| 0.4 ECOSYSTEM.md identical | ✅ done | `diff ECOSYSTEM.md ../BuzzcafAI/ECOSYSTEM.md` empty |
+| 1.1 Studio client fixed | ⬜ open | |
+| 1.2 curation removed | ⬜ open | |
+| 1.3 offline startup (**I4**) | ⬜ open | |
+| 1.4 voice removed | ⬜ open | |
+| 1.5 llamacpp provider (**I3**) | ⬜ open | |
+| 1.6 hidden launcher (**I1**) | ⬜ open | |
+| 3.2 studio tools (**I5**) | ⬜ open | |
+| 4.1 knowledge ingestion (**I6/I7**) | ⬜ open | |
+| 4.2 profile (**I8**) | ⬜ open | |
+| 4.3 Google connected | ⬜ blocked on owner | needs `data/google_credentials.json` |
+| 5.1 YouTube status tools (**I9**) | ⬜ open | |
+| 5.2 one agenda (**I10**) | ⬜ open | |
+| 5.3 tray + hotkey | ⬜ open | |
+
+## v4 status at a glance
 
 | Part | Item | Status |
 |---|---|---|

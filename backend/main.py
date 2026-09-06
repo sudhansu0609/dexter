@@ -168,6 +168,16 @@ try:
     os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
     with open(TOKEN_FILE, "w", encoding="utf-8") as _handle:
         _handle.write(SESSION_TOKEN)
+    if os.name == "nt":
+        # The file inherits data/'s ACL, which can be readable by every local
+        # account. Strip inheritance and grant only the current user (0.2).
+        import subprocess as _sp
+        _sp.run(
+            ["icacls", TOKEN_FILE, "/inheritance:r", "/grant:r",
+             f"{os.environ.get('USERNAME', '')}:F"],
+            check=False, capture_output=True,
+            creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+        )
 except Exception as _exc:
     print(f"[Auth] Could not persist session token: {_exc}")
 
