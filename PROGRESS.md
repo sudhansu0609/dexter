@@ -22,8 +22,26 @@ Nothing is marked done on intent.
 | 4.2 profile (**I8**) | ✅ built | `user_profile.py` → `data/profile.json`; block injected into both router prompts; tools `show_profile`/`update_profile`; `/api/dexter/profile`; Settings → "About you". Profile is empty until you fill it |
 | 4.3 Google connected | ⬜ blocked on owner | needs `data/google_credentials.json` |
 | 5.1 YouTube status tools (**I9**) | ✅ built | `youtube_channel_status`, `youtube_video_stats` over the Studio's `/api/buzzbrain/*`; client `buzzbrain_channels/latest/video`; tests in `test_tools_studio.py`. **I9** live check needs the extension reloaded in Chrome and one of your videos opened |
-| 5.2 one agenda (**I10**) | ⬜ open | |
-| 5.3 tray + hotkey | ⬜ open | |
+| 5.2 one agenda (**I10**) | ✅ done | `agenda.py` composes workbook commitments (overdue first) + today's reminders + calendar; `add_task`/`complete_task` are workbook operations; `DayPlannerTool`, `day_planner.json`, `sticky_notes.json` gone; `migrate_planner.py` ran (0 real tasks, 2 demo seeds dropped); notes are Markdown in the `notes` root (`data/notes` default) and indexed on write; scheduler arms heads-ups from commitments; `test_agenda.py` 3 tests, suite 305 passed; live `/api/dexter/planner` shows the 2 real overdue commitments and nothing invented |
+| 5.3 tray + hotkey | ✅ done | `pystray` icon (Show / Reindex knowledge / Quit); `WM_CLOSE` to the window → window hidden, `/api/dexter/health` still 200; `Ctrl+Alt+D` → `IsWindowVisible` true again within 1 s (2026-09-06); `DEXTER_TRAY=0` restores close-to-quit |
+| 5.4 docs | ✅ done | README (agenda, notes, knowledge, tray), ECOSYSTEM.md (data locations, tray), this table |
+
+## v5 acceptance bar (what "intuitive" means, with evidence)
+
+| # | Felt experience | Status | Evidence |
+|---|---|---|---|
+| I1 | One click opens Dexter | ✅ | `Dexter.vbs` → `[Desktop] Window opening after 1.1s`, no new `conhost` |
+| I3 | Dexter is fast | ⚠️ | Tier 0/1 replies in 3–30 ms; LLM-turn timing with the 8089 server up not yet measured |
+| I4 | Dexter starts offline | ✅ | `[Embeddings] ... offline=True`; no network call on the startup path |
+| I5 | Dexter controls the Studio | ⚠️ | Tools verified against the live Studio (project created, `project_created` event received); an LLM-driven "open the studio and start a video about X" run is still to be done with a model server up |
+| I6 | Dexter knows the studio | ✅ | `search_knowledge("Beyond3Baje voice")` cites `studio/prompts/channels/beyond3baje.md` |
+| I7 | Dexter knows notes/docs | ✅ | Documents PDFs/CSVs indexed (335 files); `create_note` writes Markdown and indexes it immediately; nightly + `reindex knowledge` |
+| I8 | Dexter knows me | ⚠️ | Profile block wired into both prompts; `data/profile.json` is still empty until you fill Settings → About you |
+| I9 | Dexter knows YouTube status | ⚠️ | Tools + Studio store built and tested; needs BuzzBrain 1.2.0 reloaded in Chrome and one of your videos opened |
+| I10 | One agenda, one notes place | ✅ | `/api/dexter/planner` composes workbook + reminders (+ calendar); `day_planner.json` retired; notes are `.md` files |
+| I13 | Reversible | ✅ | `git tag -l` → `pre-v5`; `git show pre-v5:backend/voice_engine.py` works |
+
+I2, I11, I12 are tracked in `BuzzcafAI/PROGRESS.md`.
 
 ## v4 status at a glance
 

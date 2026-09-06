@@ -26,7 +26,9 @@ Local model servers (none are required to boot; all are probed):
 3. The Studio can be launched by hand or by telling Dexter "open the studio".
 
 Both desktop apps run FastAPI in-process on `127.0.0.1` inside a pywebview
-window; closing the window ends the process (until Dexter's tray lands in 5.3).
+window. Closing the Studio window ends its process. Closing Dexter's window
+hides it to the system tray (reminders, the scheduler and the Studio event
+bridge keep running); `Ctrl+Alt+D` or the tray icon brings it back.
 
 ## Environment variables
 
@@ -38,7 +40,8 @@ window; closing the window ends the process (until Dexter's tray lands in 5.3).
 | `BUZZCAF_PORT` | BuzzcafAI env | Studio port, default 8000 |
 | `LLAMACPP_URL` | dexter `.env` | codeBuzz llama-server, default `http://127.0.0.1:8089/v1` |
 | `DEXTER_LLM_PROVIDER` | dexter `.env` | `auto` (llamacpp → lmstudio → ollama → cloud), or a fixed provider |
-| `DEXTER_KNOWLEDGE_ROOTS` | dexter `.env` / settings | `tag=path;tag=path` folders Dexter indexes (4.1) |
+| `DEXTER_KNOWLEDGE_ROOTS` | dexter `.env` / settings | `tag=path;tag=path` folders Dexter indexes; the `notes` tag is where new notes are written |
+| `DEXTER_TRAY` | dexter `.env` | `1` (default) hide-to-tray on close; `0` close quits |
 | `GEMINI_API_KEY`, `OPENAI_API_KEY` | both | Cloud fallbacks |
 
 ## Control API: Dexter tool → Studio route
@@ -67,12 +70,14 @@ BuzzBrain → Studio: `POST /api/buzzbrain/snapshot` (5.1).
 |---|---|
 | Dexter memory (conversations, facts, summaries, documents) | `dexter/data/dexter_memory.db` |
 | Dexter workbook (goals, commitments) | `dexter/data/dexter_workbook.db` |
-| Dexter profile | `dexter/data/profile.json` (4.2) |
-| Dexter settings, reminders, tasks, log | `dexter/data/*.json`, `dexter/data/dexter.log` |
+| Dexter profile | `dexter/data/profile.json` |
+| Dexter knowledge index | `documents` + `ingest_sources` tables in `dexter_memory.db` |
+| Dexter notes | the `notes` knowledge root, default `dexter/data/notes/*.md` |
+| Dexter settings, reminders, scheduled tasks, window, log | `dexter/data/*.json`, `dexter/data/dexter.log` |
 | Studio projects and assets | `BuzzcafAI/backend/projects/<id>/` |
 | Studio memory, saved topics, seed topics | `BuzzcafAI/backend/knowledge/` |
-| BuzzBrain snapshots | `BuzzcafAI/backend/knowledge/buzzbrain/` (5.1) |
-| Studio log | `BuzzcafAI/backend/logs/studio.log` (2.2) |
+| BuzzBrain snapshots | `BuzzcafAI/backend/knowledge/buzzbrain/` |
+| Studio log | `BuzzcafAI/backend/logs/studio.log` |
 
 ## Tracking
 

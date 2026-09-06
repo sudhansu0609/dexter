@@ -98,7 +98,7 @@ The language model is the **last** resort, not the first. Most commands never
 reach it, which is what makes Dexter both fast and predictable on local hardware.
 
 ```
-voice / text
+text
      │
      ▼
 ┌─ Tier 0: fast path ──────────────────┐  ~5ms, no LLM
@@ -116,20 +116,25 @@ voice / text
 └──────────────────────────────────────┘
 ```
 
-Measured on this machine: Tier 0/1 answer in **3–30ms**; time-to-first-audio is
-**~450ms** (streaming, sentence-chunked TTS).
+Measured on this machine: Tier 0/1 answer in **3–30ms**; Tier 2 depends on
+which model server is up (see `ECOSYSTEM.md`) and streams its reply.
 
 ### Backend modules
 
 | File | Role |
 |---|---|
 | `main.py` | FastAPI transport only — endpoints, lifecycle, SSE streaming |
-| `desktop_app.py` | The window: preflight, in-process uvicorn, WebView2, remembered size |
+| `desktop_app.py` | The window: preflight, in-process uvicorn, WebView2, remembered size, tray icon, `Ctrl+Alt+D` |
 | `buzzcaf_client.py` | HTTP client for the Buzzcaf Studio (port 8000), launches its desktop app |
 | `router.py` | The three tiers, slot extraction, agent loop, confirmations |
 | `tool_registry.py` | `@tool` decorator → OpenAI schema + intent examples + validation |
-| `tools_core.py` | Apps, files, planner, notes, media, the Studio |
+| `tools_core.py` | Apps, files, agenda, notes, media |
+| `tools_studio.py` | The Buzzcaf Studio: status, launch, projects, steps, approvals, topics, YouTube stats |
+| `tools_knowledge.py` | `search_knowledge`, `reindex_knowledge`, profile tools |
 | `tools_assistant.py` | Reminders, memory, time |
+| `agenda.py` | Today, composed from the workbook + reminders + calendar |
+| `knowledge_ingest.py` | Indexes your folders (md/txt/pdf/docx/csv, Studio JSON) into `memory.documents` with citations |
+| `user_profile.py` | `data/profile.json`: who you are, your channels; injected into every prompt |
 | `windows_tools.py` | Volume, brightness, clipboard, screenshots, windows, lock |
 | `media_tools.py` | System-wide playback via Windows SMTC |
 | `google_tools.py` | Gmail + Google Calendar |
@@ -191,7 +196,35 @@ window is open:
 ```
 
 Reminders survive restarts; any that came due while Dexter was down are surfaced
-once on next launch.
+once on next launch. Closing the window only hides it: Dexter stays in the
+system tray (Show / Reindex knowledge / Quit) and reminders keep firing.
+`Ctrl+Alt+D` brings the window back. Set `DEXTER_TRAY=0` to make close quit.
+
+---
+
+## Today, notes, and what Dexter knows
+
+**Agenda.** "What's on today" composes three things: workbook commitments due
+or overdue (overdue first, with how often they have been moved), reminders
+set for today, and calendar events when Google is connected. "Add a task"
+creates a commitment; with a time it also sets a reminder. There is no
+separate planner file any more.
+
+**Notes.** "Note that ..." writes a Markdown file into your notes folder (the
+`notes=` entry in `DEXTER_KNOWLEDGE_ROOTS`, or `data/notes` by default) and
+indexes it immediately, so "what did I note about the render rig" works a
+second later.
+
+**Knowledge.** `DEXTER_KNOWLEDGE_ROOTS=tag=path;tag=path` names the folders
+Dexter indexes (Markdown, text, CSV, PDF, Word, and the Studio's channel
+guides, saved topics and project files). An incremental pass runs at startup
+(capped at 60 s) and nightly at 02:30; "reindex knowledge" forces one.
+Answers that use a passage name the file. Ask "search my notes for X" or
+just ask the question.
+
+**Profile.** Settings → About you (or "update my profile: ...") fills
+`data/profile.json`; the block is in every prompt, so "what channels do I
+run" is answered from it, not guessed.
 
 ---
 
