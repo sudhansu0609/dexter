@@ -3,7 +3,43 @@
 A local-first desktop assistant for Windows. Runs your apps and files, plans your
 day, actually reminds you, controls audio/media/system, and runs the Buzzcaf
 Studio for you — with the language model kept local (a llama.cpp server,
-LM Studio, or Ollama). Text chat is the way in; voice was removed in v5.
+LM Studio, or Ollama). Type, or talk: say **"Dexter"** (or press the mic)
+and Dexter listens, answers out loud, and keeps listening for a follow-up.
+
+## Voice (v10)
+
+Everything runs on this machine: silero-vad to hear where a sentence ends,
+faster-whisper (`small`, CPU int8) to write it down, Kokoro to speak, and
+openWakeWord as an optional phrase model. Nothing spoken leaves the PC.
+
+| You do | Dexter does |
+|---|---|
+| Say **"Dexter, open Chrome"** | Shows *Listening…*, chimes, then acts. There is no "Dexter" wake-word model anywhere, so the recognizer does it: the first two seconds of every sentence the room says are checked, and only ones that start with "Dexter" go further ("the dexterity test" and "ask Dexter later" do not). |
+| Say **"Dexter"** and pause | Chimes and opens a six-second window for the rest. No second name needed. |
+| Prefer an instant wake phrase | **Settings → Voice → How to wake Dexter → model** switches to openWakeWord's stock `hey_jarvis` phrase (fires the moment the phrase ends, no recognizer work until then). `both` answers to either. |
+| Click **Open** under the composer | Open mic: everything you say is for Dexter, no name, until you mute. Pair it with *Learn my voice* so "everything" means you. |
+| **Settings → Voice → Learn my voice** | Ten seconds of you talking. From then on Dexter answers only your voice (a visitor gets "That wasn't your voice, so I left it") and never its own echo: it keeps a voice print of its current Kokoro voice and drops anything that matches it. Turn off with *Only answer to my voice*. A sentence a little under the bar still counts when it starts with "Dexter" or follows one of yours, and every confident match teaches Dexter your voice on this mic; if it keeps saying "that wasn't your voice", lower *Voice match strictness*. |
+| Nothing is heard | The line under the composer shows a live input meter, and after six seconds of digital silence says which mic is dead. **Settings → Voice → Microphone** lists the real ones; Windows defaults to virtual endpoints (Oculus, Stereo Mix, iPhone) surprisingly often, and Dexter skips those on its own. |
+| Dexter sounds flat | **Settings → Voice → Dexter's voice**, with a *Try* button. Spoken replies also open with a mood the model picks (warm, upbeat, calm, apologetic, urgent, thinking) that sets the pace and timbre of the voice - the tag never reaches the chat. |
+| Answer within ~9 s of a reply | Heard as a follow-up: **no wake word**. The window closes on its own. |
+| Press the **mic** (or **Ctrl+Space**) | Talk now, no wake word. Pressing it while Dexter speaks cuts the reply off. |
+| Say **"stop"**, **"cancel"** or **"never mind"** on their own | Dexter stops talking and the phrase never reaches the chat. **Esc** does the same. |
+| Turn voice off (title bar) | The mic is released and replies are not spoken. Remembered across launches. |
+
+Spoken questions get spoken-shaped answers (short, no lists, no paths) whether
+the reply is voiced or not, and streamed replies are voiced sentence by
+sentence, so speech starts before the model has finished. Reminders and
+check-ins are spoken too. Only one shell window (the pop-up or the full one,
+whichever was shown last) holds the mic, so a command is never heard twice.
+
+Knobs live in **Settings → Voice** (how to wake, the name, follow-up window,
+echo guard, wake sensitivity, barge-in) and in `.env` (`DEXTER_WHISPER_MODEL`,
+`DEXTER_WAKE_MODE`, `DEXTER_VOICE=0` to turn the whole layer off). Barge-in - talking over Dexter - is **off** by
+default because through speakers the mic hears Dexter's own voice; turn it on
+with headphones. To run Whisper on the GPU, put the CUDA 12 cuBLAS/cuDNN DLLs
+on `PATH` (`pip install nvidia-cublas-cu12 nvidia-cudnn-cu12`); `auto` falls
+back to CPU when they are missing and `/api/dexter/status` → `voice.device`
+says which it picked.
 
 ---
 
@@ -32,7 +68,8 @@ because something else holds the GPU, an embeddings model that is not cached.
 Or run the pieces separately:
 
 ```bash
-python backend/main.py               # API on http://127.0.0.1:8098
+python backend/main.py               # API on 127.0.0.1:8098, or the next free port
+                                    # (it prints "READY port=N" and publishes it)
 npm run dev                          # Vite dev server on :3006
 npm run desktop                      # Electron shell
 ```
@@ -125,14 +162,18 @@ which model server is up (see `ECOSYSTEM.md`) and streams its reply.
 |---|---|
 | `main.py` | FastAPI transport only — endpoints, lifecycle, SSE streaming |
 | `desktop_app.py` | The window: preflight, in-process uvicorn, WebView2, remembered size, tray icon, `Ctrl+Alt+D` |
-| `buzzcaf_client.py` | HTTP client for the Buzzcaf Studio (port 8000), launches its desktop app |
+| `buzzcaf_client.py` | HTTP client for the Buzzcaf Studio (it prefers 8099; found through the port ledger, `studio.runtime.json` or a scan, and only trusted when `/health` says `app:"buzzcaf"`), launches its desktop app |
 | `router.py` | The three tiers, slot extraction, agent loop, confirmations |
 | `tool_registry.py` | `@tool` decorator → OpenAI schema + intent examples + validation |
 | `tools_core.py` | Apps, files, agenda, notes, media |
 | `tools_studio.py` | The Buzzcaf Studio: status, launch, projects, steps, approvals, topics, YouTube stats |
 | `tools_knowledge.py` | `search_knowledge`, `reindex_knowledge`, profile tools |
 | `browser.py` / `tools_browser.py` | Dexter's Chrome window (Playwright): open, read, click, type, tabs, screenshot |
-| `code_agent.py` / `tools_code.py` | buzzcode jobs in your repos; start/stop the llama-server on 8089 |
+| `buzzcaf_ports.py` | The shared port ledger (`%LOCALAPPDATA%\Buzzcaf\ports.json`): pick a free port, publish it, find another app's. Copied byte-identical into every Python app in the ecosystem — see `ECOSYSTEM.md` "Ports" |
+| `code_agent.py` / `tools_code.py` | buzzcode jobs in your repos; start/stop the llama-server on 8089 (books its 12.5 GB from Sentinel first) |
+| `sentinel_client.py` | The guardian's named pipe: `Hello`, register, reserve/query VRAM **and** RAM, RAM/disk/app status, cleanup, the event stream. Absent = old behaviour, never a hang (v9) |
+| `model_steward.py` | **The only door to a model.** Reserves before every load, releases once it is resident, and runs the shed ladder when Sentinel says memory is tight. Nothing else may call `warm_model`/`release_model` — there is a test that greps for it (v9) |
+| `apps_registry.py` / `procs.py` / `tools_apps.py` | All 17 projects under `Buzzcaf_Media`: launch, probe, stop, what each costs and what it cannot share the card with (v9) |
 | `tools_assistant.py` | Reminders, memory, time |
 | `agenda.py` | Today, composed from the workbook + reminders + calendar |
 | `mission.py` / `companion.py` / `tools_mission.py` | The mission, Dexter's stance and voice, check-ins, coaching tails (v7) |
@@ -230,6 +271,70 @@ Dexter is a coworker on one mission, not a command line with notifications.
   finished code job or a Studio step waiting for approval arrives as a
   message with "Approve" / "Check it first", not a banner.
 
+## Sentinel and the apps (v9)
+
+This PC runs a 16 GB card and, on a normal evening, some combination of a
+render, a 27B model server, a ComfyUI graph and Dexter's own model. At most one
+of the heavy ones fits beside Dexter. **Sentinel** — a Windows service on
+`\\.\pipe\Sentinel` — is the guardian that decides who gets VRAM and RAM, and
+Dexter is one of the claimants that can *choose* not to load.
+
+**Dexter asks before it loads.** Every model load in Dexter goes through one
+module, `backend/model_steward.py`, which books the VRAM *and* the RAM from
+Sentinel first and hands the booking back the moment the model is resident (or
+the load fails). Nothing else in the codebase is allowed to touch model
+residency, and there is a test that greps for violations.
+
+When Sentinel says no, Dexter does not go quiet and does not load anyway:
+
+> Sentinel won't give me 6.0 GB of video memory right now — 1.2 GB is free and
+> VrDeep has 10.0 GB. I can park the background work ("pause batch jobs") or we
+> wait for it to finish — your call. I'll keep going on the small model meanwhile.
+
+...and it means it: the reply is generated on whatever model is already in
+memory. When Sentinel tells Dexter memory is tight it sheds cooperatively — the
+big model first, then the small one, then any model it did not load itself, then
+LM Studio, then a buzzcode engine it started. Freezing does not free VRAM on
+Windows, which is why giving it back voluntarily is the first move.
+
+**Dexter runs your projects.** Say it plainly; none of these touch the model:
+
+| You say | What happens |
+|---|---|
+| "what's running" | every project's live state, plus the GPU and RAM lines |
+| "is vrdeep running", "is buzzfin running" | one project, with its port and uptime |
+| "open buzzedit", "start vrdeep", "start mastgaane" | Sentinel is asked first, conflicts are named, then it launches and waits for the app's own health check |
+| "stop caliber", "stop the coding engine" | each project's own shutdown route — and it **asks first** if a render or a job is mid-flight |
+| "restart the studio", "show me buzzedit's log" | |
+| "what's in the vrdeep queue", "mastgaane report", "coffee brief" | reads what each app already publishes |
+| "clean up space" | asks Sentinel to run SmartCleaner in your session (Dexter never deletes anything itself) |
+| "pause batch jobs" / "resume batch jobs" | Sentinel freezes or thaws the background work |
+| "gpu status" | what is on the card right now |
+
+All 17 projects under `B:\youtubeProjects\Buzzcaf_Media` are in
+`data/apps.default.json` — launch script, probes, how to stop it, what it costs,
+and what it cannot share the card with. Your own changes go in `data/apps.json`,
+which Dexter reads and never writes.
+
+**In the window.** The expanded dashboard has a **Machine** panel (VRAM, RAM and
+disk gauges, who is holding the card, what is frozen, buttons for pause/resume
+batch and a safe clean) and a **Projects** panel (start and stop, with the
+confirmation for a busy batch job). If Sentinel is not running, or is an older
+build without RAM and disk commands, the panel says so — it does not show you an
+empty gauge and let you guess.
+
+**Nothing here is a hang risk.** Every call to Sentinel has a sub-second timeout
+and an "absent" answer. With the guardian stopped, Dexter behaves exactly as it
+did before it existed.
+
+Settings → **Machine** tunes the budgets live: `DEXTER_VRAM_BUDGET_MIB` (5120),
+`DEXTER_RAM_BUDGET_MIB` (3072), the buzzcode engine's booking (12500 / 6500),
+whether Dexter may unload LM Studio, and whether "clean up space" is allowed to
+forward a request at all. The cross-project contract is
+[`ECOSYSTEM.md`](ECOSYSTEM.md).
+
+---
+
 ## Browser, coder, video intelligence (v6)
 
 **Browser.** "go to github.com", "search youtube for bhangarh fort", "click
@@ -241,10 +346,14 @@ attach to your everyday Chrome instead, start it with
 `--remote-debugging-port=9222` and set `DEXTER_BROWSER_CDP=http://127.0.0.1:9222`.
 
 **Coder.** "buzzcode: fix the failing test in dexter", "ask the coder to add
-type hints to knowledge_ingest.py in dexter". Dexter runs buzzcode headless in
-that repository and comes back at once; the result (files changed, its
-summary, `git diff --stat`) arrives as a toast and a banner. "code status" while
-it runs. Files-only by default; add "and let it run the tests" to allow
+type hints to knowledge_ingest.py in dexter". Dexter opens buzzcode in its own
+terminal window (v8) in that repository and comes back at once; you watch the
+tool calls and the model's text live, and the result (files changed, its
+summary, `git diff --stat`) arrives as a toast and a banner when it finishes.
+buzzcode stops its model server at the end so the GPU is free again, and Dexter
+unloads its own big model before the job starts. `DEXTER_CODE_WINDOW=0` goes
+back to a hidden background process. "code status" while it runs. Files-only by
+default; add "and let it run the tests" to allow
 commands. "start the local model" brings up the 27B llama-server on 8089,
 which Dexter then uses for its own replies too.
 
@@ -270,9 +379,24 @@ window is open:
 ```
 
 Reminders survive restarts; any that came due while Dexter was down are surfaced
-once on next launch. Closing the window only hides it: Dexter stays in the
-system tray (Show / Reindex knowledge / Quit) and reminders keep firing.
-`Ctrl+Alt+D` brings the window back. Set `DEXTER_TRAY=0` to make close quit.
+once on next launch. Closing a window only hides it: Dexter stays in the
+system tray and reminders keep firing. Set `DEXTER_TRAY=0` to make close quit.
+
+## The pop-up and the full window (v8)
+
+Dexter lives as a small pop-up, bottom-right and on top: Dexter's latest
+message and one line to answer it. It shows up when Dexter has something to
+say (a check-in, a reminder, a finished code job) and tucks itself away 30 s
+later unless you are typing; anything you start yourself stays until you press
+`Esc` or close it. `Ctrl+Alt+D` or a click on the tray icon brings it up.
+
+The full app - the conversation, the mission card, the planner, the Studio -
+is a second window: tray menu → **Open Dexter**, or the expand button on the
+pop-up. Tray menu: Ask Dexter / Open Dexter / Reindex knowledge / Quit. Set
+`DEXTER_START_MODE=full` in `.env` to open the full window at launch instead.
+
+The look is light and minimal on purpose: one accent, system font, no glow.
+Every colour is a token in `src/index.css`.
 
 ---
 
@@ -317,10 +441,22 @@ The token is stored at `data/google_token.json` and is gitignored.
 
 ```bash
 npm run check                        # everything: preflight, pytest, tsc, vitest
-pytest backend -q                    # 307 backend tests, no server needed
+pytest backend -q                    # 395 backend tests, no server needed
 npx vitest run                       # frontend smoke tests
 python test_dexter_suite.py          # live end-to-end checks (server must be up)
+python test_day_in_life.py           # a day as the owner: 34 timed turns, table in reports/
 ```
+
+**Instant replies (v8).** A small model (`DEXTER_FAST_MODEL`, qwen2.5:3b on
+Ollama) answers conversation and general knowledge in well under a second and is
+kept in memory for hours; anything that reads as an instruction, anything about
+your own things, and any reply where the small model pretends or declines goes
+to the tool-enabled model (`DEXTER_SMART_MODEL`), which is unloaded again after
+`DEXTER_SMART_KEEP_ALIVE`. `/api/dexter/status` → `tiers` shows which model is
+where and whether it sits on the GPU. Two things that silently made this slow
+on Windows: use `127.0.0.1`, never `localhost`, in every local URL (2 s per
+call otherwise), and check `ollama ps` says `GPU` - if it says `CPU`, Ollama's
+`lib/ollama/cuda_*` folders are incomplete.
 
 `test_router.py` is the contract for intent handling. A new tool's example
 phrasings can silently steal a phrase another tool used to own, so add a case
@@ -389,3 +525,4 @@ filesystem path allowlist, and removing `shell=True` from the launcher paths —
 all tracked in [`PLAN.md`](PLAN.md) (Roadmap v4) with the running record in
 [`PROGRESS.md`](PROGRESS.md). `IMPROVEMENT_PLAN.md` is Roadmap v3, complete and
 kept for history.
+# dexter
