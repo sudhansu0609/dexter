@@ -53,8 +53,8 @@ export default function ProviderSelector() {
           width: '8px',
           height: '8px',
           borderRadius: '50%',
-          background: online ? 'var(--accent-emerald)' : '#f87171',
-          boxShadow: online ? '0 0 8px rgba(16,185,129,0.6)' : 'none',
+          background: online ? 'var(--accent-emerald)' : 'var(--danger)',
+          boxShadow: online ? '0 0 8px #bfe6cc' : 'none',
           flex: '0 0 auto',
         }}
       />
@@ -100,8 +100,8 @@ export default function ProviderSelector() {
         onClick={() => refresh()}
         title="Refresh models"
         style={{
-          background: 'rgba(15, 23, 42, 0.6)',
-          color: '#38bdf8',
+          background: 'var(--surface-2)',
+          color: 'var(--accent)',
           border: '1px solid var(--bg-card-border)',
           padding: '4px 9px',
           borderRadius: '8px',

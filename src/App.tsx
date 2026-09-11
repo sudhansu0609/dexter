@@ -3,6 +3,7 @@ import { Maximize2 } from 'lucide-react';
 import { launchApp } from './api';
 
 import { useChat } from './hooks/useChat';
+import { useVoice } from './hooks/useVoice';
 import { usePlanner } from './hooks/usePlanner';
 import { useSkills } from './hooks/useSkills';
 import { useBuzzcaf } from './hooks/useBuzzcaf';
@@ -25,13 +26,16 @@ import { useMission } from './hooks/useMission';
 import { DayPlanner } from './components/DayPlanner';
 import { FileExplorer } from './components/FileExplorer';
 import { BuzzcafPanel } from './components/BuzzcafPanel';
-import { AppLauncher } from './components/AppLauncher';
+import { AppsPanel } from './components/AppsPanel';
+import { ResourcePanel } from './components/ResourcePanel';
 import { SkillsPanel } from './components/SkillsPanel';
 
 // App is composition + layout only. Every unit of behaviour lives in a hook
 // (src/hooks) and every unit of UI in a component (src/components); this file
-// wires them together (roadmap Phase 6, item 1). Voice was removed in v5: the
-// chat box is the way in.
+// wires them together (roadmap Phase 6, item 1). Voice came back in v10: two
+// shared refs break the natural voice<->chat cycle - the mic (registered once,
+// in useVoice) reads the thinking flag and dispatches recognised commands
+// through them, while chat owns and updates both.
 export default function App() {
   const [isExpanded, setIsExpanded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -39,7 +43,10 @@ export default function App() {
   // Buzzcaf/app-launch narration is pushed into chat; a ref lets those hooks
   // reach the chat sink even though chat is created after them.
   const pushMessageRef = useRef<(text: string, action?: string, extra?: { kind?: string; quickReplies?: string[] }) => void>(() => {});
+  const isThinkingRef = useRef(false);
+  const commandHandlerRef = useRef<(text: string) => void>(() => {});
 
+  const voice = useVoice({ windowName: 'full', isThinkingRef, commandHandlerRef, hotkeys: true });
   const planner = usePlanner();
   const skills = useSkills();
   const buzzcaf = useBuzzcaf((text) => pushMessageRef.current(text));
@@ -50,6 +57,9 @@ export default function App() {
   const missionState = useMission();
 
   const chat = useChat({
+    voice,
+    isThinkingRef,
+    commandHandlerRef,
     onTurnComplete: () => {
       planner.refresh();
       workbook.refresh();
@@ -63,12 +73,17 @@ export default function App() {
   const events = useServerEvents({
     refreshPlanner: planner.refresh,
     refreshBuzzcaf: buzzcaf.refresh,
+    // The steward acted (shed, loaded, was refused): the panels refetch off the
+    // push channel rather than polling harder.
+    onResources: () => {},
     // Dexter speaking first lands in the conversation, not in a banner (v7).
     onCompanion: (p) => {
       pushMessageRef.current(p.text, 'companion', { kind: p.kind, quickReplies: p.quickReplies });
       missionState.refresh();
       workbook.refresh();
     },
+    // Reminders and check-ins are said out loud when voice is on (v10).
+    onSpeak: (text, emotion, isReminder) => voice.speakText(text, emotion, isReminder),
   });
 
   const toggleExpandWindow = () => {
@@ -99,9 +114,29 @@ export default function App() {
         transition: 'max-width 0.3s ease',
       }}
     >
-      <RuntimeBanner warnings={runtime.warnings} onDismiss={runtime.dismiss} />
+      {/* One banner stack: how Dexter is running, plus what the machine just did
+          to it (the GPU taken, a drive gone red, Sentinel stopping something). */}
+      <RuntimeBanner
+        warnings={[
+          ...runtime.warnings,
+          ...events.notices.map((n) => ({
+            code: n.id,
+            message: n.text,
+            action:
+              n.kind === 'disk_tight'
+                ? 'Say "clean up space" to have Sentinel run a safe clean.'
+                : n.kind === 'gpu_busy'
+                  ? 'Say "pause batch jobs" to park the background work.'
+                  : 'Sentinel did this to keep the machine responsive.',
+          })),
+        ]}
+        onDismiss={(code) => {
+          runtime.dismiss(code);
+          events.dismissNotice(code);
+        }}
+      />
 
-      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} voice={voice} />}
 
       <ReminderBanners
         reminders={events.reminders}
@@ -130,6 +165,10 @@ export default function App() {
         onToggleExpand={toggleExpandWindow}
         online={online}
         onToggleSettings={() => setShowSettings((v) => !v)}
+        voiceState={voice.state}
+        voiceReason={voice.unavailableReason}
+        voiceMode={voice.wakeMode}
+        onToggleVoice={voice.toggleMuted}
       />
 
       {/* Pick the LLM backend + model (or leave on Auto). */}
@@ -153,6 +192,7 @@ export default function App() {
             onSend={() => chat.handleSendMessage()}
             onQuickReply={(t) => chat.handleSendMessage(t)}
             isExpanded={isExpanded}
+            voice={voice}
           />
 
           {!isExpanded && (
@@ -162,8 +202,8 @@ export default function App() {
                 onClick={toggleExpandWindow}
                 style={{
                   flex: 1,
-                  background: 'rgba(15, 23, 42, 0.6)',
-                  color: '#38bdf8',
+                  background: 'var(--surface-2)',
+                  color: 'var(--accent)',
                   border: '1px solid var(--bg-card-border)',
                   padding: '8px',
                   borderRadius: '10px',
@@ -217,7 +257,12 @@ export default function App() {
               onApprove={buzzcaf.approve}
               onStart={buzzcaf.start}
             />
-            <AppLauncher onLaunch={handleLaunchApp} />
+            <ResourcePanel tick={events.resourceTick} />
+            <AppsPanel
+              onLaunch={handleLaunchApp}
+              onMessage={(text) => chat.pushDexterMessage(text)}
+              tick={events.resourceTick}
+            />
             <SkillsPanel skills={skills.skills} />
           </div>
         )}

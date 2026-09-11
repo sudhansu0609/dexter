@@ -18,7 +18,8 @@ from tool_registry import ToolResult, tool
     name="code_task",
     description=(
         "Delegate a coding task to buzzcode, the local coding agent, inside one of the user's repositories "
-        "(dexter, BuzzcafAI, BuzzBrain, codeBuzz, ...). Returns immediately; the result arrives when the job ends. "
+        "(dexter, BuzzcafAI, BuzzBrain, codeBuzz, ...). It opens in its own terminal window; returns immediately and "
+        "the result arrives when the job ends. "
         "mode 'edits' lets it change files only; 'yolo' also lets it run commands and needs the user to ask for it."
     ),
     params={
@@ -53,10 +54,11 @@ def code_task(task: str, project: Optional[str] = None, mode: Optional[str] = "e
     except (ValueError, RuntimeError) as exc:
         return ToolResult.fail(str(exc))
     engine = code_agent.engine_status()
-    note = "" if engine["online"] else " The local model is starting first, so the first minute or two is model load."
+    note = "" if engine["online"] else " The local model loads first, so the first minute or two is model load."
+    where = " in its own buzzcode window" if job.windowed else ""
     return ToolResult(
         ok=True,
-        summary=f"Started code task {job.id} in {target['name']} ({job.mode} mode). I'll tell you when it's done.{note}",
+        summary=f"Started code task {job.id} in {target['name']}{where} ({job.mode} mode). I'll tell you when it's done.{note}",
         data=job.to_dict(),
     )
 

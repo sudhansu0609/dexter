@@ -212,3 +212,49 @@ def test_video_stats_prefers_the_owners_latest_video_and_shows_the_trend(fake):
     assert "4.0K -> 15.2K" in result.summary
     named = execute("youtube_video_stats", {"video": "stranger"})
     assert named.ok and "not marked as one of your channels" in named.summary
+
+
+# ───────── finding the Studio, wherever it stepped to (P1) ─────────
+
+
+def test_the_studio_is_looked_for_in_the_ledger_before_its_runtime_file(monkeypatch):
+    """Order matters (GUARDIAN_PLAN.md section 11, rule 5): the owner's env, then
+    the shared ledger, then the Studio's own runtime file, then a scan."""
+    import buzzcaf_client
+
+    monkeypatch.setattr(buzzcaf_client, "_ledger_base_url", lambda: "http://127.0.0.1:8100")
+    monkeypatch.setattr(buzzcaf_client, "_runtime_base_url", lambda: "http://127.0.0.1:8101")
+    monkeypatch.setattr(buzzcaf_client.buzzcaf_ports, "discover", lambda *a, **k: "http://127.0.0.1:8102")
+
+    client = buzzcaf_client.BuzzcafAIClient("http://127.0.0.1:8099")
+    assert client._candidate_base_urls() == [
+        "http://127.0.0.1:8099",   # BUZZCAF_API_URL, as configured
+        "http://127.0.0.1:8100",   # the ledger
+        "http://127.0.0.1:8101",   # studio.runtime.json
+        "http://127.0.0.1:8102",   # a step-forward scan
+    ]
+
+
+def test_a_ledger_entry_left_by_a_dead_studio_is_not_offered(monkeypatch):
+    import buzzcaf_client
+
+    monkeypatch.setattr(buzzcaf_client.buzzcaf_ports, "entry",
+                        lambda app, *a, **k: {"port": 8100, "pid": 4})
+    monkeypatch.setattr(buzzcaf_client.buzzcaf_ports, "_pid_alive", lambda pid: False)
+    assert buzzcaf_client._ledger_base_url() is None
+
+
+def test_only_something_that_says_it_is_the_studio_is_believed(monkeypatch):
+    """CaliberAI on 8000 was once mistaken for the Studio. Every candidate,
+    ledger entry included, still has to answer /health with app: "buzzcaf"."""
+    import buzzcaf_client
+
+    monkeypatch.setattr(buzzcaf_client, "_ledger_base_url", lambda: "http://127.0.0.1:8100")
+    monkeypatch.setattr(buzzcaf_client, "_runtime_base_url", lambda: None)
+    monkeypatch.setattr(buzzcaf_client.buzzcaf_ports, "discover", lambda *a, **k: None)
+
+    client = buzzcaf_client.BuzzcafAIClient("http://127.0.0.1:8099")
+    asked = []
+    monkeypatch.setattr(client, "_answers", lambda url: asked.append(url) or False)
+    assert client.health_check(force=True) is False
+    assert "http://127.0.0.1:8100" in asked, "the ledger entry was never tried"

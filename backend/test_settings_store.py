@@ -114,3 +114,43 @@ def test_describe_exposes_a_renderable_schema():
     assert schema["closeOutHour"]["liveReload"] is False
     assert set(schema["llmProvider"]["options"]) == {"auto", "llamacpp", "ollama", "lmstudio"}
     assert all(row["label"] for row in schema.values()), "every setting needs a label"
+
+
+# ───────────────────────── v11.1: the tier models are settings ─────────────────────────
+
+
+def test_the_ollama_model_can_be_changed_without_editing_env(monkeypatch):
+    """Owner: "make sure I can change the models in the local instance like Ollama"."""
+    monkeypatch.setattr(router, "FAST_MODEL", "qwen2.5:3b", raising=False)
+    monkeypatch.setattr(router, "SMART_MODEL", "qwen2.5:7b", raising=False)
+
+    result = settings_store.update({"smartModel": "gemma4:12b", "fastModel": ""})
+
+    assert router.SMART_MODEL == "gemma4:12b"
+    assert router.FAST_MODEL == ""  # blank = fast tier off
+    assert {"smartModel", "fastModel"} <= set(result["applied"])
+    assert os.environ["DEXTER_SMART_MODEL"] == "gemma4:12b"
+
+
+def test_model_ids_keep_their_case_and_need_not_be_in_the_list(monkeypatch):
+    monkeypatch.setattr(router, "SMART_MODEL", "", raising=False)
+    settings_store.update({"smartModel": "google/Gemma-4-12B"})
+    assert settings_store.current()["smartModel"] == "google/Gemma-4-12B"
+
+
+def test_model_settings_list_what_the_servers_have(monkeypatch):
+    import hybrid_llm
+
+    monkeypatch.setattr(hybrid_llm.llm_router, "list_models", lambda: {
+        "providers": {
+            "ollama": {"online": True, "models": ["qwen2.5:7b", "qwen2.5:3b", "gemma4:12b"]},
+            "lmstudio": {"online": True, "models": ["google/gemma-4-12b"]},
+            "llamacpp": {"online": False, "models": []},
+        }
+    })
+    settings_store.update({"smartModel": "qwen2.5:7b"})
+    row = next(r for r in settings_store.describe() if r["key"] == "smartModel")
+    assert row["kind"] == "model"
+    assert row["options"][0] == "qwen2.5:7b"  # the current value leads
+    assert "gemma4:12b" in row["options"] and "google/gemma-4-12b" in row["options"]
+    assert row["liveReload"] is True

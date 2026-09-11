@@ -102,6 +102,20 @@ INTENT_CASES = [
     ("what's on my clipboard", "read_clipboard"),
     ("take a screenshot", "take_screenshot"),
     ("lock my pc", "lock_screen"),
+    # v11.1: power. "restart my pc" used to reach nothing at all (the v9
+    # "restart <app>" rule matched and yielded None; no tool existed).
+    ("restart my pc", "restart_pc"),
+    ("I want you to restart my PC.", "restart_pc"),
+    ("can you reboot the computer", "restart_pc"),
+    ("shut down the pc", "shutdown_pc"),
+    ("turn off my computer", "shutdown_pc"),
+    ("sign me out", "sign_out"),
+    ("log off windows", "sign_out"),
+    ("cancel the restart", "cancel_shutdown"),
+    ("empty the recycle bin", "empty_recycle_bin"),
+    # ... and none of these are the PC.
+    ("restart vrdeep", "restart_app"),
+    ("shut down discord", "close_app"),
     ("set volume to 25", "set_volume"),
     # The literal number in set_brightness's own example used to steal this one.
     ("set volume to 40", "set_volume"),
@@ -251,9 +265,14 @@ def test_tool_result_legacy_adapter():
 def _stub_earlier_tiers(monkeypatch, router):
     """Force a message past chitchat/fast-path/semantic so it reaches Tier 1.5."""
     monkeypatch.setattr(router, "chitchat", lambda t: None)
-    monkeypatch.setattr(router, "fast_path", lambda t: None)
+    monkeypatch.setattr(router, "fast_path", lambda t, session="default": None)
     monkeypatch.setattr(router, "semantic_match", lambda t: None)
     monkeypatch.setattr(router.llm_router, "resolve_provider", lambda p="auto": "ollama")
+    monkeypatch.setattr(router.llm_router, "provider_for_model", lambda m, preferred="": "ollama")
+    monkeypatch.setattr(router, "_keep_fast_model_warm", lambda provider: None)
+    monkeypatch.setattr(router, "_release_smart_model_soon", lambda provider, model: None)
+    monkeypatch.setattr(router, "FAST_PROVIDER", "")
+    monkeypatch.setattr(router, "SMART_PROVIDER", "")
 
 
 def test_fast_tier_answers_simple_turn(monkeypatch):
@@ -310,3 +329,691 @@ def test_fast_tier_escalates_to_smart_model(monkeypatch):
     assert res.action == "agent"
     assert seen["provider"] == "ollama"       # pinned to the resolved backend
     assert seen["model"] == "smart-model"     # escalated to the bigger model
+
+
+def test_fast_tier_keeps_running_while_the_big_llama_server_is_up(monkeypatch):
+    """The 27B on 8089 used to switch the fast tier off entirely (every message
+    waited on the big model). Now the small model runs on its own server and
+    only the escalated pass goes to the shared llama-server."""
+    import router
+    from hybrid_llm import LLMResponse
+
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "SMART_MODEL", "smart-model")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router.llm_router, "resolve_provider", lambda p="auto": "llamacpp")
+
+    calls = []
+
+    def fake_chat(messages, **kw):
+        calls.append((kw.get("provider"), kw.get("model")))
+        return LLMResponse(provider="ollama", content="Paris.")
+
+    monkeypatch.setattr(router.llm_router, "chat", fake_chat)
+    res = router.route("capital of france?")
+    assert res.action == "fast_chat" and calls == [("ollama", "fast-model")]
+
+    # Escalation: the smart pass lands on the llama-server with its own (single) model.
+    monkeypatch.setattr(router.llm_router, "chat", lambda messages, **kw: LLMResponse(provider="ollama", content="<ESCALATE>"))
+    seen = {}
+    monkeypatch.setattr(router, "agent_loop", lambda message, **kw: seen.update(kw) or router.RouteResult(reply="ok", action="agent"))
+    router.route("open my calendar")
+    assert seen["provider"] == "llamacpp" and seen["model"] is None
+
+
+def test_fast_tier_is_skipped_when_nothing_serves_the_small_model(monkeypatch):
+    import router
+
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router.llm_router, "provider_for_model", lambda m, preferred="": None)
+    monkeypatch.setattr(router.llm_router, "chat", lambda *a, **k: pytest.fail("fast model must not be called"))
+    seen = {}
+    monkeypatch.setattr(router, "agent_loop", lambda message, **kw: seen.update(kw) or router.RouteResult(reply="ok", action="agent"))
+    router.route("tell me something")
+    assert seen["provider"] == "auto" and seen["model"] is None
+
+
+def test_fast_reply_streams_tokens_but_never_leaks_the_sentinel(monkeypatch):
+    import router
+    from hybrid_llm import LLMResponse
+
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    _stub_earlier_tiers(monkeypatch, router)
+
+    def streaming_chat(pieces):
+        def fake(messages, **kw):
+            for piece in pieces:
+                kw["on_token"](piece)
+            return LLMResponse(provider="ollama", content="".join(pieces))
+        return fake
+
+    events = []
+    pieces = ["The moon", " is about", " 384,400 km away", " on average.", " Light", " takes 1.3 s."]
+    monkeypatch.setattr(router.llm_router, "chat", streaming_chat(pieces))
+    res = router.route("how far is the moon", on_event=lambda kind, data: events.append((kind, data)))
+    assert res.action == "fast_chat"
+    tokens = [d["text"] for k, d in events if k == "token"]
+    # The opening is held until the first sentence can be judged, then the rest streams live.
+    assert tokens == ["The moon is about 384,400 km away on average.", " Light", " takes 1.3 s."]
+    assert "".join(tokens) == "".join(pieces)
+
+    events.clear()
+    monkeypatch.setattr(router.llm_router, "chat", streaming_chat(["<ESC", "ALATE>"]))
+    monkeypatch.setattr(router, "agent_loop", lambda message, **kw: router.RouteResult(reply="did it", action="agent"))
+    res = router.route("open spotify please", on_event=lambda kind, data: events.append((kind, data)))
+    assert res.action == "agent"
+    assert not [e for e in events if e[0] == "token"]          # nothing of the sentinel reached the UI
+    assert [e for e in events if e[0] == "escalated"][0][1]["provider"] == "ollama"
+
+
+def test_sentinel_gate_holds_only_while_a_sentinel_is_still_possible():
+    import router
+
+    out = []
+    gate = router._SentinelGate(lambda kind, data: out.append(data["text"]))
+    gate.feed("<")            # could be "<ESCALATE>": hold
+    assert out == []
+    gate.feed("b>Bold</b> is html, not a sentinel.")   # prose after all: release everything held
+    assert out == ["<b>Bold</b> is html, not a sentinel."]
+    gate.feed(" hi")
+    assert out[-1] == " hi"
+
+    held = []
+    gate = router._SentinelGate(lambda kind, data: held.append(data["text"]))
+    gate.feed("<ESCALATE>")
+    gate.feed(" more")
+    assert held == []          # a real sentinel never reaches the UI
+
+
+@pytest.mark.parametrize("message", [
+    "drop the Verification probe commitment, it was a test",
+    "open spotify",
+    "can you please remind me to call mum at 6",
+    "hey dexter, set the volume to 40",
+    "I need you to add a task for tomorrow",
+    "let's create a note about the shoot",
+    "go to youtube.com",
+])
+def test_instructions_skip_the_fast_model(monkeypatch, message):
+    import router
+
+    assert router.looks_like_action(message)
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router.llm_router, "chat", lambda *a, **k: pytest.fail("the fast model must not see an instruction"))
+    seen = {}
+    monkeypatch.setattr(router, "agent_loop", lambda m, **kw: seen.update(kw) or router.RouteResult(reply="ok", action="agent"))
+    assert router.route(message).action == "agent"
+    assert seen["provider"] == "ollama"
+
+
+@pytest.mark.parametrize("message", [
+    "what's the capital of australia?",
+    "tell me a joke",
+    "how are you today",
+    "explain what a mutex does in one line",
+    "thanks, that was helpful",
+    "who wrote hamlet",
+])
+def test_conversation_stays_on_the_fast_model(message):
+    import router
+
+    assert not router.looks_like_action(message)
+
+
+def test_fast_reply_that_pretends_to_act_is_escalated(monkeypatch):
+    import router
+    from hybrid_llm import LLMResponse
+
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router, "looks_like_action", lambda text: False)   # the guard the model slipped past
+
+    def fake(messages, **kw):
+        for piece in ("Understood, the ", "Verification probe commitment ", "will be dropped."):
+            kw["on_token"](piece)
+        return LLMResponse(provider="ollama", content="Understood, the Verification probe commitment will be dropped.")
+
+    monkeypatch.setattr(router.llm_router, "chat", fake)
+    monkeypatch.setattr(router, "agent_loop", lambda m, **kw: router.RouteResult(reply="Dropped it.", action="agent"))
+    events = []
+    res = router.route("the verification probe thing is a test, it can go", on_event=lambda k, d: events.append((k, d)))
+    assert res.action == "agent" and res.reply == "Dropped it."
+    assert not [e for e in events if e[0] == "token"]     # the false claim never reached the UI
+
+
+def test_claims_action_examples():
+    import router
+
+    assert router.claims_action("Understood, the commitment will be dropped.")
+    assert router.claims_action("I'll remind you at 6.")
+    assert router.claims_action("Reminder set for 6 PM.")
+    assert router.claims_action("Done.")
+    assert router.claims_action("I've added that to your list.")
+    assert router.claims_action("I'm opening Spotify now.")
+    assert not router.claims_action("The capital of Australia is Canberra.")
+    assert not router.claims_action("A mutex ensures only one thread holds a resource at a time.")
+    assert not router.claims_action("You're welcome! Anything else?")
+    assert not router.claims_action("I'm doing well, thanks for asking!")
+    assert not router.claims_action("The city was called Byzantium before it was renamed.")
+    assert not router.claims_action("I have heard that Canberra was chosen as a compromise.")
+
+
+def test_smart_pass_goes_where_the_smart_model_lives(monkeypatch):
+    """LM Studio up (no qwen there) + Ollama up (has it): the smart pass must
+    run on Ollama, not send an Ollama tag to LM Studio."""
+    import router
+
+    monkeypatch.setattr(router, "SMART_MODEL", "smart-model")
+    monkeypatch.setattr(router, "SMART_PROVIDER", "")
+    monkeypatch.setattr(router.llm_router, "resolve_provider", lambda p="auto": "lmstudio")
+    monkeypatch.setattr(router.llm_router, "provider_for_model", lambda m, preferred="": "ollama")
+    assert router.smart_backend() == ("ollama", "smart-model")
+    # Nobody serves it: stay on the resolved provider with its own default model.
+    monkeypatch.setattr(router.llm_router, "provider_for_model", lambda m, preferred="": None)
+    assert router.smart_backend() == ("lmstudio", None)
+    # The shared llama-server serves one model of its own; SMART_MODEL does not apply.
+    monkeypatch.setattr(router.llm_router, "resolve_provider", lambda p="auto": "llamacpp")
+    assert router.smart_backend() == ("llamacpp", None)
+
+
+# ── v8: day-to-day phrases that used to reach the model and get a promise instead of an action ──
+@pytest.mark.parametrize("message, tool, args", [
+    ("note: thumbnail idea - red arrow pointing at the fort gate", "create_note", {"content": "thumbnail idea - red arrow pointing at the fort gate"}),
+    ("jot this down: call the printer about the banners", "create_note", {"content": "call the printer about the banners"}),
+    ("remember that my editor is davinci resolve", "remember_fact", {"key": "editor", "value": "davinci resolve"}),
+    ("remember that I edit in davinci resolve", "remember_fact", {"key": "edit in", "value": "I edit in davinci resolve"}),
+    ("keep in mind the channel intro is 4 seconds", "remember_fact", {"key": "channel intro", "value": "4 seconds"}),
+    ("remember to call mum at 6pm", "create_reminder", {"text": "call mum", "when": "remember to call mum at 6pm"}),
+    ("remind me at 2:30pm to prep the studio lights", "create_reminder", {"text": "prep the studio lights", "when": "remind me at 2:30pm to prep the studio lights"}),
+    ("mark the voiceover commitment done", "complete_task", {"title": "voiceover"}),
+    ("tick off the thumbnail task", "complete_task", {"title": "thumbnail"}),
+    ("what time is it in tokyo", "get_current_time", {"place": "tokyo"}),
+    ("what's the time in new york right now", "get_current_time", {"place": "new york"}),
+    # v11: closing an app means every window of it, gracefully (close_app),
+    # not the one window whose title matched best (close_window).
+    ("close notepad", "close_app", {"name": "notepad"}),
+    ("quit spotify", "close_app", {"name": "spotify"}),
+    ("what's on my screen right now", "get_active_window", {}),
+    ("what did we get done today", "mission_status", {}),
+    ("cancel the studio lights reminder", "cancel_reminder", {"text": "studio lights"}),
+    ("drop the Verification probe commitment, it was a test", "drop_commitment", {"text": "Verification probe", "why": "it was a test"}),
+    ("scrap the podcast task", "drop_commitment", {"text": "podcast"}),
+    ("cancel the reminder about the studio lights", "cancel_reminder", {"text": "the studio lights"}),
+])
+def test_day_to_day_phrases_are_deterministic(message, tool, args):
+    hit = fast_path(message)
+    assert hit is not None, f"{message!r} fell through to the model"
+    assert hit[0] == tool and hit[1] == args
+
+
+@pytest.mark.parametrize("message", ["close it", "shut down the pc", "close this tab", "close out my day"])
+def test_close_needs_a_real_target(message):
+    hit = fast_path(message)
+    assert hit is None or hit[0] != "close_window"
+
+
+@pytest.mark.parametrize("message", [
+    "thanks dexter, that's all for today", "ok that's it", "I'm done for today", "that'll be all, thanks", "signing off",
+])
+def test_sign_offs_are_instant(message):
+    assert chitchat(message) and "talk tomorrow" in chitchat(message)
+
+
+def test_live_data_questions_skip_the_fast_model(monkeypatch):
+    import router
+
+    assert router.needs_live_data("what's on my screen right now")
+    assert router.needs_live_data("what's on my calendar tomorrow")
+    assert router.needs_live_data("what's the weather like")
+    assert router.needs_live_data("what editor do I use")
+    assert router.needs_live_data("what's my channel called")
+    assert not router.needs_live_data("what's the capital of australia")
+    assert not router.needs_live_data("in one sentence, what is a mutex")
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router.llm_router, "chat", lambda *a, **k: pytest.fail("the small model must not answer about the user's screen"))
+    monkeypatch.setattr(router, "agent_loop", lambda m, **kw: router.RouteResult(reply="You're in Notepad.", action="agent"))
+    assert router.route("what is on my screen").action == "agent"
+
+
+def test_fast_model_refusal_is_escalated(monkeypatch):
+    import router
+    from hybrid_llm import LLMResponse
+
+    assert router.is_refusal("I don't have direct access to your screen right now.")
+    assert router.is_refusal("I'm unable to check that for you.")
+    assert not router.is_refusal("The capital of Australia is Canberra.")
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router, "needs_live_data", lambda text: False)   # slipped past the pre-check
+
+    def fake(messages, **kw):
+        kw["on_token"]("I don't have direct access to your screen right now, sorry.")
+        return LLMResponse(provider="ollama", content="I don't have direct access to your screen right now, sorry.")
+
+    monkeypatch.setattr(router.llm_router, "chat", fake)
+    monkeypatch.setattr(router, "agent_loop", lambda m, **kw: router.RouteResult(reply="You're in Notepad.", action="agent"))
+    events = []
+    res = router.route("tell me what you see", on_event=lambda k, d: events.append((k, d)))
+    assert res.action == "agent" and not [e for e in events if e[0] == "token"]
+
+
+def test_time_elsewhere():
+    from tools_assistant import get_current_time
+
+    assert "Tokyo" in get_current_time("tokyo").summary and "ahead" in get_current_time("tokyo").summary
+    assert get_current_time("narnia").ok is False
+    assert get_current_time().ok and "It's" in get_current_time().summary
+
+
+def test_agent_loop_nudges_a_model_that_only_claims(monkeypatch):
+    """The 7B answered 'the commitment is dropped' without calling anything.
+    One nudge sends it back; the second pass must call the tool."""
+    import router
+    from hybrid_llm import LLMResponse
+
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router, "FAST_MODEL", "")
+    monkeypatch.setattr(router, "TIERED_ENABLED", False)
+    replies = [
+        LLMResponse(provider="ollama", content="Got it, the voiceover commitment is dropped."),
+        LLMResponse(provider="ollama", content="", tool_calls=[{"id": "1", "name": "drop_commitment", "arguments": {"text": "voiceover"}}]),
+        LLMResponse(provider="ollama", content="Dropped the voiceover commitment."),
+    ]
+    seen = []
+
+    def fake_chat(messages, **kw):
+        seen.append([m["content"][:40] for m in messages if m["role"] == "user"])
+        return replies.pop(0)
+
+    monkeypatch.setattr(router.llm_router, "chat", fake_chat)
+    monkeypatch.setattr(
+        router, "_run_tool",
+        lambda name, args, on_event=None, session="default": (ToolResult(ok=True, summary=f"Dropped '{args['text']}'.", data={}), False),
+    )
+    res = router.route("drop the voiceover one")
+    assert [c["name"] for c in res.tool_calls] == ["drop_commitment"]
+    assert res.action == "agent"
+    assert "Nothing happened" in str(seen)   # the nudge went into the conversation
+
+
+# ── Sentinel: asking before loading, and letting go when told ────────────────
+#
+# The point of these two is the same: the GPU is shared, and Dexter is the only
+# claimant that can choose *not* to take it. Both paths have to work with
+# Sentinel absent as well, because most machines will not have it.
+
+
+def test_a_denied_reservation_answers_honestly_and_loads_nothing(monkeypatch):
+    """Sentinel says the card is full: Dexter must say so, not load anyway.
+
+    Loading a 5 GB model into 2 GB of free VRAM is the exact failure this whole
+    feature exists to stop — Ollama silently falls back to the CPU and every
+    turn takes ten seconds.
+    """
+    import router
+
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "SMART_MODEL", "qwen2.5:7b")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    # The fast pass escalates.
+    monkeypatch.setattr(router, "_fast_reply", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        router, "sentinel_reserve_for_smart",
+        lambda model: (False, {"free_mib": 2048, "reason": "not enough VRAM"}),
+    )
+
+    loaded = []
+    monkeypatch.setattr(router, "agent_loop", lambda *a, **kw: loaded.append(kw) or None)
+    # Nothing resident to fall back to, so the refusal stands on its own.
+    monkeypatch.setattr(router.model_steward, "resident_fallback", lambda provider: None)
+
+    events = []
+    res = router.route("write me a limerick about a frozen render",
+                       on_event=lambda name, data: events.append((name, data)))
+
+    assert loaded == [], "the smart model must not be loaded after a refusal"
+    assert res.action == "gpu_busy"
+    assert "2.0 GB" in res.reply, res.reply
+    assert "pause batch jobs" in res.reply.lower()
+    names = [name for name, _ in events]
+    assert "gpu_busy" in names
+    payload = next(data for name, data in events if name == "gpu_busy")
+    assert payload["free_mib"] == 2048
+
+
+def test_a_refusal_still_answers_on_whatever_is_already_loaded(monkeypatch):
+    """Sentinel saying no must not make Dexter go quiet.
+
+    The one thing it must not do is load: the reply runs on the model that is
+    already in memory, and leads with who has the card.
+    """
+    import router
+
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router, "FAST_MODEL", "qwen2.5:3b")
+    monkeypatch.setattr(router, "SMART_MODEL", "qwen2.5:7b")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    monkeypatch.setattr(router, "_fast_reply", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        router, "sentinel_reserve_for_smart",
+        lambda model: (False, {
+            "free_mib": 1200, "reason": "not enough VRAM",
+            "blockers": [{"process": "VrDeep", "pid": 33228, "vram_mib": 10240, "class": "batch"}],
+        }),
+    )
+    monkeypatch.setattr(router.model_steward, "resident_fallback", lambda provider: "qwen2.5:3b")
+
+    ran = []
+    monkeypatch.setattr(
+        router, "agent_loop",
+        lambda *a, **kw: ran.append(kw.get("model"))
+        or router.RouteResult(reply="Here you go.", action="agent"),
+    )
+    res = router.route("what did we get done yesterday")
+
+    assert ran == ["qwen2.5:3b"], "it must run on what is loaded, never load the 7B"
+    assert res.action == "gpu_busy_degraded"
+    assert "VrDeep" in res.reply
+    assert "Here you go." in res.reply
+
+
+def test_a_granted_reservation_lets_the_escalation_through(monkeypatch):
+    import router
+
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "SMART_MODEL", "qwen2.5:7b")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    monkeypatch.setattr(router, "_fast_reply", lambda *a, **kw: None)
+    monkeypatch.setattr(router, "sentinel_reserve_for_smart", lambda model: (True, {}))
+
+    ran = []
+    monkeypatch.setattr(
+        router, "agent_loop",
+        lambda *a, **kw: ran.append(kw.get("model")) or router.RouteResult(reply="done", action="agent"),
+    )
+    res = router.route("rename every file in the downloads folder")
+    assert ran == ["qwen2.5:7b"]
+    assert res.action == "agent"
+
+
+def test_an_escalated_turn_hands_the_booking_back(monkeypatch):
+    """A booking outlives its purpose the moment the model is resident.
+
+    Found on the live run against Sentinel v2: the escalation reserved 5490 MiB
+    and never released it, so for the next 90 seconds Sentinel counted those
+    gigabytes *twice* — once as a Dexter booking and once as the llama-server's
+    real usage — and refused the next claimant on memory that was not actually
+    spoken for. It has to go back even when the turn raises.
+    """
+    import model_steward
+    import router
+
+    _stub_earlier_tiers(monkeypatch, router)
+    monkeypatch.setattr(router, "FAST_MODEL", "fast-model")
+    monkeypatch.setattr(router, "SMART_MODEL", "qwen2.5:7b")
+    monkeypatch.setattr(router, "TIERED_ENABLED", True)
+    monkeypatch.setattr(router, "_fast_reply", lambda *a, **kw: None)
+    monkeypatch.setattr(router, "sentinel_reserve_for_smart", lambda model: (True, {}))
+    monkeypatch.setattr(router, "_release_smart_model_soon", lambda *a, **kw: None)
+
+    released = []
+    monkeypatch.setattr(model_steward, "release", lambda why="": released.append(why))
+
+    monkeypatch.setattr(
+        router, "agent_loop",
+        lambda *a, **kw: router.RouteResult(reply="done", action="agent"),
+    )
+    router.route("rename every file in the downloads folder")
+    assert released == ["smart-model"], "the escalation kept the booking"
+
+    # …and a turn that blows up must not leak it either.
+    released.clear()
+
+    def _boom(*a, **kw):
+        raise RuntimeError("the model fell over")
+
+    monkeypatch.setattr(router, "agent_loop", _boom)
+    with pytest.raises(RuntimeError):
+        router.route("rename every file in the downloads folder")
+    assert released == ["smart-model"], "a failed turn leaked the booking"
+
+
+def test_with_sentinel_absent_a_reservation_is_granted(monkeypatch):
+    """No guardian must mean no change in behaviour, not a refusal to think."""
+    import router
+
+    monkeypatch.setattr(router, "SENTINEL_ENABLED", False)
+    granted, details = router.sentinel_reserve_for_smart("qwen2.5:7b")
+    assert granted is True
+    assert details.get("absent") is True
+
+
+def _shed_recorder(monkeypatch, fast="", smart="qwen2.5:7b"):
+    """Watch what the steward unloads, with nothing real in reach."""
+    import model_steward
+    import router
+
+    monkeypatch.setattr(router, "SMART_MODEL", smart)
+    monkeypatch.setattr(router, "FAST_MODEL", fast)
+    monkeypatch.setattr(router, "SMART_PROVIDER", "ollama")
+    released = []
+    monkeypatch.setattr(
+        model_steward.llm_router, "release_model",
+        lambda provider, model, after="0": released.append((provider, model, after)) or True,
+    )
+    monkeypatch.setattr(model_steward.llm_router, "loaded_models", lambda: [])
+    return released
+
+
+def test_vram_tight_drops_the_smart_model(monkeypatch):
+    """A red VramTight event unloads the big model immediately."""
+    import router
+
+    released = _shed_recorder(monkeypatch)
+    router._on_sentinel_event({
+        "VramTight": {"level": "red", "used": 1, "total": 2, "free": 700 * 1024 * 1024,
+                      "over_budget": [], "deadline_secs": 10}
+    })
+    assert released == [("ollama", "qwen2.5:7b", "0")]
+
+
+def test_a_red_also_gives_up_the_small_model(monkeypatch):
+    """On red the instant tier goes too: a second of latency beats the whole
+    machine paging, and VramRelief brings it back."""
+    import router
+
+    released = _shed_recorder(monkeypatch, fast="qwen2.5:3b")
+    router._on_sentinel_event({
+        "VramTight": {"level": "red", "used": 1, "total": 2, "free": 1,
+                      "over_budget": [], "deadline_secs": 10}
+    })
+    assert [m for _, m, _ in released] == ["qwen2.5:7b", "qwen2.5:3b"]
+
+
+def test_ram_tight_asking_to_shed_sheds(monkeypatch):
+    """RAM pressure is handled the same way as VRAM: give memory back."""
+    import router
+
+    released = _shed_recorder(monkeypatch)
+    router._on_sentinel_event({
+        "RamTight": {"zone": "Yellow", "phys_avail": 1024 * 1024 * 1024,
+                     "commit_fraction": 0.9, "over_budget": [], "deadline_secs": 20,
+                     "ask": "shed"},
+    })
+    assert [m for _, m, _ in released] == ["qwen2.5:7b"]
+
+
+def test_a_preempt_sheds_and_hands_the_booking_back(monkeypatch):
+    """Being preempted is Sentinel giving us the chance to leave with dignity."""
+    import model_steward
+    import router
+
+    released = _shed_recorder(monkeypatch)
+    handed_back = []
+    monkeypatch.setattr(model_steward, "release", lambda why="": handed_back.append(why))
+    router._on_sentinel_event({
+        "Preempt": {"client": "dexter", "by": "buzzcode", "mib": 12500,
+                    "ram_mib": 6500, "deadline_secs": 20},
+    })
+    assert [m for _, m, _ in released] == ["qwen2.5:7b"]
+    assert handed_back == ["preempted"]
+
+
+def test_being_named_over_budget_also_drops_the_smart_model(monkeypatch):
+    """Orange plus 'you are over your budget' is Sentinel asking politely."""
+    import router
+
+    monkeypatch.setattr(router, "SMART_MODEL", "qwen2.5:7b")
+    monkeypatch.setattr(router, "SMART_PROVIDER", "ollama")
+    released = []
+    monkeypatch.setattr(
+        router.llm_router, "release_model",
+        lambda provider, model, after="0": released.append(model) or True,
+    )
+    router._on_sentinel_event({
+        "VramTight": {"level": "orange", "used": 1, "total": 2, "free": 3,
+                      "over_budget": ["Dexter"], "deadline_secs": 0}
+    })
+    assert released == ["qwen2.5:7b"]
+
+
+def test_other_events_and_orange_within_budget_change_nothing(monkeypatch):
+    """Dropping 5 GB of model is not free — it must not happen on every twitch."""
+    import router
+
+    monkeypatch.setattr(router, "SMART_MODEL", "qwen2.5:7b")
+    monkeypatch.setattr(router, "SMART_PROVIDER", "ollama")
+    released = []
+    monkeypatch.setattr(
+        router.llm_router, "release_model",
+        lambda provider, model, after="0": released.append(model) or True,
+    )
+    for event in (
+        {"VramTight": {"level": "orange", "used": 1, "total": 2, "free": 3,
+                       "over_budget": ["buzzcode"], "deadline_secs": 0}},
+        {"VramRelief": {"used": 1, "total": 2, "free": 3}},
+        {"Heartbeat": {"every_secs": 30}},
+        {"Frozen": {"pid": 1, "name": "x.exe", "class": "batch", "by": "gpu", "reason": ""}},
+        "not even a dict",
+    ):
+        router._on_sentinel_event(event)
+    assert released == []
+
+
+def test_pause_and_resume_batch_are_fast_path_phrases():
+    """Said when the machine already feels slow — no model in the way."""
+    import router
+
+    for phrase in ("pause batch jobs", "pause the background work",
+                   "freeze the batch jobs", "park the background jobs"):
+        assert router.fast_path(phrase) == ("pause_batch_jobs", {}), phrase
+    for phrase in ("resume batch jobs", "resume the background jobs",
+                   "unfreeze the batch work", "unpause background processing"):
+        assert router.fast_path(phrase) == ("resume_batch_jobs", {}), phrase
+
+
+def test_shutdown_hands_back_the_booking_and_the_registration(monkeypatch):
+    """A dead client still listed as registered holds a budget nobody is using.
+
+    Observed live: killing the process with Stop-Process leaves the row behind
+    in Sentinel's table, because the lifespan shutdown never ran. A *clean*
+    shutdown must release, unregister and stop the event thread, in that order.
+    """
+    import model_steward
+    import router
+    import sentinel_client
+
+    order = []
+
+    class FakeClient:
+        def unregister(self):
+            order.append("unregister")
+            return True
+
+        def stop(self):
+            order.append("stop")
+
+    monkeypatch.setattr(sentinel_client, "client", lambda: FakeClient())
+    monkeypatch.setattr(model_steward, "release", lambda why="": order.append(f"release:{why}"))
+    monkeypatch.setattr(router, "_sentinel_started", True)
+
+    router.sentinel_stop()
+
+    assert order == ["release:shutdown", "unregister", "stop"]
+    assert router._sentinel_started is False
+
+
+def test_shutdown_is_a_no_op_when_we_never_started(monkeypatch):
+    import router
+    import sentinel_client
+
+    monkeypatch.setattr(router, "_sentinel_started", False)
+    monkeypatch.setattr(sentinel_client, "client",
+                        lambda: (_ for _ in ()).throw(AssertionError("must not touch the pipe")))
+    router.sentinel_stop()  # must not raise
+
+
+def test_shutdown_survives_a_sentinel_that_is_already_gone(monkeypatch):
+    """The service can be stopped before Dexter is; that is not an error path
+    worth crashing a shutdown over."""
+    import router
+    import sentinel_client
+
+    monkeypatch.setattr(router, "_sentinel_started", True)
+    monkeypatch.setattr(sentinel_client, "client",
+                        lambda: (_ for _ in ()).throw(OSError("pipe is gone")))
+    router.sentinel_stop()
+    assert router._sentinel_started is False
+
+
+def test_registration_declares_ram_and_priority_only_to_a_v2_service(monkeypatch):
+    """A v1 service refuses a Register carrying keys it does not know, so the
+    new fields are held back until Hello says they are understood."""
+    import router
+    import sentinel_client
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, features):
+            self._features = features
+
+        def features(self):
+            return list(self._features)
+
+        def version(self):
+            return "2.0.0" if self._features else None
+
+        def register(self, pid, cls, budget, ram_budget_mib=None, priority=None, label=None):
+            calls.append({"cls": cls, "budget": budget, "ram": ram_budget_mib,
+                          "priority": priority, "label": label})
+            return True
+
+        def subscribe(self, handler):
+            return None
+
+    monkeypatch.setattr(sentinel_client, "client", lambda: FakeClient(["ram_reserve", "query"]))
+    monkeypatch.setattr(router, "_sentinel_started", False)
+    monkeypatch.setattr(router, "SENTINEL_ENABLED", True)
+    router.sentinel_start()
+    assert calls[-1]["ram"] == router.DEXTER_RAM_BUDGET_MIB
+    assert calls[-1]["label"] == "Dexter"
+
+    monkeypatch.setattr(sentinel_client, "client", lambda: FakeClient([]))
+    monkeypatch.setattr(router, "_sentinel_started", False)
+    router.sentinel_start()
+    assert calls[-1]["ram"] is None, "a v1 service must not be sent ram_budget_mib"
+    assert calls[-1]["priority"] is None
+    assert calls[-1]["label"] is None

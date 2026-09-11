@@ -193,8 +193,119 @@ def long_stretch(now: datetime) -> Optional[Dict[str, Any]]:
     }
 
 
+# ───────────────────────── the machine (v9, D6) ─────────────────────────
+#
+# Four things about the PC worth saying unprompted. Each is a fact the owner
+# would want to act on and would otherwise only discover when something broke:
+# an idle GPU with work queued, a drive filling up, a job that has been frozen
+# for half an hour, and something Sentinel had to stop.
+
+GPU_IDLE_MIB = 9000
+EVENING_QUEUE_HOUR = 18
+FROZEN_MINUTES = 30
+
+
+def _snapshot() -> Dict[str, Any]:
+    import model_steward
+
+    return model_steward.snapshot()
+
+
+def gpu_free_queue_waiting(now: datetime) -> Optional[Dict[str, Any]]:
+    """Renders queued, evening, card idle — the moment to start the queue."""
+    if now.hour < EVENING_QUEUE_HOUR:
+        return None
+    import apps_registry
+
+    record = apps_registry.get("vrdeep")
+    if not record or apps_registry.probe(record).get("running"):
+        return None
+    queue = apps_registry.read_queue("vrdeep")
+    pending = int(queue.get("pending") or 0)
+    if pending < 1:
+        return None
+    vram = _snapshot().get("vram") or {}
+    if int(vram.get("freeMib") or 0) < GPU_IDLE_MIB:
+        return None
+    return {
+        "key": f"gpu-idle-{now.date().isoformat()}",
+        "text": (
+            f"The GPU is free and VrDeep has {pending} job(s) waiting. "
+            "Want me to start the queue for the night?"
+        ),
+        "quick": ["Start vrdeep", "Not tonight"],
+    }
+
+
+def disk_low(now: datetime) -> Optional[Dict[str, Any]]:
+    """A drive in Yellow, with the size of a safe clean named."""
+    disk = _snapshot().get("disk") or {}
+    for drive in disk.get("drives", []):
+        zone = str(drive.get("zone", "")).lower()
+        if zone not in ("yellow", "red"):
+            continue
+        free_gb = int(drive.get("free") or 0) / (1024 ** 3)
+        return {
+            "key": f"disk-{drive.get('letter')}-{now.date().isoformat()}",
+            "text": (
+                f"{drive.get('letter')} is down to {free_gb:.0f} GB free. "
+                "Want me to have Sentinel run a safe clean (temp files, caches, logs)?"
+            ),
+            "quick": ["Clean up space", "Leave it"],
+        }
+    return None
+
+
+def frozen_long(now: datetime) -> Optional[Dict[str, Any]]:
+    """Something has been paused for half an hour — resume it, or stop it."""
+    frozen = _snapshot().get("frozen") or []
+    for item in frozen:
+        since = item.get("since") or item.get("frozen_at") or item.get("at")
+        try:
+            minutes = (time.time() - float(since)) / 60 if since else None
+        except (TypeError, ValueError):
+            minutes = None
+        if minutes is not None and minutes < FROZEN_MINUTES:
+            continue
+        name = item.get("name") or "a background job"
+        span = f" for {int(minutes)} minutes" if minutes else ""
+        return {
+            "key": f"frozen-{name}-{now.hour // 3}",
+            "text": (
+                f"{name} has been paused{span} because memory was tight. "
+                "Resume it, or is it done for today?"
+            ),
+            "quick": ["Resume batch jobs", "Leave it paused"],
+        }
+    return None
+
+
+def evicted_notice(now: datetime) -> Optional[Dict[str, Any]]:
+    """Tell the owner what the steward gave up, and why. Nothing vanishes silently."""
+    import model_steward
+
+    shed = model_steward.last_shed()
+    steps = shed.get("steps") or []
+    if not steps or not shed.get("at"):
+        return None
+    if time.time() - float(shed["at"]) > 3600:
+        return None
+    freed = float(shed.get("freedMib") or 0) / 1024.0
+    return {
+        "key": f"shed-{int(float(shed['at']) // 300)}",
+        "text": (
+            f"Memory got tight ({shed.get('reason') or 'Sentinel asked'}), so I gave back "
+            f"{freed:.1f} GB: {'; '.join(steps[:2])}. Replies may be a beat slower until it reloads."
+        ),
+        "quick": ["What's running", "Fine"],
+    }
+
+
 CANDIDATES: List[Callable[[datetime], Optional[Dict[str, Any]]]] = [
     upcoming_commitment, pick_today_win, stale_overdue, off_mission, win_before_close, long_stretch,
+    # The machine comes after the work: a full drive matters, but not more than
+    # a commitment due in twenty minutes.
+    disk_low, frozen_long, evicted_notice, gpu_free_queue_waiting,
     own_video_momentum, studio_idle,
 ]
 

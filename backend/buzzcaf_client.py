@@ -1,16 +1,18 @@
 """
 BuzzcafAI Client - HTTP interface to the 115-agent content production studio.
 
-BuzzcafAI API runs on http://127.0.0.1:8000 (BUZZCAF_API_URL) and provides:
+BuzzcafAI API runs on http://127.0.0.1:8099 (BUZZCAF_API_URL) and provides:
 - Project management (create, execute workflows, track status)
 - Workflow engine (multi-step content pipelines)
 - Asset management (media files, thumbnails, etc.)
 - Brand management (Beyond3Baje, Khayal3Baje, etc.)
 """
 
+import json
 import os
 
 import env_boot  # noqa: F401  - loads .env for every entry point
+import buzzcaf_ports
 import shutil
 import sys
 import time
@@ -19,11 +21,18 @@ import requests
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
-BUZZCAF_BASE_URL = os.getenv("BUZZCAF_API_URL", "http://127.0.0.1:8000")
+# 8099, not 8000: 8000 is every local app's default and the Studio was mistaken
+# for one of them (CaliberAI). See ECOSYSTEM.md "Finding the Studio".
+# This is the *preferred* port only: the Studio steps forward when 8099 is held,
+# and `_candidate_base_urls` below is how Dexter follows it.
+BUZZCAF_BASE_URL = os.getenv("BUZZCAF_API_URL", "http://127.0.0.1:8099")
 # Sibling-project locations default to directories next to the Dexter checkout
 # but can be pointed anywhere via .env.
 _SIBLING_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BUZZCAF_DIR = os.getenv("BUZZCAF_DIR", os.path.join(_SIBLING_ROOT, "BuzzcafAI"))
+# A running Studio records the port it actually bound here (it steps off
+# BUZZCAF_PORT when another app holds it). Read before deciding it is offline.
+STUDIO_RUNTIME_FILE = os.path.join(BUZZCAF_DIR, "backend", "config", "studio.runtime.json")
 
 
 def _studio_port(base_url: str) -> str:
@@ -31,9 +40,37 @@ def _studio_port(base_url: str) -> str:
     try:
         from urllib.parse import urlparse
 
-        return str(urlparse(base_url).port or 8000)
+        return str(urlparse(base_url).port or 8099)
     except Exception:
-        return "8000"
+        return "8099"
+
+
+def _ledger_base_url() -> Optional[str]:
+    """The Studio's entry in the shared ledger, if the process that wrote it lives.
+
+    The ledger is the ecosystem-wide answer (GUARDIAN_PLAN.md section 11) and
+    comes before the Studio's own runtime file: both are written by the Studio,
+    but the ledger is also removed on a clean exit by anything that publishes,
+    and it is where every other app looks too.
+    """
+    record = buzzcaf_ports.entry("buzzcaf")
+    if not record or not buzzcaf_ports._pid_alive(record.get("pid")):
+        return None
+    try:
+        port = int(record.get("port") or 0)
+    except (TypeError, ValueError):
+        return None
+    return f"http://127.0.0.1:{port}" if 0 < port < 65536 else None
+
+
+def _runtime_base_url() -> Optional[str]:
+    """Base URL from the Studio's runtime record, or None if there is none."""
+    try:
+        with open(STUDIO_RUNTIME_FILE, "r", encoding="utf-8") as handle:
+            port = int((json.load(handle) or {}).get("port"))
+        return f"http://127.0.0.1:{port}" if 0 < port < 65536 else None
+    except Exception:
+        return None
 
 
 def _studio_python() -> str:
@@ -89,6 +126,9 @@ class BuzzcafAIClient:
         # IPv4 - so a 2s timeout cost 4s per call. Pinning to 127.0.0.1 halves
         # that; the cache below removes it from the hot path entirely.
         self.base_url = base_url.rstrip("/").replace("//localhost:", "//127.0.0.1:")
+        # Where the owner told us to look; base_url may move away from it when
+        # the Studio had to take another port, and back when it returns.
+        self.configured_url = self.base_url
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
         self._active_project_id: Optional[str] = None
@@ -116,17 +156,53 @@ class BuzzcafAIClient:
         ):
             return self._health
 
-        try:
-            res = self.session.get(f"{self.base_url}/health", timeout=1.5)
-            # Port 8000 is popular. Only the Studio answers with app=buzzcaf;
-            # anything else there is "offline" as far as Dexter is concerned.
-            online = res.status_code == 200 and (res.json() or {}).get("app") == "buzzcaf"
-        except Exception:
-            online = False
+        online = self._answers(self.base_url)
+        if not online:
+            for candidate in self._candidate_base_urls():
+                if candidate != self.base_url and self._answers(candidate):
+                    self.base_url = candidate
+                    online = True
+                    break
 
         self._health = online
         self._health_at = time.time()
         return online
+
+    def _candidate_base_urls(self) -> List[str]:
+        """Where the Studio might be, best evidence first (section 11, rule 5).
+
+        The owner's explicit `BUZZCAF_API_URL`, then the shared ledger, then the
+        Studio's own runtime file, then a step-forward scan from the preferred
+        port. Every one of them is still put through `_answers`, so a candidate
+        only counts if the thing on that port says `app: "buzzcaf"` - the check
+        that exists because CaliberAI on 8000 was once mistaken for the Studio.
+        """
+        candidates = [self.configured_url, _ledger_base_url(), _runtime_base_url()]
+        try:
+            scanned = buzzcaf_ports.discover(
+                "buzzcaf", int(_studio_port(self.configured_url)), "/health", ttl=0,
+            )
+        except Exception:
+            scanned = None
+        candidates.append(scanned)
+
+        ordered: List[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in ordered:
+                ordered.append(candidate)
+        return ordered
+
+    def _answers(self, base_url: str) -> bool:
+        """True only if the Studio itself is at base_url.
+
+        Loopback ports are popular. Only the Studio answers /health with
+        app=buzzcaf; anything else there is "offline" as far as Dexter is concerned.
+        """
+        try:
+            res = self.session.get(f"{base_url}/health", timeout=1.5)
+            return res.status_code == 200 and (res.json() or {}).get("app") == "buzzcaf"
+        except Exception:
+            return False
 
     def invalidate_health(self) -> None:
         """Force the next health_check to hit the network (after start/stop)."""

@@ -6,6 +6,7 @@ tools_core) never forms an import cycle with the tools that drive it.
 """
 
 import os
+import re
 from typing import Optional
 
 from memory import memory
@@ -143,8 +144,8 @@ def cancel_reminder(text: str) -> ToolResult:
 )
 def remember_fact(key: str, value: str) -> ToolResult:
     if memory.remember(key, value):
-        return ToolResult(ok=True, summary=f"Got it - I'll remember that {key} is {value}.",
-                          data={"key": key, "value": value})
+        said = f"Got it - I'll remember: {value}." if value.lower().startswith(("i ", "we ", "you ")) else f"Got it - I'll remember that {key} is {value}."
+        return ToolResult(ok=True, summary=said, data={"key": key, "value": value})
     return ToolResult.fail("I couldn't store that.")
 
 
@@ -282,19 +283,207 @@ def remember_document(path: str) -> ToolResult:
 # ───────────────────────── time ─────────────────────────
 
 
+_CITY_TZ = {
+    "tokyo": "Asia/Tokyo", "japan": "Asia/Tokyo", "osaka": "Asia/Tokyo", "seoul": "Asia/Seoul", "korea": "Asia/Seoul",
+    "beijing": "Asia/Shanghai", "shanghai": "Asia/Shanghai", "china": "Asia/Shanghai", "hong kong": "Asia/Hong_Kong",
+    "taipei": "Asia/Taipei", "singapore": "Asia/Singapore", "kuala lumpur": "Asia/Kuala_Lumpur", "malaysia": "Asia/Kuala_Lumpur",
+    "bangkok": "Asia/Bangkok", "thailand": "Asia/Bangkok", "jakarta": "Asia/Jakarta", "manila": "Asia/Manila", "hanoi": "Asia/Ho_Chi_Minh",
+    "delhi": "Asia/Kolkata", "new delhi": "Asia/Kolkata", "mumbai": "Asia/Kolkata", "bangalore": "Asia/Kolkata", "bengaluru": "Asia/Kolkata",
+    "kolkata": "Asia/Kolkata", "chennai": "Asia/Kolkata", "hyderabad": "Asia/Kolkata", "pune": "Asia/Kolkata", "india": "Asia/Kolkata",
+    "karachi": "Asia/Karachi", "pakistan": "Asia/Karachi", "dhaka": "Asia/Dhaka", "kathmandu": "Asia/Kathmandu", "colombo": "Asia/Colombo",
+    "dubai": "Asia/Dubai", "abu dhabi": "Asia/Dubai", "uae": "Asia/Dubai", "doha": "Asia/Qatar", "riyadh": "Asia/Riyadh", "tehran": "Asia/Tehran",
+    "istanbul": "Europe/Istanbul", "turkey": "Europe/Istanbul", "moscow": "Europe/Moscow", "russia": "Europe/Moscow",
+    "london": "Europe/London", "uk": "Europe/London", "england": "Europe/London", "dublin": "Europe/Dublin", "lisbon": "Europe/Lisbon",
+    "paris": "Europe/Paris", "france": "Europe/Paris", "berlin": "Europe/Berlin", "germany": "Europe/Berlin", "munich": "Europe/Berlin",
+    "amsterdam": "Europe/Amsterdam", "brussels": "Europe/Brussels", "madrid": "Europe/Madrid", "spain": "Europe/Madrid", "barcelona": "Europe/Madrid",
+    "rome": "Europe/Rome", "italy": "Europe/Rome", "milan": "Europe/Rome", "zurich": "Europe/Zurich", "vienna": "Europe/Vienna",
+    "stockholm": "Europe/Stockholm", "oslo": "Europe/Oslo", "copenhagen": "Europe/Copenhagen", "helsinki": "Europe/Helsinki",
+    "warsaw": "Europe/Warsaw", "prague": "Europe/Prague", "athens": "Europe/Athens", "kyiv": "Europe/Kyiv", "kiev": "Europe/Kyiv",
+    "cairo": "Africa/Cairo", "egypt": "Africa/Cairo", "lagos": "Africa/Lagos", "nairobi": "Africa/Nairobi", "johannesburg": "Africa/Johannesburg",
+    "cape town": "Africa/Johannesburg", "south africa": "Africa/Johannesburg",
+    "new york": "America/New_York", "nyc": "America/New_York", "boston": "America/New_York", "washington": "America/New_York",
+    "miami": "America/New_York", "toronto": "America/Toronto", "montreal": "America/Toronto", "atlanta": "America/New_York",
+    "chicago": "America/Chicago", "dallas": "America/Chicago", "houston": "America/Chicago", "austin": "America/Chicago",
+    "denver": "America/Denver", "phoenix": "America/Phoenix", "las vegas": "America/Los_Angeles",
+    "los angeles": "America/Los_Angeles", "la": "America/Los_Angeles", "san francisco": "America/Los_Angeles", "sf": "America/Los_Angeles",
+    "seattle": "America/Los_Angeles", "vancouver": "America/Vancouver", "california": "America/Los_Angeles",
+    "mexico city": "America/Mexico_City", "mexico": "America/Mexico_City", "sao paulo": "America/Sao_Paulo", "brazil": "America/Sao_Paulo",
+    "buenos aires": "America/Argentina/Buenos_Aires", "argentina": "America/Argentina/Buenos_Aires", "santiago": "America/Santiago",
+    "bogota": "America/Bogota", "lima": "America/Lima",
+    "sydney": "Australia/Sydney", "melbourne": "Australia/Melbourne", "brisbane": "Australia/Brisbane", "perth": "Australia/Perth",
+    "canberra": "Australia/Sydney", "australia": "Australia/Sydney", "auckland": "Pacific/Auckland", "new zealand": "Pacific/Auckland",
+    "wellington": "Pacific/Auckland", "honolulu": "Pacific/Honolulu", "hawaii": "Pacific/Honolulu",
+    "utc": "UTC", "gmt": "UTC",
+}
+
+
+def _zone_for(place: str):
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    key = (place or "").strip().lower().strip(" .!?,")
+    key = re.sub(r"^(?:the\s+)", "", key)
+    name = _CITY_TZ.get(key)
+    if not name:
+        # "Asia/Tokyo" or "tokyo japan" style: try the text itself, then its words.
+        candidates = [place.strip()] + [w for w in key.replace(",", " ").split() if len(w) > 2]
+        for cand in candidates:
+            try:
+                return ZoneInfo(cand), cand
+            except (ZoneInfoNotFoundError, ValueError, KeyError):
+                pass
+            if cand in _CITY_TZ:
+                name = _CITY_TZ[cand]
+                break
+    if not name:
+        return None, None
+    try:
+        return ZoneInfo(name), name
+    except (ZoneInfoNotFoundError, KeyError):
+        return None, None
+
+
 @tool(
     name="get_current_time",
-    description="Get the current date and time on the user's PC.",
-    params={},
-    examples=["what time is it", "what's today's date", "what day is it", "current time"],
+    description="Get the current date and time on the user's PC, or in another city / time zone.",
+    params={"place": {"type": "string", "description": "A city, country or IANA zone (e.g. Tokyo, Asia/Tokyo). Omit for local time.", "required": False}},
+    examples=["what time is it", "what's today's date", "what day is it", "current time", "what time is it in tokyo", "time in new york"],
     category="general",
 )
-def get_current_time() -> ToolResult:
+def get_current_time(place: Optional[str] = None) -> ToolResult:
     from datetime import datetime
 
+    if place and place.strip():
+        zone, name = _zone_for(place)
+        if zone is None:
+            return ToolResult.fail(f"I don't know the time zone for '{place.strip()}'. Try a major city or a zone like Asia/Tokyo.")
+        there = datetime.now(zone)
+        here = datetime.now().astimezone()
+        offset_h = (there.utcoffset() - here.utcoffset()).total_seconds() / 3600
+        rel = "the same as here" if abs(offset_h) < 0.01 else f"{abs(offset_h):g} hours {'ahead of' if offset_h > 0 else 'behind'} you"
+        return ToolResult(
+            ok=True,
+            summary=there.strftime(f"It's %I:%M %p on %A in {place.strip().title()} ({rel}).").replace(" 0", " "),
+            data={"iso": there.isoformat(timespec="seconds"), "zone": name, "offsetHours": round(offset_h, 2)},
+        )
     now = datetime.now()
     return ToolResult(
         ok=True,
         summary=now.strftime("It's %I:%M %p on %A, %B %d.").replace(" 0", " "),
         data={"iso": now.isoformat(timespec="seconds")},
     )
+
+
+# ───────────────────────── read aloud (voice v10) ─────────────────────────
+
+
+@tool(
+    name="read_aloud",
+    description=(
+        "Read something out loud to the user in a narrator voice - their agenda, "
+        "notes, the clipboard, or a text file. Use when they want to listen to "
+        "content rather than just be told a one-line summary."
+    ),
+    params={
+        "source": {
+            "type": "string",
+            "description": "What to read: 'agenda', 'notes', 'clipboard', 'reminders', or a full file path",
+        }
+    },
+    examples=[
+        "read my agenda out loud", "read me my tasks", "read out my notes",
+        "read the clipboard to me", "read this file aloud",
+        "read me my schedule for today", "narrate my day", "what's on today, read it to me",
+    ],
+    category="general",
+)
+def read_aloud(source: str) -> ToolResult:
+    """
+    Produce long-form narration text.
+
+    The `_speech_emotion` hint tells the speech layer to use the slower
+    narrator register with longer pauses, rather than the clipped tone used
+    for confirmations.
+    """
+    target = (source or "").strip().lower()
+    body = ""
+
+    if any(word in target for word in ("agenda", "task", "plan", "schedule", "day", "today")):
+        body = _narrate_agenda()
+    elif "note" in target:
+        body = _narrate_notes()
+    elif "reminder" in target:
+        pending = scheduler.list_reminders(include_fired=False)
+        if not pending:
+            body = "You have no reminders set."
+        else:
+            lines = [f"{r.get('text', '')}, {r.get('whenText', '')}" for r in pending]
+            body = f"You have {len(pending)} reminders. " + ". ".join(lines) + "."
+    elif "clip" in target:
+        from windows_tools import read_clipboard
+
+        clip = read_clipboard()
+        content = clip.data.get("content", "") if clip.ok else ""
+        body = content.strip() or "There is nothing on your clipboard."
+    else:
+        from filesystem_tool import FileSystemTool
+
+        raw = FileSystemTool.read_file(source, max_chars=6000)
+        if not raw.get("success"):
+            return ToolResult.fail(
+                f"I couldn't read '{source}'. Try 'agenda', 'notes', 'clipboard', or give me a full file path."
+            )
+        body = raw.get("content", "").strip()
+        if raw.get("truncated"):
+            body += " That is as far as I will read for now."
+
+    if not body:
+        return ToolResult.fail(f"There is nothing to read for '{source}'.")
+
+    return ToolResult(
+        ok=True,
+        summary=body,
+        data={"_speech_emotion": "reading", "length": len(body), "source": source},
+    )
+
+
+def _narrate_agenda() -> str:
+    """Conversational narration, not the terse summary the agenda tool returns."""
+    import agenda
+
+    tasks = agenda.compose().get("tasks", [])
+    pending = [t for t in tasks if not t.get("completed")]
+    done = len(tasks) - len(pending)
+
+    if not tasks:
+        return "Your day is completely clear. Nothing on the plan."
+    if not pending:
+        return f"Everything is done. All {len(tasks)} items are complete. Enjoy the rest of your day."
+
+    opener = f"You have {len(pending)} thing{'s' if len(pending) != 1 else ''} left today"
+    opener += f", and {done} already done." if done else "."
+
+    ordinals = ["First", "Then", "After that", "Next", "Then", "Later"]
+    lines = []
+    for index, task in enumerate(pending):
+        lead = ordinals[index] if index < len(ordinals) else "Then"
+        when = task.get("time") or ""
+        title = task.get("title", "")
+        late = " That one is overdue." if task.get("overdue") else ""
+        lines.append(f"{lead}, {'at ' + when + ', ' if when and when.lower() != 'anytime' else ''}{title}.{late}")
+
+    closing = "" if len(pending) < 4 else " That is a full day."
+    return f"{opener} {' '.join(lines)}{closing}"
+
+
+def _narrate_notes() -> str:
+    from tools_core import notes
+
+    entries = notes.list_notes(limit=10)
+    if not entries:
+        return "You have no notes saved."
+    lines = []
+    for i, n in enumerate(entries):
+        text = (n.get("content") or n.get("preview") or n.get("title") or "").strip()
+        if text:
+            lines.append(f"Note {i + 1}. {text}.")
+    return f"You have {len(entries)} note{'s' if len(entries) != 1 else ''}. " + " ".join(lines)

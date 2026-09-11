@@ -12,7 +12,7 @@ export function SkillsPanel({ skills }: Props) {
       <h3
         style={{
           fontSize: '13px',
-          color: '#a855f7',
+          color: 'var(--accent)',
           marginBottom: '8px',
           display: 'flex',
           alignItems: 'center',
@@ -26,14 +26,14 @@ export function SkillsPanel({ skills }: Props) {
           <div
             key={idx}
             style={{
-              background: 'rgba(15, 23, 42, 0.6)',
+              background: 'var(--surface-2)',
               padding: '6px 8px',
               borderRadius: '8px',
-              border: '1px solid rgba(168, 85, 247, 0.25)',
+              border: '1px solid var(--accent-border)',
               fontSize: '10px',
             }}
           >
-            <div style={{ fontWeight: 700, color: '#a855f7' }}>⚡ {s.name}</div>
+            <div style={{ fontWeight: 700, color: 'var(--accent)' }}>⚡ {s.name}</div>
           </div>
         ))}
       </div>

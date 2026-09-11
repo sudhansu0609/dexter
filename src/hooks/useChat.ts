@@ -1,12 +1,23 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type MutableRefObject } from 'react';
 import { chatStream, getHistory } from '../api';
 import { getLlmChoice } from './useLlmChoice';
+import type { VoiceApi } from './useVoice';
 import type { ChatMessage, StreamEvent } from '../types';
 
 interface ChatDeps {
   // Called once a turn produces its authoritative reply, to refresh the widgets
   // whose data a tool call may have changed.
   onTurnComplete: () => void;
+  // The voice layer (v10). Optional: a text-only shell works without it.
+  voice?: VoiceApi;
+  // Shared with the voice loop: whether a turn is in flight, and the send
+  // handler the mic dispatches recognised commands through.
+  isThinkingRef?: MutableRefObject<boolean>;
+  commandHandlerRef?: MutableRefObject<(text: string) => void>;
+}
+
+export interface SendOptions {
+  via?: 'voice' | 'text';
 }
 
 // Enough to re-establish where the conversation was, without the feed opening
@@ -20,16 +31,22 @@ const WELCOME: ChatMessage = {
 };
 
 // Owns the chat feed and the streaming /chat/stream turn loop: live token
-// rendering, tool-activity labels and provider-switch handling (roadmap Phase
-// 6, items 9 + token-stream rendering). Voice was removed in v5; the chat is
-// text-only.
-export function useChat({ onTurnComplete }: ChatDeps) {
+// rendering, tool-activity labels, provider-switch handling (roadmap Phase 6,
+// items 9 + token-stream rendering), and - with a voice layer attached -
+// feeding spoken chunks to it as they stream in (v10).
+export function useChat({ onTurnComplete, voice, isThinkingRef, commandHandlerRef }: ChatDeps) {
   const [chatLog, setChatLog] = useState<ChatMessage[]>([WELCOME]);
   const [inputMsg, setInputMsg] = useState('');
   const [isThinking, setIsThinking] = useState(false);
   const [toolActivity, setToolActivity] = useState('');
   // Chat message currently receiving streamed LLM tokens, if any.
   const streamMsgIdRef = useRef<string | null>(null);
+
+  // Keep the thinking flag mirrored where the voice loop reads it.
+  useEffect(() => {
+    if (isThinkingRef) isThinkingRef.current = isThinking;
+    voice?.setThinking(isThinking);
+  }, [isThinking, isThinkingRef, voice]);
 
   // Resume the thread on launch. The backend has always persisted these turns
   // and fed them to the model; the UI just could not read them back, so every
@@ -67,22 +84,29 @@ export function useChat({ onTurnComplete }: ChatDeps) {
     setChatLog((prev) => [...prev, { id: `d-${Date.now()}`, sender: 'dexter', text, action, ...(extra || {}) }]);
   };
 
-  const handleSendMessage = async (customText?: string) => {
+  const handleSendMessage = async (customText?: string, options: SendOptions = {}) => {
     const textToSend = customText || inputMsg;
     if (!textToSend.trim()) return;
+    const via = options.via || 'text';
 
-    const userMsg: ChatMessage = { id: `u-${Date.now()}`, sender: 'user', text: textToSend };
+    const userMsg: ChatMessage = { id: `u-${Date.now()}`, sender: 'user', text: textToSend, via };
     setChatLog((prev) => [...prev, userMsg]);
     setInputMsg('');
     setIsThinking(true);
     setToolActivity('');
     streamMsgIdRef.current = null;
 
+    // Voice on means Dexter talks back; a reply to something spoken is shaped
+    // to be heard (short, no lists) whether or not it is voiced.
+    const speak = Boolean(voice?.canSpeak());
+    let gotAudio = false;
+    let replyText = '';
+
     try {
       // Streaming endpoint: tokens land as they are generated. The user's picked
       // provider/model (or 'auto') rides along on every turn.
       const choice = getLlmChoice();
-      const res = await chatStream(textToSend, choice.provider, choice.model);
+      const res = await chatStream(textToSend, choice.provider, choice.model, { speak, spoken: via === 'voice' });
 
       if (!res.ok || !res.body) throw new Error(`Chat failed: ${res.status}`);
 
@@ -124,14 +148,27 @@ export function useChat({ onTurnComplete }: ChatDeps) {
               const sid = streamMsgIdRef.current;
               setChatLog((prev) => prev.map((m) => (m.id === sid ? { ...m, text: m.text + piece } : m)));
             }
+          } else if (evt.type === 'escalated') {
+            // The small model handed this turn to the bigger, tool-enabled one (v8).
+            setToolActivity('bringing in the bigger model');
           } else if (evt.type === 'provider_switched') {
             // The reply restarts on a fallback provider; clear the partial text.
             const sid = streamMsgIdRef.current;
             if (sid) setChatLog((prev) => prev.map((m) => (m.id === sid ? { ...m, text: '' } : m)));
             setToolActivity(`retrying on ${evt.payload?.to || 'fallback'}`);
+          } else if (evt.type === 'audio' && speak) {
+            // A spoken sentence, ready while the rest is still being written.
+            gotAudio = true;
+            voice?.enqueueAudio(String(evt.payload?.url || ''));
+          } else if (evt.type === 'interrupted') {
+            // The user cut in. Keep whatever was rendered; drop the spinner.
+            setIsThinking(false);
+            setToolActivity('');
+            streamMsgIdRef.current = null;
           } else if (evt.type === 'reply') {
             setIsThinking(false);
             setToolActivity('');
+            replyText = String(evt.payload?.reply || '');
             const sid = streamMsgIdRef.current;
             streamMsgIdRef.current = null;
             if (sid) {
@@ -163,6 +200,9 @@ export function useChat({ onTurnComplete }: ChatDeps) {
 
       setIsThinking(false);
       setToolActivity('');
+      // Nothing was voiced (voice off, or a reply with no speakable text):
+      // still open the follow-up window so the next sentence needs no wake word.
+      if (via === 'voice' || speak) voice?.replyLanded(gotAudio, replyText);
     } catch (err) {
       console.warn('Chat request failed', err);
       setIsThinking(false);
@@ -173,6 +213,12 @@ export function useChat({ onTurnComplete }: ChatDeps) {
       ]);
     }
   };
+
+  // The mic is registered once on mount but must always dispatch to the current
+  // render's send closure; keep the shared handler ref pointed at it.
+  useEffect(() => {
+    if (commandHandlerRef) commandHandlerRef.current = (text: string) => handleSendMessage(text, { via: 'voice' });
+  });
 
   return {
     chatLog,

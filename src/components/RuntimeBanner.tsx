@@ -1,10 +1,15 @@
-import { AlertTriangle, X } from 'lucide-react';
+import { AlertTriangle, ShieldOff, X } from 'lucide-react';
 import type { RuntimeWarning } from '../types';
 
 interface Props {
   warnings: RuntimeWarning[];
   onDismiss: (code: string) => void;
 }
+
+// v9 codes that are about the guardian rather than the model, and get its icon:
+// Sentinel not answering, or its tray (the hand that actually freezes and
+// cleans) not running.
+const GUARDIAN_CODES = new Set(['sentinel_down', 'tray_down', 'gpu_busy', 'disk_tight', 'evicted']);
 
 /**
  * Says out loud when Dexter is running degraded, and what to do about it.
@@ -27,17 +32,21 @@ export function RuntimeBanner({ warnings, onDismiss }: Props) {
             alignItems: 'flex-start',
             gap: '10px',
             padding: '10px 12px',
-            border: '1px solid rgba(251, 191, 36, 0.35)',
-            background: 'rgba(251, 191, 36, 0.08)',
+            border: '1px solid #f3dcb0',
+            background: 'var(--warn-soft)',
             borderRadius: '10px',
           }}
         >
-          <AlertTriangle size={16} style={{ color: '#fbbf24', flexShrink: 0, marginTop: '2px' }} />
+          {GUARDIAN_CODES.has(warning.code) ? (
+            <ShieldOff size={16} style={{ color: 'var(--warn)', flexShrink: 0, marginTop: '2px' }} />
+          ) : (
+            <AlertTriangle size={16} style={{ color: 'var(--warn)', flexShrink: 0, marginTop: '2px' }} />
+          )}
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: '12px', color: '#fde68a', lineHeight: 1.45 }}>
+            <div style={{ fontSize: '12px', color: 'var(--warn)', lineHeight: 1.45 }}>
               {warning.message}
             </div>
-            <div style={{ fontSize: '11px', color: '#94a3b8', marginTop: '4px', lineHeight: 1.4 }}>
+            <div style={{ fontSize: '11px', color: 'var(--muted)', marginTop: '4px', lineHeight: 1.4 }}>
               {warning.action}
             </div>
           </div>
@@ -47,7 +56,7 @@ export function RuntimeBanner({ warnings, onDismiss }: Props) {
             style={{
               background: 'transparent',
               border: 'none',
-              color: '#94a3b8',
+              color: 'var(--muted)',
               cursor: 'pointer',
               padding: '2px',
               flexShrink: 0,

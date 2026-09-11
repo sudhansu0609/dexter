@@ -1,0 +1,212 @@
+backend/hybrid_llm.py (lines 151-360 of 633)
+151	        ):
+152	            online = bool(health[key]["online"])
+153	            providers[prov] = {
+154	                "online": online,
+155	                "url": url,
+156	                "models": self._list_models_at(url) if online else [],
+157	            }
+158	        return {
+159	            "providers": providers,
+160	            "preferred": self.default_provider,
+161	            # The model each provider defaults to when none is picked explicitly.
+162	            "defaultModel": {
+163	                "llamacpp": self.llamacpp_model or None,
+164	                "lmstudio": self.lm_studio_model or None,
+165	                "ollama": self.ollama_model or None,
+166	            },
+167	        }
+168	
+169	    # ───────────────────────── model discovery ─────────────────────────
+170	
+171	    def _discover_model(self, base_url: str) -> str:
+172	        """Ask the server what is actually loaded instead of guessing a name."""
+173	        if base_url in self._model_cache:
+174	            return self._model_cache[base_url]
+175	        try:
+176	            res = self.session.get(f"{base_url}/models", timeout=_PROBE_TIMEOUT)
+177	            if res.status_code == 200:
+178	                data = res.json().get("data") or []
+179	                if data:
+180	                    model_id = data[0].get("id", "")
+181	                    if model_id:
+182	                        self._model_cache[base_url] = model_id
+183	                        print(f"[HybridLLM] Detected model at {base_url}: {model_id}")
+184	                        return model_id
+185	        except Exception:
+186	            pass
+187	        return ""
+188	
+189	    def _model_for(self, provider: str, override: Optional[str]) -> str:
+190	        if override:
+191	            return override
+192	        if provider == "llamacpp":
+193	            return self.llamacpp_model or self._discover_model(self.llamacpp_url) or "local-model"
+194	        if provider == "lmstudio":
+195	            return self.lm_studio_model or self._discover_model(self.lm_studio_url) or "local-model"
+196	        if provider == "ollama":
+197	            return self.ollama_model or self._discover_model(self.ollama_url) or "llama3.2"
+198	        if provider == "gemini":
+199	            return "gemini-1.5-pro"
+200	        if provider == "openai":
+201	            return "gpt-4o"
+202	        return "local-model"
+203	
+204	    def _is_available(self, provider: str, providers: Dict[str, Any]) -> bool:
+205	        if provider == "llamacpp":
+206	            return bool(providers.get("llamacpp", {}).get("online"))
+207	        if provider == "lmstudio":
+208	            return bool(providers["lmStudio"]["online"])
+209	        if provider == "ollama":
+210	            return bool(providers["ollama"]["online"])
+211	        if provider == "gemini":
+212	            return bool(providers["gemini"]["configured"])
+213	        if provider == "openai":
+214	            return bool(providers["openai"]["configured"])
+215	        return False
+216	
+217	    def resolve_provider(self, provider: str = "auto") -> str:
+218	        if provider and provider != "auto":
+219	            return provider
+220	        providers = self.get_available_providers()
+221	        # Configured preference wins when it is actually up; otherwise fall back
+222	        # to the original local-first order.
+223	        order = ["llamacpp", "lmstudio", "ollama", "gemini", "openai"]
+224	        if self.default_provider != "auto":
+225	            order = [self.default_provider] + [p for p in order if p != self.default_provider]
+226	        for prov in order:
+227	            if self._is_available(prov, providers):
+228	                return prov
+229	        return "lmstudio"
+230	
+231	    def _base_url_for(self, provider: str) -> str:
+232	        if provider == "llamacpp":
+233	            return self.llamacpp_url
+234	        return self.ollama_url if provider == "ollama" else self.lm_studio_url
+235	
+236	    def _provider_chain(self, provider: str, needs_tools: bool = False) -> List[str]:
+237	        """
+238	        Ordered providers to try for one request. An explicit choice is honoured
+239	        exactly; "auto" is local-first with cloud fallback so a local server
+240	        dying mid-request degrades to a configured key instead of an apology.
+241	        Gemini is chat-only here (its path has no tool calling), so it is
+242	        skipped whenever tools are required.
+243	        """
+244	        if provider and provider != "auto":
+245	            return [provider]
+246	        health = self.get_available_providers()
+247	        chain: List[str] = []
+248	        if health.get("llamacpp", {}).get("online"):
+249	            chain.append("llamacpp")
+250	        if health["lmStudio"]["online"]:
+251	            chain.append("lmstudio")
+252	        if health["ollama"]["online"]:
+253	            chain.append("ollama")
+254	        if health["openai"]["configured"]:
+255	            chain.append("openai")
+256	        if health["gemini"]["configured"] and not needs_tools:
+257	            chain.append("gemini")
+258	        # Honour the configured default: move it to the front so it is tried
+259	        # first, while the others remain as graceful fallbacks. Frees the
+260	        # non-preferred local backend (e.g. LM Studio) for other work.
+261	        if self.default_provider != "auto" and self.default_provider in chain:
+262	            chain = [self.default_provider] + [p for p in chain if p != self.default_provider]
+263	        return chain or ["lmstudio"]
+264	
+265	    # ───────────────────────── chat ─────────────────────────
+266	
+267	    def chat(
+268	        self,
+269	        messages: List[Dict[str, Any]],
+270	        provider: str = "auto",
+271	        model: Optional[str] = None,
+272	        temperature: float = 0.5,
+273	        max_tokens: int = 768,
+274	        tools: Optional[List[Dict[str, Any]]] = None,
+275	        timeout: int = 90,
+276	        on_token: Optional[Callable[[str], None]] = None,
+277	        on_fallback: Optional[Callable[[str, str], None]] = None,
+278	        should_cancel: Optional[Callable[[], bool]] = None,
+279	    ) -> LLMResponse:
+280	        """
+281	        Full multi-turn chat with optional native tool calling.
+282	
+283	        `on_token` streams content deltas as they arrive (the request is made
+284	        with stream=True); the returned LLMResponse still carries the complete
+285	        content and parsed tool calls either way.
+286	
+287	        `on_fallback(failed, next)` fires before each retry against the next
+288	        provider in the chain, so callers can reset any tokens already shown.
+289	
+290	        `should_cancel()` is polled while a stream is consumed; when it returns
+291	        True generation stops and the response is flagged `cancelled` - returned
+292	        as-is without trying the next provider (a barge-in is not a failure).
+293	        """
+294	        chain = self._provider_chain(provider, needs_tools=bool(tools))
+295	        last: Optional[LLMResponse] = None
+296	        for idx, prov in enumerate(chain):
+297	            if should_cancel and should_cancel():
+298	                return LLMResponse(provider=prov, model=model or "", cancelled=True)
+299	            if idx > 0:
+300	                print(f"[HybridLLM] {chain[idx - 1]} failed mid-request; trying {prov}.")
+301	                if on_fallback:
+302	                    try:
+303	                        on_fallback(chain[idx - 1], prov)
+304	                    except Exception:
+305	                        pass
+306	            response = self._chat_one(
+307	                prov, messages, model, temperature, max_tokens, tools, timeout,
+308	                on_token, should_cancel,
+309	            )
+310	            if response.cancelled:
+311	                return response
+312	            if response.ok:
+313	                if idx > 0:
+314	                    response.fallback_from = chain[0]
+315	                return response
+316	            last = response
+317	            # The failed probe result is stale now; let the next request re-probe.
+318	            self.invalidate_health()
+319	        return last or LLMResponse(
+320	            provider=chain[0] if chain else "none",
+321	            error="No LLM provider is available.",
+322	        )
+323	
+324	    def _chat_one(
+325	        self,
+326	        prov: str,
+327	        messages: List[Dict[str, Any]],
+328	        model: Optional[str],
+329	        temperature: float,
+330	        max_tokens: int,
+331	        tools: Optional[List[Dict[str, Any]]],
+332	        timeout: int,
+333	        on_token: Optional[Callable[[str], None]],
+334	        should_cancel: Optional[Callable[[], bool]] = None,
+335	    ) -> LLMResponse:
+336	        model_name = self._model_for(prov, model)
+337	
+338	        if prov == "gemini":
+339	            if not self.gemini_api_key:
+340	                return LLMResponse(provider=prov, model=model_name,
+341	                                   error="Gemini API key not configured")
+342	            return self._chat_gemini(messages, model_name, temperature, max_tokens)
+343	
+344	        if prov == "openai":
+345	            if not self.openai_api_key:
+346	                return LLMResponse(provider=prov, model=model_name,
+347	                                   error="OpenAI API key not configured")
+348	            return self._chat_openai_compat(
+349	                "https://api.openai.com/v1", messages, model_name, temperature,
+350	                max_tokens, tools, timeout,
+351	                headers={"Authorization": f"Bearer {self.openai_api_key}"},
+352	                provider_label="openai", on_token=on_token, should_cancel=should_cancel,
+353	            )
+354	
+355	        return self._chat_openai_compat(
+356	            self._base_url_for(prov), messages, model_name, temperature,
+357	            max_tokens, tools, timeout, provider_label=prov, on_token=on_token,
+358	            should_cancel=should_cancel,
+359	        )
+360	
+… 273 more lines. Continue with read_file(path="backend/hybrid_llm.py", offset=361).

@@ -1,3 +1,105 @@
+# Dexter Roadmap v11 — Hands like mine (desktop control)
+
+**Status date:** 2026-09-11 · **Progress log:** `PROGRESS.md` · **Built by:** an Opus implementation agent from this plan
+**Status:** P1-P3 built 2026-09-11 (see `PROGRESS.md` v11); v11.1 the same day fixed why none of it was reachable by voice and added power + shell tools.
+**Owner's ask (2026-09-11):** "dexter opens chrome but not what i say in it, like opening a different website or closing chrome or a url, similarly other tasks. make it more smart so that it can do stuff like me, the minute stuff as well."
+
+## Why it fails today (measured in the code, not guessed)
+
+| You say | What happens | Why |
+|---|---|---|
+| "open chrome" | your everyday Chrome opens | `_FAST_RULES` → `open_app` (registry miss) → `launch_app` → `app_index` |
+| "open youtube" | "I couldn't find 'youtube' on this PC" | same rule: only URL-ish text (`youtube.com`) is treated as a site |
+| "open youtube.com" | a **second** Chrome window opens (Dexter's own Playwright profile under `data/browser_profile`) | `browser_open` drives Dexter's browser, never yours |
+| "close chrome" | closes one Chrome window by title, or nothing | `close_window` matches window titles; no notion of an app's process |
+| "close this tab", "go back", "search for lo-fi on youtube" | act in Dexter's window, or "no page open" | the `browser_*` tools do not know the Chrome you are looking at |
+| "scroll down", "press ctrl s", "type hello", "switch to code", "minimize this" | nothing | no keyboard / window / scroll tools exist |
+| "open youtube and search for lo-fi beats" | usually right (agent loop), sometimes "couldn't find 'youtube and search...'" | the open-rule swallows the whole sentence when it is ≤ 4 words |
+
+Two browsers is the root cause. Everything else is a missing hand.
+
+## Decisions (owner, 2026-09-11)
+
+- **D1 One Chrome, yours.** Dexter acts in the Chrome you use. Chrome 136+ refuses remote debugging on the default profile, so control is by three honest means: (a) `chrome.exe <url>` hands a URL to the running instance as a new tab; (b) keystrokes and window commands for tab/window actions; (c) Windows UI Automation (UIA) to *read* the active tab's URL, title, tab list and page text. Dexter's Playwright window stays only as an explicit fallback (`DEXTER_BROWSER_MODE=playwright`).
+- **D2 The minute stuff is a toolset,** not a model trick: press keys, type text, scroll, click by visible text, focus/switch/minimize/maximize/snap/close windows and apps, read what is on screen. Deterministic, testable with fakes, no real keystrokes in tests.
+- **D3 Context is the default.** "it / that / this / here / the tab" resolve to the active window; "in chrome, …" focuses first; a compound sentence is executed step by step by the agent loop and reported once.
+- **D4 Nothing destructive without a word.** Closing an app with unsaved work is the app's own prompt; Dexter never force-kills a window it was asked to "close" (only "kill" does that, with confirmation). No key is ever sent to a window that is not the one named or in focus.
+
+## Phase 1 — Your Chrome (P1)
+
+| # | Item | Acceptance |
+|---|---|---|
+| P1.1 | `chrome_control.py`: find Chrome windows (pygetwindow + psutil, by process), the active one, open a URL/search in the running instance (`chrome.exe <url>`; launch if not running), close a tab (Ctrl+W), close Chrome (WM_CLOSE to every Chrome window, then wait; never TerminateProcess unless `kill`), new tab, next/previous tab, reopen closed tab, back/forward/reload, find in page, zoom, fullscreen | "open youtube" → a **new tab in your Chrome** (launches it if closed); "close chrome" → every Chrome window closes cleanly; "close this tab" / "next tab" / "go back" / "reload" act in the tab you see |
+| P1.2 | UIA reader (pywinauto, `backend="uia"`): active tab URL (omnibox value), title, tab strip names, main document text (budgeted, ≤ 6 000 chars) | "what am I looking at" / "read this page" / "what tabs do I have open" answer from **your** Chrome |
+| P1.3 | Site names are sites: `open youtube`, `open gmail`, `go to reddit`, `search youtube for X`, `google X` resolve through `_SITE_ALIASES` + a "known sites" table (extend `browser.normalize_target`) **before** the app launcher; `open chrome` still opens Chrome; `open X` unknown to both → one clear question, not "couldn't find" | 12 phrases in `test_router.py` pinned |
+| P1.4 | The existing `browser_*` tools become **mode-aware**: default `own` routes open/close/tabs/back/read to `chrome_control`, `playwright` keeps today's behaviour; `browser_click`/`browser_type` in `own` mode use UIA (click by name) with keystroke fallback | `test_browser_tools.py` covers both modes with fakes |
+
+## Phase 2 — The minute stuff (P2)
+
+| # | Item | Acceptance |
+|---|---|---|
+| P2.1 | `desktop_control.py` + `tools_desktop.py`: `press_keys("ctrl+s")`, `type_text("…", submit=False)`, `scroll(direction, amount)`, `click_text("Save")` (UIA name match in the active window; pyautogui-free), `read_screen_text()` (UIA text of the active window, budgeted), `switch_to(app)`, `minimize/maximize/restore/snap_left/snap_right(window)`, `close_app(name)` (all windows of the process, graceful), `list_windows` grouped by app | "press control s", "type hello world", "select all and copy", "scroll down", "click save", "switch to code", "minimize this", "snap chrome to the left", "close notepad" |
+| P2.2 | App recipes: a small table of per-app hotkeys (Chrome, Edge, VS Code, Explorer, Spotify, Notepad, Discord, Premiere) so "new tab", "new file", "find", "toggle sidebar", "next track" pick the right keys for the **active** app | recipe table tested; unknown app → generic keys or a one-line "in X I don't know how" |
+| P2.3 | Safety: keys go only to the window named or in focus (focus is verified after `switch_to`, and refused if a *different* window took focus); `type_text` refuses secrets-looking input into a browser omnibox; `kill` needs confirmation; every action returns what it did and to which window | tests for every refusal |
+
+## Phase 3 — Understanding (P3)
+
+| # | Item | Acceptance |
+|---|---|---|
+| P3.1 | Reference resolution: "close it/this/that", "scroll here", "this tab", "the browser" resolve from the active window and the last thing Dexter opened (a `focus` memory in the router, per session, 5 min) | "open notepad" … "close it" closes Notepad; "open youtube" … "close that tab" closes it |
+| P3.2 | "in <app>, …" and "<app>: …" prefixes focus first, then run the rest; "and then / and / then" chains run through the agent loop with the desktop tools in the candidate set; one combined reply | "in chrome, go to gmail and open the first unread" (best effort on the last step) |
+| P3.3 | The fast-path open-rule stops swallowing sentences: anything with "and", "then", a URL, a site name, or > 3 words goes to the tiers below; `_NOT_AN_APP` extended | `test_router.py`: 20 new phrases, zero regressions |
+| P3.4 | `test_agent_eval.py`: 15 desktop/browser cases so the model's choice is measured, not assumed | eval file runs (skipped without a model) |
+
+## Phase 4 — Teach me (P4) — *not in this build*
+
+Playbooks ("when I say start streaming: open OBS, …") on top of the macro recorder, and a Chrome extension with native messaging for full DOM access in your own Chrome. Planned; not built now.
+
+## Not doing
+
+- Remote-debugging the daily Chrome profile (Chrome forbids it since 136; a copy of the profile is not "your Chrome").
+- Screen-vision clicking (OCR / vision model). UIA names cover what is clickable; a picture is Phase 4 material.
+- Force-killing anything on "close".
+
+---
+
+# Dexter Roadmap v9 — Sentinel rules, Dexter runs the apps
+
+**Status date:** 2026-09-10 · **Progress log:** `PROGRESS.md` · **Cross-repository contract:** [`../GUARDIAN_PLAN.md`](../GUARDIAN_PLAN.md)
+**Owner's ask (2026-09-10):** "Dexter controls every app in
+`B:\youtubeProjects\Buzzcaf_Media`; Sentinel is the supreme guardian of VRAM and
+RAM so the PC never hangs, and uses SmartCleaner to free space; Dexter is my
+coworker/coach and asks Sentinel for permission before loading models."
+
+What was wrong: five places in Dexter loaded or unloaded a model, only one of
+them asked Sentinel, and none of them ever called `Release`. Dexter could open
+Chrome and start the Studio but could not tell you whether VrDeep was rendering,
+and `launch_app` would happily fire up a 10 GB pipeline beside a 12 GB model
+server. On a 16 GB card shared with VrDeep, BuzzEdit's ComfyUI and buzzcode's
+27B, that is how the machine locks up.
+
+| # | Item | Design | Acceptance |
+|---|---|---|---|
+| D1 | Sentinel client + lifecycle | `sentinel_client.py` speaks protocol v2: `hello()`/`features()`, `register(… ram_budget_mib, priority, label)` keeping the token, `reserve(mib, ram_mib, for_pid, ttl)`, `query`, `ram_status`, `disk_status`, `request_cleanup`, `app_status`, `release()`, `unregister()`. New fields go on the wire **only** when `Hello` says they are understood, so the v1 service installed today keeps working byte for byte. `router.sentinel_start()` registers and subscribes; `sentinel_stop()` releases, unregisters and stops the thread in the lifespan shutdown | **N1** `Hello` failing degrades to v1 (`features=[]`, no `ram_mib` on the wire, `Query` skipped and "would be granted"), verified live against the installed service in well under a second |
+| D2 | **The model steward** | `model_steward.py` is the *only* module allowed to call `hybrid_llm.warm_model`/`release_model`/`set_keep_alive`, enforced by a grep test. `ensure()` estimates VRAM **and** RAM, `Reserve`s, loads, then `Release`s once the load is *observed* in `/api/ps` — or immediately on failure. `shed()` runs the ladder for `VramTight`/`RamTight`/`Preempt`: smart model → (red) fast model → foreign Ollama models → LM Studio → an engine Dexter started. Every old load path is rewired: startup warm, `_keep_fast_model_warm`, Tier 1.5 escalation, `code_agent` | **N2** no module outside the steward touches model residency; a refusal loads **nothing**, names the holder and the allowed move, and Dexter keeps answering on whatever is resident; every booking is released on success *and* on failure |
+| D3 | The apps registry | `apps_registry.py` + `data/apps.default.json` (all 17 projects with real launch scripts, cwd, probes, stop strategies, class, VRAM/RAM, `exclusive_with`, logs; owner overrides in `data/apps.json`, never written by Dexter). `procs.py` (psutil, else `Get-CimInstance`/`tasklist`/`netstat`): find by name **and path**, port owner, kill tree, RSS, uptime. `tools_apps.py`: `app_status`, `apps_overview`, `open_app`, `stop_app`, `restart_app`, `app_logs`, `request_cleanup`, plus the thin readers `vrdeep_queue`, `buzzedit_status`, `finance_status`, `coffee_brief`, `mastgaane_report`. All Tier-0 rules. The Studio keeps `buzzcaf_client` | **N3** "open buzzedit", "start vrdeep", "is buzzfin running", "stop caliber", "what's running", "clean up space" resolve without a model; "open chrome" and "close notepad" still route as before |
+| D4 | Resource-aware launch | `open_app` for a batch app or anything with `vram_mib>0`: `exclusive_with` check, `sentinel.query(vram, ram)`, RAM zone (Yellow warns, Red refuses), then launch and poll the probe for 30 s and report honestly. Refusals name the holders and the moves; a record's `warn` (MidnightBuzz binds `0.0.0.0`, BuzzAnimate builds on launch) is passed on | **N4** a refused `Query` launches nothing and names who has the memory; an exclusive app that is running blocks the launch by name |
+| D5 | The UI | `GET /api/dexter/resources`, `GET /api/dexter/apps`, `POST /api/dexter/apps/{id}/start\|stop`, `POST /api/dexter/nudge` (loopback + token, for Mission Reminder). `ResourcePanel.tsx` (three gauges, holders, frozen, pause/resume/clean), `AppsPanel.tsx` (the v8 `AppLauncher` grown up: running/stopped, start/stop with confirmation, the quick OS launcher kept). SSE `resources`/`gpu_busy`/`disk_tight`/`evicted` → banners and the pop-up; `RuntimeBanner` gains `sentinel_down` and `tray_down` | **N5** an absent or old Sentinel reads as "the guardian is old", never as an empty gauge; stopping a busy batch app from the panel asks first and only the second click confirms |
+| D6 | The coworker layer | One machine line in `companion.context_block()` and in the morning brief (who has the GPU, RAM %, disk free, last night's cleanup). Initiative candidates `gpu_free_queue_waiting`, `disk_low`, `frozen_long`, `evicted_notice`, ordered *after* the work ones. Mission Reminder's runtime mirror is read (never written) into "Right now", and **Dexter's own nudges are suppressed while one of its focus blocks is running** | **N6** the machine line is in every prompt and degrades to nothing when the guardian is down; a running Mission Reminder session silences check-ins, tails, nudges and proposals; a stale mirror does not |
+| D7 | Settings | `settings_store.SETTINGS` gains a **Machine** group with `module`/`attr` so it hot-reloads: VRAM/RAM budgets, `DEXTER_MANAGE_LMSTUDIO`, `DEXTER_AUTO_CLEAN`, engine VRAM/RAM, `DEXTER_APPS_FILE`, `MISSION_REMINDER_RUNTIME`; `.env.example` documents all of them | **N7** changing the VRAM budget in Settings takes effect on the next reservation without a restart |
+| D8 | Verification | `FakeSentinel` extended with the v2 commands while every v1 test stays; `test_model_steward.py` (incl. the monopoly grep), `test_apps_registry.py`, `test_tools_apps.py`, router refusal/lifecycle tests, vitest for both panels; `test_dexter_suite.py` scenario E, skipped when no pipe answers | **N8** `python -m pytest backend -q`, `npx tsc --noEmit`, `npx vitest run` and `npm run build` all green; nothing in the suite can reach a real process, a real model or the real Sentinel |
+| D9 | Docs | `ECOSYSTEM.md` rewritten around the full port map, the Sentinel contract and the steward rule, and copied byte-identical to `BuzzcafAI/`; this table; `PROGRESS.md` evidence; a README section | **N9** both `ECOSYSTEM.md` copies hash the same |
+| **P1** | **Ports: nothing hardcoded** | `backend/buzzcaf_ports.py` (stdlib only) is the canonical Python implementation of GUARDIAN_PLAN.md section 11 - `pick_port` / `publish` / `withdraw` / `discover` / `ledger_path` over a shared ledger at `%LOCALAPPDATA%\Buzzcaf\ports.json`, and it is copied byte-identical into every Python app. Dexter picks its own port from `DEXTER_PORT` (8098) upwards in `desktop_app.py` / `main.py`, answers `/health` with `{app, status, port, pid, version}`, publishes once that route answers and withdraws on exit; CORS, the window, `/status` and `/resources` all name the chosen port. `src/api.ts` derives the API base from `window.location.origin` (Vite dev proxies from `VITE_DEXTER_PORT`), `apps.default.json` carries `preferred_port` + `extra_preferred`, the registry probes `discover()` with the identity rule, `buzzcaf_client` reads the ledger before `studio.runtime.json`, and `LLAMACPP_URL` falls back to the ledger's `buzzcode` entry. `start_dexter.bat` no longer fixes a port or kills whoever holds one | **P1** with 8098 deliberately occupied Dexter starts on 8099, `/health` identifies it, the ledger has the entry, `python test_dexter_suite.py` passes against it, and the entry is gone after a clean exit |
+
+**Not doing.** Dexter does not kill anything Sentinel has not classified, does
+not delete files (SmartCleaner runs from Sentinel's tray, in the user session,
+where it can actually see `%TEMP%`), does not override a refusal, and does not
+write `C:\ProgramData\Sentinel`. Mission Reminder's mission model and Dexter's
+stay two separate things — the bridge is read-only so neither can corrupt the
+other.
+
+---
+
 # Dexter Roadmap v7 — A coworker, not a program
 
 **Status date:** 2026-09-06 · **Progress log:** `PROGRESS.md`

@@ -1,30 +1,55 @@
-import { Maximize2, Minimize2, Settings, WifiOff, X } from 'lucide-react';
+import type { CSSProperties } from 'react';
+import { Maximize2, Mic, MicOff, Minimize2, Settings, WifiOff, X } from 'lucide-react';
+import type { VoiceState } from '../hooks/useVoice';
 
 interface Props {
   isExpanded: boolean;
   onToggleExpand: () => void;
   online: boolean;
   onToggleSettings: () => void;
+  // v10: the voice on/off switch. Absent in shells without voice.
+  voiceState?: VoiceState;
+  voiceReason?: string;
+  voiceMode?: string;
+  onToggleVoice?: () => void;
 }
 
-// Desktop window title bar: brand, connectivity, settings, and the window
-// action controls.
-export function Header({
-  isExpanded,
-  onToggleExpand,
-  online,
-  onToggleSettings,
-}: Props) {
+const VOICE_LABEL: Record<VoiceState, string> = {
+  starting: 'Voice…',
+  unavailable: 'No voice',
+  off: 'Voice off',
+  standby: 'Voice',
+  idle: 'Voice on',
+  listening: 'Listening',
+  thinking: 'Voice on',
+  speaking: 'Speaking',
+  enrolling: 'Learning',
+};
+
+const iconButton: CSSProperties = {
+  background: 'transparent',
+  color: 'var(--muted)',
+  border: '1px solid transparent',
+  width: '30px',
+  height: '30px',
+  borderRadius: '9px',
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+};
+
+// Title bar: name, connectivity, voice switch, settings, and the compact / full toggle.
+export function Header({ isExpanded, onToggleExpand, online, onToggleSettings, voiceState, voiceReason, voiceMode, onToggleVoice }: Props) {
   return (
     <header
-      className="dexter-panel dexter-header"
+      className="dexter-header"
       style={
         {
-          padding: '10px 16px',
+          padding: '4px 4px 10px',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'space-between',
-          marginBottom: '14px',
+          marginBottom: '6px',
           appRegion: 'drag',
         } as any
       }
@@ -32,113 +57,59 @@ export function Header({
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
         <div
           style={{
-            width: '32px',
-            height: '32px',
-            borderRadius: '10px',
-            background: 'linear-gradient(135deg, #38bdf8 0%, #a855f7 100%)',
+            width: '28px',
+            height: '28px',
+            borderRadius: '9px',
+            background: 'var(--accent)',
+            color: '#fff',
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'center',
-            fontSize: '18px',
+            fontSize: '13px',
+            fontWeight: 700,
           }}
         >
-          🧠
+          D
         </div>
-        <div>
-          <h1
-            style={{
-              fontSize: '15px',
-              color: '#f8fafc',
-              margin: 0,
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-            }}
-          >
-            DEXTER{' '}
-            <span
-              style={{
-                fontSize: '9px',
-                background: 'rgba(56, 189, 248, 0.2)',
-                color: '#38bdf8',
-                padding: '1px 6px',
-                borderRadius: '8px',
-                border: '1px solid rgba(56, 189, 248, 0.4)',
-              }}
-            >
-              DESKTOP AI
+        <h1 style={{ fontSize: '15px', margin: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
+          Dexter
+          <span className={`dexter-status-dot${online ? '' : ' off'}`} title={online ? 'Online' : 'No network connection'} />
+          {!online && (
+            <span style={{ fontSize: '11px', color: 'var(--danger)', display: 'flex', alignItems: 'center', gap: '3px', fontWeight: 500 }}>
+              <WifiOff size={11} /> offline
             </span>
-            {!online && (
-              <span
-                title="No network connection"
-                style={{
-                  fontSize: '9px',
-                  background: 'rgba(239, 68, 68, 0.2)',
-                  color: '#f87171',
-                  padding: '1px 6px',
-                  borderRadius: '8px',
-                  border: '1px solid rgba(239, 68, 68, 0.4)',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '3px',
-                }}
-              >
-                <WifiOff size={9} /> OFFLINE
-              </span>
-            )}
-          </h1>
-        </div>
+          )}
+        </h1>
       </div>
 
-      {/* Window action controls */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', appRegion: 'no-drag' } as any}>
-        <button
-          type="button"
-          onClick={onToggleSettings}
-          style={{
-            background: 'rgba(148, 163, 184, 0.15)',
-            color: '#94a3b8',
-            border: '1px solid rgba(148, 163, 184, 0.3)',
-            padding: '6px 8px',
-            borderRadius: '10px',
-            display: 'flex',
-            alignItems: 'center',
-          }}
-          title="Settings"
-        >
-          <Settings size={14} />
-        </button>
-
-        {/* Window Expand / Compact Toggle */}
-        <button
-          type="button"
-          onClick={onToggleExpand}
-          style={{
-            background: 'rgba(15, 23, 42, 0.6)',
-            color: '#38bdf8',
-            border: '1px solid var(--bg-card-border)',
-            padding: '6px 8px',
-            borderRadius: '8px',
-          }}
-          title={isExpanded ? 'Compact View' : 'Expand Full Dashboard'}
-        >
-          {isExpanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-        </button>
-
-        {/* Electron Close Window */}
-        {(window as any).electronAPI && (
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', appRegion: 'no-drag' } as any}>
+        {voiceState && onToggleVoice && (
           <button
             type="button"
-            onClick={() => (window as any).electronAPI.close()}
-            style={{
-              background: 'rgba(239, 68, 68, 0.2)',
-              color: '#f87171',
-              border: '1px solid rgba(239, 68, 68, 0.4)',
-              padding: '6px 8px',
-              borderRadius: '8px',
-            }}
+            className={`dexter-voice-toggle ${voiceState}`}
+            onClick={onToggleVoice}
+            disabled={voiceState === 'unavailable' || voiceState === 'starting'}
+            title={
+              voiceState === 'unavailable'
+                ? `Voice unavailable: ${voiceReason || 'no microphone'}`
+                : voiceState === 'off'
+                  ? 'Turn voice on'
+                  : 'Turn voice off (mic released, replies not spoken)'
+            }
           >
-            <X size={14} />
+            {voiceState === 'off' || voiceState === 'unavailable' ? <MicOff size={13} /> : <Mic size={13} />}
+            {(voiceState === 'idle' || voiceState === 'thinking') && voiceMode === 'open' ? 'Open mic' : VOICE_LABEL[voiceState]}
+          </button>
+        )}
+        <button type="button" onClick={onToggleSettings} style={iconButton} title="Settings">
+          <Settings size={15} />
+        </button>
+        <button type="button" onClick={onToggleExpand} style={iconButton} title={isExpanded ? 'Compact view' : 'Full dashboard'}>
+          {isExpanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+        </button>
+        {(window as any).electronAPI && (
+          <button type="button" onClick={() => (window as any).electronAPI.close()} style={iconButton} title="Close">
+            <X size={15} />
           </button>
         )}
       </div>

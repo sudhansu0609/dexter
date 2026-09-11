@@ -1,6 +1,10 @@
+/// <reference types="vite/client" />
 // Single home for the backend base URL, the per-run auth token, and every typed
 // endpoint call (roadmap Phase 6, item 11 + 3). Nothing outside this file builds
-// a backend URL or references the port, so `:8098` appears in exactly one place.
+// a backend URL, and since GUARDIAN_PLAN.md section 11 the port is not written
+// down here at all - Dexter's backend takes the first free port from 8098
+// upwards, so any literal in this file would be wrong the first time something
+// else held it.
 //
 // The backend mints a fresh session token every start and requires it as
 // X-Dexter-Token on every /api/ call. The token itself is fetched from the
@@ -19,9 +23,28 @@ import type {
   Task,
   UserProfile,
   WorkbookSnapshot,
- MissionStatus } from './types';
+ MissionStatus,
+  ResourceSnapshot,
+  AppRow,
+  ToolReply } from './types';
 
-export const API_BASE = 'http://localhost:8098';
+function resolveApiBase(): string {
+  // Served by the backend itself - the pywebview window, and anything that
+  // opens the built bundle - so the origin already carries the right port
+  // whatever it turned out to be (section 11, rule 6).
+  if (typeof window !== 'undefined' && /^https?:$/.test(window.location?.protocol || '')) {
+    return window.location.origin;
+  }
+  // A shell with no http origin (Electron's file://). It gets the backend port
+  // baked in at build time from VITE_DEXTER_PORT; relative URLs are the last
+  // resort and only work behind a proxy.
+  const port = import.meta.env?.VITE_DEXTER_PORT;
+  return port ? `http://127.0.0.1:${port}` : '';
+}
+
+// In `npm run dev` this is the Vite origin and Vite proxies /api and /health to
+// the backend port it was launched with (see vite.config.ts).
+export const API_BASE = resolveApiBase();
 const DEXTER = `${API_BASE}/api/dexter`;
 
 let token: string | null = null;
@@ -201,14 +224,107 @@ export const getModels = () => getJson<LlmModelsResponse>('/llm/models');
 // tokens can be rendered as they arrive. `provider`/`model` let the UI route a
 // turn to a specific backend; 'auto' + null falls back to the server's
 // configured preference (DEXTER_LLM_PROVIDER).
+export interface ChatStreamOptions {
+  // Speak the reply: the stream carries `audio` events, one clip per sentence.
+  speak?: boolean;
+  // The message was spoken, so the reply is shaped to be heard, not read.
+  spoken?: boolean;
+}
+
 export function chatStream(
   message: string,
   provider: string = 'auto',
   model: string | null = null,
+  options: ChatStreamOptions = {},
 ): Promise<Response> {
   return apiFetch(`${DEXTER}/chat/stream`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ message, provider: provider || 'auto', model: model || null }),
+    body: JSON.stringify({
+      message,
+      provider: provider || 'auto',
+      model: model || null,
+      voiceEnabled: Boolean(options.speak),
+      voiceInput: Boolean(options.spoken),
+    }),
   });
 }
+
+// ───────────────────────────── voice (v10) ─────────────────────────────
+
+// WebSocket cannot send headers either; the voice audio channel authenticates
+// with the token as a query param, like the SSE stream. `window` names which
+// shell window this is (full / popup) so the backend can arbitrate the mic.
+export async function voiceWsUrl(windowName = 'full', session = 'default'): Promise<string> {
+  const t = await ensureToken();
+  const wsBase = API_BASE.replace(/^http/, 'ws');
+  return `${wsBase}/api/dexter/voice/ws?session=${encodeURIComponent(session)}&window=${encodeURIComponent(
+    windowName,
+  )}${t ? `&token=${encodeURIComponent(t)}` : ''}`;
+}
+
+// One clip for something Dexter says on its own (a reminder, a check-in).
+export async function generateTts(text: string, emotion: string | undefined, isReminder: boolean): Promise<Blob> {
+  const res = await apiFetch(`${DEXTER}/tts/generate`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ text, emotion, isReminder }),
+  });
+  if (!res.ok) throw new Error(`TTS failed: ${res.status}`);
+  return res.blob();
+}
+
+// Absolute URL for a streamed audio clip (the backend returns a relative path).
+export const audioUrl = (url: string) => (url.startsWith('http') ? url : `${API_BASE}${url}`);
+
+// Cut the reply that is being generated (the stop button / Esc).
+export const voiceInterrupt = (session = 'default') => post('/voice/interrupt', { session });
+
+// Who Dexter listens to (v10.2): enrolment state and the speaker settings.
+export interface VoiceProfile {
+  available: boolean;
+  enrolled: boolean;
+  enrolledAt?: string | null;
+  enrolledSeconds?: number | null;
+  strict: boolean;
+  threshold: number;
+  dexterVoice?: string | null;
+  wakeMode?: string;
+  voiceKey?: string;
+}
+export const getVoiceProfile = () => getJson<VoiceProfile>('/voice/profile');
+export async function forgetVoiceProfile(): Promise<VoiceProfile> {
+  const res = await apiFetch(`${DEXTER}/voice/profile`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(`Forget failed: ${res.status}`);
+  return res.json();
+}
+
+// One clip in a given voice, for picking one by ear.
+export async function previewVoice(voiceKey: string, text?: string): Promise<Blob> {
+  const res = await apiFetch(`${DEXTER}/voice/preview`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ voiceKey, text: text || null }),
+  });
+  if (!res.ok) throw new Error(`Preview failed: ${res.status}`);
+  return res.blob();
+}
+
+// ───────────────── resources, apps and nudges (roadmap v9) ─────────────────
+
+export const getResources = () => getJson<ResourceSnapshot>('/resources');
+
+export const getApps = () => getJson<{ apps: AppRow[]; root: string }>('/apps');
+
+export const startAppById = (id: string) =>
+  postJson<ToolReply>(`/apps/${encodeURIComponent(id)}/start`);
+
+// A batch app in the middle of a job needs `confirm` - the same guard the chat
+// asks for out loud, so the panel is not the quiet way round it.
+export const stopAppById = (id: string, confirm = false) =>
+  postJson<ToolReply>(`/apps/${encodeURIComponent(id)}/stop?confirm=${confirm ? 'true' : 'false'}`);
+
+// The Sentinel/batch tools are reached the way the user reaches them: as a
+// sentence. One code path for "pause batch jobs", whether tapped or typed.
+export const runPhrase = (message: string) =>
+  postJson<{ reply: string; action: string }>('/chat', { message });

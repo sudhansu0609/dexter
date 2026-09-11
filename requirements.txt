@@ -5,6 +5,19 @@ pydantic
 requests
 python-dotenv
 
+# ── Voice (v10) ──
+# All optional: each piece degrades on its own (no Kokoro -> edge-tts, no
+# faster-whisper -> the mic is reported unavailable) and the UI says which.
+faster-whisper   # local speech-to-text (CPU int8 by default; CUDA if cuBLAS/cuDNN DLLs are present)
+openwakeword     # fully-local wake word ("hey jarvis" stock model)
+silero-vad       # voice-activity detection (uses the torch already pulled in by sentence-transformers)
+kokoro-onnx      # local neural voice
+soundfile
+edge-tts         # online fallback voice when Kokoro's model files are missing
+# Who is talking: `pip install --no-deps resemblyzer` (its webrtcvad dependency has
+# no wheel for Python 3.14 and speaker_id.py never calls the one helper that uses it).
+# resemblyzer
+
 # ── Scheduling & reminders ──
 apscheduler
 dateparser

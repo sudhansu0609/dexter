@@ -24,6 +24,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import env_boot  # noqa: F401  - loads .env for every entry point
+import sentinel_client
 
 import requests
 
@@ -77,7 +78,17 @@ def _model_size_mb(ollama_url: str, model: str) -> Optional[int]:
 
 
 def _gpu_state() -> Optional[Dict[str, Any]]:
-    """Total/used/free VRAM via nvidia-smi. None when there is no NVIDIA GPU."""
+    """Total/used/free VRAM. None when there is no GPU we can read.
+
+    Sentinel first: it is already reading the card every second for its own
+    ladder, so asking it costs a fraction of a millisecond on a pipe instead of
+    spawning `nvidia-smi` (tens of milliseconds, and a process creation on a
+    machine that is by definition already struggling). `nvidia-smi` stays as the
+    fallback for when Sentinel is not installed or not running.
+    """
+    from_sentinel = _gpu_state_from_sentinel()
+    if from_sentinel is not None:
+        return from_sentinel
     smi = shutil.which("nvidia-smi")
     if not smi:
         return None
@@ -104,6 +115,50 @@ def _gpu_state() -> Optional[Dict[str, Any]]:
         }
     except Exception:
         return None
+
+
+def _gpu_state_from_sentinel() -> Optional[Dict[str, Any]]:
+    """The primary adapter as Sentinel reports it, or None when it cannot say."""
+    try:
+        status = sentinel_client.client().gpu_status()
+    except Exception:
+        return None
+    if not status:
+        return None
+    primary = next((a for a in status.get("adapters", []) if a.get("is_primary")), None)
+    if not primary or not primary.get("total"):
+        return None
+    mib = 1024 * 1024
+    return {
+        "name": primary.get("name", "GPU"),
+        "totalMb": int(primary.get("total", 0)) // mib,
+        "usedMb": int(primary.get("used", 0)) // mib,
+        "freeMb": int(primary.get("free", 0)) // mib,
+        "source": "sentinel",
+    }
+
+
+def sentinel_state() -> Dict[str, Any]:
+    """What Sentinel is doing, for /status. Never raises, never blocks for long."""
+    try:
+        client = sentinel_client.client()
+        status = client.gpu_status()
+    except Exception:
+        status = None
+    if not status:
+        return {"connected": False, "frozen": [], "reservations": [], "version": None, "features": []}
+    return {
+        "connected": True,
+        "zone": status.get("zone"),
+        "frozen": status.get("frozen", []),
+        "reservations": status.get("reservations", []),
+        "registrations": status.get("registrations", []),
+        # v9: which protocol the guardian speaks, so the UI can say "old build"
+        # rather than showing an empty RAM gauge and looking broken.
+        "version": client.version(),
+        "features": client.features(),
+        "trayAlive": status.get("tray_alive"),
+    }
 
 
 def _gpu_hogs() -> List[str]:
@@ -246,6 +301,8 @@ def diagnose(
                 "action": free_the_gpu,
             })
 
+    warnings.extend(_guardian_warnings())
+
     ok = not warnings
     result: Dict[str, Any] = {
         "ok": ok,
@@ -263,6 +320,45 @@ def diagnose(
         _cache = result
         _cache_at = now
     return result
+
+
+def _guardian_warnings() -> List[Dict[str, str]]:
+    """Say when the guardian, or its hands, are missing (roadmap v9, D5).
+
+    Both of these are silent failures otherwise: with Sentinel down Dexter
+    happily loads models next to a render, and with the tray down Sentinel can
+    *decide* to freeze a batch job but has nobody in the user session to do it,
+    so nothing happens and the machine keeps grinding.
+    """
+    if os.getenv("DEXTER_SENTINEL", "1").strip().lower() in ("0", "false", "no", "off"):
+        return []
+    out: List[Dict[str, str]] = []
+    try:
+        client = sentinel_client.client()
+        status = client.gpu_status()
+    except Exception:
+        status = None
+    if not status:
+        return [{
+            "code": "sentinel_down",
+            "message": (
+                "Sentinel — the guardian that decides who gets VRAM and RAM — is not "
+                "answering. I'll keep working, but nothing is stopping two things from "
+                "claiming the same memory."
+            ),
+            "action": "Check the Sentinel service is running (services.msc → Sentinel).",
+        }]
+    if status.get("tray_alive") is False:
+        out.append({
+            "code": "tray_down",
+            "message": (
+                "Sentinel's tray isn't running. The service can decide to pause a "
+                "background job or free disk space, but the tray is what carries that "
+                "out in your session — so those steps are not happening."
+            ),
+            "action": "Start Sentinel's tray (it normally runs at logon).",
+        })
+    return out
 
 
 def summary_lines(diagnosis: Dict[str, Any]) -> List[str]:

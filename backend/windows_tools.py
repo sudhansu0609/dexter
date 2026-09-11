@@ -14,7 +14,7 @@ import os
 import subprocess
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from tool_registry import ToolResult, tool
 
@@ -326,7 +326,7 @@ def focus_window(title: str) -> ToolResult:
     if not _gw:
         return ToolResult.fail("Window control needs pygetwindow. Run: pip install pygetwindow")
     try:
-        matches = [w for w in _gw.getAllWindows() if title.lower() in (w.title or "").lower()]
+        matches = _rank_windows(_gw.getAllWindows(), title)
         if not matches:
             return ToolResult.fail(f"No open window matching '{title}'.")
         window = matches[0]
@@ -339,19 +339,47 @@ def focus_window(title: str) -> ToolResult:
         return ToolResult.fail(f"Could not focus that window: {exc}")
 
 
+def _rank_windows(windows, title: str):
+    """Whole-word matches first ("notepad" is Notepad, not Notepad++; "code" is
+    VS Code, not "Decode.png"), then plain substring matches. Returns [] when
+    nothing matches at all."""
+    import re as _re
+
+    wanted = (title or "").strip().lower()
+    if not wanted:
+        return []
+    word = _re.compile(r"(?<![\w+#])" + _re.escape(wanted) + r"(?![\w+#])", _re.I)
+    exact, loose = [], []
+    for w in windows:
+        text = (w.title or "").strip()
+        if not text:
+            continue
+        if word.search(text):
+            exact.append(w)
+        elif wanted in text.lower():
+            loose.append(w)
+    return exact or loose
+
+
 @tool(
     name="close_window",
-    description="Close an open application window by part of its title.",
+    description=(
+        "Close one open window by part of its title. "
+        "To close a whole application (all of its windows) use close_app instead."
+    ),
     params={"title": {"type": "string", "description": "Part of the window title"}},
-    examples=["close chrome", "close that window", "shut the browser"],
-    confirm=True,
+    examples=["close that window", "close this window", "shut the window called report",
+              "close the window titled invoice"],
+    # No confirmation (v8): applications prompt for unsaved work themselves, and
+    # "close notepad" -> "are you sure?" made a one-word job a two-step one.
+    confirm=False,
     category="system",
 )
 def close_window(title: str) -> ToolResult:
     if not _gw:
         return ToolResult.fail("Window control needs pygetwindow. Run: pip install pygetwindow")
     try:
-        matches = [w for w in _gw.getAllWindows() if title.lower() in (w.title or "").lower()]
+        matches = _rank_windows(_gw.getAllWindows(), title)
         if not matches:
             return ToolResult.fail(f"No open window matching '{title}'.")
         closed = matches[0].title
@@ -396,6 +424,145 @@ def sleep_pc() -> ToolResult:
         return ToolResult(ok=True, summary="Going to sleep.")
     except Exception as exc:
         return ToolResult.fail(f"Could not sleep the PC: {exc}")
+
+
+# Restart / shut down / sign out go through shutdown.exe with a short grace so
+# a "never mind" within it still works (`cancel_shutdown`). All three ask first:
+# they end every app on the machine, and a small model that hears "restart my
+# pc" in the middle of a sentence about a render must not be able to act alone.
+
+
+def _shutdown_exe(*flags: str) -> None:
+    subprocess.Popen(
+        ["shutdown.exe", *flags],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+POWER_GRACE_SECONDS = int(os.getenv("DEXTER_POWER_GRACE_SECONDS", "10") or 10)
+
+
+def _power_prompt(verb: str) -> Callable[[Dict[str, Any]], str]:
+    def _build(_args: Dict[str, Any]) -> str:
+        return (
+            f"{verb} closes everything that's open - anything unsaved is lost. "
+            "Say yes and I'll do it."
+        )
+
+    return _build
+
+
+@tool(
+    name="restart_pc",
+    description="Restart this computer. Destructive: every app closes. Ask first; only on a clear request.",
+    params={},
+    examples=["restart my pc", "reboot the computer", "restart windows", "reboot this machine"],
+    confirm=True,
+    category="system",
+)
+def restart_pc() -> ToolResult:
+    try:
+        _shutdown_exe("/r", "/t", str(POWER_GRACE_SECONDS), "/c", "Dexter is restarting the PC.")
+        return ToolResult(
+            ok=True,
+            summary=f"Restarting in {POWER_GRACE_SECONDS} seconds. Say 'cancel the restart' to stop it.",
+            data={"grace": POWER_GRACE_SECONDS},
+        )
+    except Exception as exc:
+        return ToolResult.fail(f"Could not restart: {exc}")
+
+
+restart_pc._dexter_confirm_prompt = _power_prompt("Restarting")
+
+
+@tool(
+    name="shutdown_pc",
+    description="Shut this computer down (power off). Destructive: every app closes. Ask first.",
+    params={},
+    examples=["shut down my pc", "power off the computer", "turn off the pc", "shutdown windows"],
+    confirm=True,
+    category="system",
+)
+def shutdown_pc() -> ToolResult:
+    try:
+        _shutdown_exe("/s", "/t", str(POWER_GRACE_SECONDS), "/c", "Dexter is shutting the PC down.")
+        return ToolResult(
+            ok=True,
+            summary=f"Shutting down in {POWER_GRACE_SECONDS} seconds. Say 'cancel the shutdown' to stop it.",
+            data={"grace": POWER_GRACE_SECONDS},
+        )
+    except Exception as exc:
+        return ToolResult.fail(f"Could not shut down: {exc}")
+
+
+shutdown_pc._dexter_confirm_prompt = _power_prompt("Shutting down")
+
+
+@tool(
+    name="sign_out",
+    description="Sign out of Windows (log off). Every app closes. Ask first.",
+    params={},
+    examples=["sign me out", "log off windows", "log out of my account", "sign out of windows"],
+    confirm=True,
+    category="system",
+)
+def sign_out() -> ToolResult:
+    try:
+        _shutdown_exe("/l")
+        return ToolResult(ok=True, summary="Signing you out.")
+    except Exception as exc:
+        return ToolResult.fail(f"Could not sign out: {exc}")
+
+
+sign_out._dexter_confirm_prompt = _power_prompt("Signing out")
+
+
+@tool(
+    name="cancel_shutdown",
+    description="Cancel a restart or shutdown that is counting down.",
+    params={},
+    examples=["cancel the restart", "cancel the shutdown", "don't restart", "abort the shutdown"],
+    category="system",
+)
+def cancel_shutdown() -> ToolResult:
+    try:
+        proc = subprocess.run(
+            ["shutdown.exe", "/a"], capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode == 0:
+            return ToolResult(ok=True, summary="Cancelled - the PC stays on.")
+        return ToolResult(ok=True, summary="Nothing was counting down.", data={"stderr": (proc.stderr or "")[:200]})
+    except Exception as exc:
+        return ToolResult.fail(f"Could not cancel: {exc}")
+
+
+@tool(
+    name="empty_recycle_bin",
+    description="Empty the Recycle Bin. Destructive: what is in it is gone for good. Ask first.",
+    params={},
+    examples=["empty the recycle bin", "clear the recycle bin", "empty my trash", "purge the recycle bin"],
+    confirm=True,
+    category="system",
+)
+def empty_recycle_bin() -> ToolResult:
+    try:
+        # SHEmptyRecycleBinW(hwnd, root, flags): no confirmation dialog, no
+        # progress window, no sound. Dexter has already asked.
+        flags = 0x0001 | 0x0002 | 0x0004
+        rc = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, flags)
+        if rc in (0, -2147418113):  # S_OK, or E_UNEXPECTED when it was already empty
+            return ToolResult(ok=True, summary="Recycle Bin emptied.")
+        return ToolResult.fail(f"Windows refused to empty the Recycle Bin (code {rc}).")
+    except Exception as exc:
+        return ToolResult.fail(f"Could not empty the Recycle Bin: {exc}")
+
+
+def _recycle_prompt(_args: Dict[str, Any]) -> str:
+    return "Emptying the Recycle Bin can't be undone. Say yes and I'll do it."
+
+
+empty_recycle_bin._dexter_confirm_prompt = _recycle_prompt
 
 
 def availability() -> Dict[str, Any]:

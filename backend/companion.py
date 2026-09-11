@@ -48,21 +48,129 @@ You and the user are coworkers on one mission (below). You are not a command lin
 
 
 def enabled() -> bool:
-    """Dexter speaks first only when the switch says it leads (and check-ins are on)."""
-    return ENABLED and mission.initiative_mode() == "dexter"
+    """Dexter speaks first only when the switch says it leads (and check-ins are on).
+
+    v9: and only when Mission Reminder is not already running a session. Two
+    apps nagging about focus at the same time is worse than either alone, and
+    the owner picked the one with the timer in front of them.
+    """
+    if not (ENABLED and mission.initiative_mode() == "dexter"):
+        return False
+    return not mission_reminder_busy()
 
 
 def context_block() -> str:
     block = STANCE + "\n\n" + mission.render_block() + "\n\n" + mission.today_block()
+    now_lines: List[str] = []
     try:
         import activity
 
-        lines = activity.context_lines() if activity.ENABLED else []
-        if lines:
-            block += "\n\n## Right now\n" + "\n".join(lines)
+        if activity.ENABLED:
+            now_lines.extend(activity.context_lines())
     except Exception:
         pass
+    session = mission_reminder_session()
+    if session:
+        now_lines.append(session)
+    machine = machine_line()
+    if machine:
+        now_lines.append(machine)
+    if now_lines:
+        block += "\n\n## Right now\n" + "\n".join(now_lines)
     return block
+
+
+# ───────────────────────── the machine (v9) ─────────────────────────
+
+
+def machine_line() -> str:
+    """One line about the PC: who has the GPU, how tight RAM is, disk left.
+
+    In the prompt because half of what Dexter is asked to do — start a render,
+    run a code task, load the big model — is decided by these three numbers,
+    and a model that cannot see them offers to do things that cannot happen.
+    """
+    try:
+        import model_steward
+
+        snap = model_steward.snapshot()
+    except Exception:
+        return ""
+    parts: List[str] = []
+
+    vram = snap.get("vram")
+    if vram:
+        holders = [h for h in (snap.get("holders") or []) if int(h.get("vramMib") or 0) >= 512]
+        who = ", ".join(f"{h['name']} {h['vramMib'] / 1024:.0f} GB" for h in holders[:2])
+        loaded = snap.get("models", {}).get("loaded") or []
+        mine = f"Dexter on {loaded[0]['name']}" if loaded else "no model loaded"
+        parts.append(
+            f"GPU: {vram['freeMib'] / 1024:.1f} GB free of {vram['totalMib'] / 1024:.0f}"
+            + (f" ({who})" if who else "")
+            + f"; {mine}"
+        )
+    ram = snap.get("ram")
+    if ram and ram.get("totalMib") and ram.get("availMib") is not None:
+        used_pct = 100 - int(100 * ram["availMib"] / max(1, ram["totalMib"]))
+        parts.append(f"RAM {used_pct} %")
+    disk = snap.get("disk")
+    for drive in (disk or {}).get("drives", [])[:2]:
+        parts.append(f"{drive.get('letter')} {int(drive.get('free') or 0) / (1024 ** 3):.0f} GB free")
+    if not snap.get("sentinel", {}).get("connected"):
+        parts.append("Sentinel is down, so nothing is arbitrating memory")
+    return "- Machine: " + "; ".join(parts) if parts else ""
+
+
+# ─────────────────── Mission Reminder, read-only (v9, D6) ───────────────────
+#
+# Mission Reminder keeps its own mission model (blocks, sessions, a tree) and
+# mirrors it to a runtime file (MR1). Dexter reads that and nothing else: two
+# mission systems stay two, and the bridge is one-way so neither can corrupt
+# the other.
+
+
+def mission_reminder_runtime() -> Optional[Dict[str, Any]]:
+    path = os.environ.get("MISSION_REMINDER_RUNTIME") or os.path.join(
+        os.environ.get("LOCALAPPDATA", ""), "MissionReminder", "runtime.json"
+    )
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        # Stale by more than ten minutes means the app is gone and left the file
+        # behind; treating that as a live session would mute Dexter for ever.
+        if time.time() - os.path.getmtime(path) > 600:
+            return None
+        import json
+
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def mission_reminder_busy() -> bool:
+    """Is a Mission Reminder focus block actually running right now?"""
+    data = mission_reminder_runtime()
+    if not data:
+        return False
+    session = data.get("session") or {}
+    if not isinstance(session, dict):
+        return False
+    return bool(session.get("started_at")) and not session.get("paused")
+
+
+def mission_reminder_session() -> str:
+    """A "Right now" line for the model, or empty."""
+    data = mission_reminder_runtime()
+    if not data:
+        return ""
+    session = data.get("session") or {}
+    if not isinstance(session, dict) or not session.get("started_at"):
+        return ""
+    block = session.get("block") or "a block"
+    state = "paused" if session.get("paused") else "running"
+    return f"- Mission Reminder: '{block}' is {state} (I stay quiet while it runs)"
 
 
 def fast_stance() -> str:
@@ -131,11 +239,46 @@ def say(kind: str, text: str, quick_replies: Optional[List[str]] = None, toast: 
     return True
 
 
+def _may_compose(kind: str) -> bool:
+    """Ask the steward before an *unprompted* message reaches a model.
+
+    Found on the live integration run against Sentinel v2: the morning brief
+    called `llm_router.chat(provider="auto")` directly, Ollama JIT-loaded the
+    4.5 GB smart model, and no `Reserve` was ever sent — the one rule of the
+    house (§1: "Sentinel decides, everyone else asks") broken by a check-in
+    nobody asked for. Every *prompted* load already goes through the steward;
+    this closes the unprompted one.
+
+    A refusal is not an error: the caller sends its template instead. A nudge is
+    never worth taking the card from a render. Anything unexpected here — no
+    router, no steward, a provider that manages its own residency — answers
+    `True`, because a broken guard must not silence Dexter.
+    """
+    try:
+        import model_steward
+        import router as _router
+
+        provider, model = _router.smart_backend("auto")
+        if provider != "ollama" or not model:
+            return True
+        decision = model_steward.ensure(
+            model, f"companion:{kind}", provider, keep_alive=_router.SMART_KEEP_ALIVE
+        )
+        if not decision.granted:
+            print(f"[Companion] {kind}: staying on the template — {decision.reason}")
+            return False
+    except Exception:
+        return True
+    return True
+
+
 def compose(kind: str, facts: List[str], fallback: str, ask: str = "") -> str:
     """Let the model phrase the check-in from facts; fall back to the template when it cannot."""
     try:
         from hybrid_llm import llm_router
     except Exception:
+        return fallback
+    if not _may_compose(kind):
         return fallback
     system = (
         context_block()
@@ -190,6 +333,22 @@ def _today_facts() -> Dict[str, Any]:
     return facts
 
 
+def _last_cleanup_line() -> str:
+    """What Sentinel's tray freed overnight, if anything."""
+    try:
+        import model_steward
+
+        disk = (model_steward.snapshot().get("disk") or {}).get("last_cleanup")
+    except Exception:
+        return ""
+    if not isinstance(disk, dict) or not disk.get("freed_bytes"):
+        return ""
+    return (
+        f"Overnight cleanup freed {int(disk['freed_bytes']) / (1024 ** 3):.1f} GB "
+        f"({disk.get('mode', 'safe')})"
+    )
+
+
 def morning(force: bool = False) -> bool:
     f = _today_facts()
     win = mission.today_win()
@@ -207,6 +366,14 @@ def morning(force: bool = False) -> bool:
         facts.append(f"'{f['slipping'][0]['text']}' has been moved {f['slipping'][0].get('roll_count')} times")
     if data.get("focus"):
         facts.append(f"This week's focus: {data['focus']}")
+    # The machine is part of the morning brief now: a render still going or a
+    # drive at 12 GB changes what today can realistically contain.
+    machine = machine_line()
+    if machine:
+        facts.append(machine.lstrip("- "))
+    cleanup = _last_cleanup_line()
+    if cleanup:
+        facts.append(cleanup)
     if win:
         facts.append(f"Today's win was already set: {win}")
         ask = f"Still going for '{win}'?"

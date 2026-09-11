@@ -57,6 +57,7 @@ def test_code_task_refuses_without_a_repository_or_binary(monkeypatch, tmp_path)
 def test_code_task_launches_buzzcode_headless(monkeypatch, tmp_path):
     (tmp_path / "dexter" / ".git").mkdir(parents=True)
     monkeypatch.setattr(code_agent, "CODE_ROOTS", [str(tmp_path)])
+    monkeypatch.setattr(code_agent, "WINDOWED", False)   # the hidden-pipe path (DEXTER_CODE_WINDOW=0)
     monkeypatch.setattr(code_agent, "buzzcode_path", lambda: "buzzcode.exe")
     monkeypatch.setattr(code_agent, "JOB_LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setattr(code_agent, "JOBS_FILE", str(tmp_path / "jobs.json"))
@@ -118,3 +119,100 @@ def test_fast_rules_reach_code_and_engine_tools():
     assert fast_path("code status")[0] == "code_status"
     tool, args = fast_path("analyse this video https://www.youtube.com/watch?v=abc for beyond3baje")[:2]
     assert tool == "studio_analyze_video" and args == {"url": "https://www.youtube.com/watch?v=abc", "channel": "beyond3baje"}
+
+
+def test_code_task_opens_buzzcode_in_its_own_window(monkeypatch, tmp_path):
+    """Default mode: a console launcher runs buzzcode; Dexter tails the job log
+    it writes and finishes the job at the launcher's exit record - even though
+    the window (the launcher process) stays open afterwards."""
+    import threading
+    import time
+
+    (tmp_path / "dexter" / ".git").mkdir(parents=True)
+    monkeypatch.setattr(code_agent, "CODE_ROOTS", [str(tmp_path)])
+    monkeypatch.setattr(code_agent, "buzzcode_path", lambda: "buzzcode.exe")
+    monkeypatch.setattr(code_agent, "JOB_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(code_agent, "JOBS_FILE", str(tmp_path / "jobs.json"))
+    monkeypatch.setattr(code_agent, "WINDOWED", True)
+    monkeypatch.setattr(code_agent, "console_python", lambda: "python.exe")
+    launched = {}
+
+    class FakeWindow:
+        """Stands in for code_console.py: writes events to the log, then stays open."""
+
+        def __init__(self, argv, **kwargs):
+            launched.setdefault("argv", argv)
+            launched.setdefault("flags", kwargs.get("creationflags"))
+            self.returncode = None
+            self.pid = 4242
+            if argv[0] == "python.exe":
+                spec = json.load(open(argv[4], encoding="utf-8"))
+                launched["spec"] = spec
+
+                def write():
+                    time.sleep(0.05)
+                    with open(spec["log"], "a", encoding="utf-8") as log:
+                        for ev in (
+                            {"type": "tool_call_start", "id": "1", "name": "edit", "arguments": {"path": "a.py"}},
+                            {"type": "assistant_message", "content": "Edited a.py.", "tool_calls": []},
+                            {"type": "finished", "reason": "done", "turns": 2},
+                            {"type": "launcher_exit", "code": 0, "elapsed": 1.0},
+                        ):
+                            log.write(json.dumps(ev) + "\n")
+                            log.flush()
+
+                threading.Thread(target=write, daemon=True).start()
+
+        def poll(self):
+            return None   # the window is still open
+
+        def wait(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(code_agent.subprocess, "Popen", FakeWindow)
+    import notify
+
+    monkeypatch.setattr(notify, "toast_async", lambda *a, **k: None)
+    import companion
+
+    monkeypatch.setattr(companion, "on_event", lambda kind, payload: True)
+    agent = code_agent.CodeAgent()
+    monkeypatch.setattr(agent, "_diff_stat", lambda path: " 1 file changed")
+    monkeypatch.setattr(agent, "engine_status", lambda: {"online": True})
+    monkeypatch.setattr(code_agent, "code_agent", agent)
+    monkeypatch.setattr(tools_code, "code_agent", agent)
+
+    result = tools_code.code_task("rename the helper in dexter")
+    assert result.ok, result.summary
+    assert "in its own buzzcode window" in result.summary
+    assert launched["argv"][0] == "python.exe" and launched["argv"][3].endswith("code_console.py")
+    assert launched["flags"] == code_agent._new_console()
+    assert launched["spec"]["exe"] == "buzzcode.exe" and launched["spec"]["mode"] == "edits"
+    assert launched["spec"]["task"] == "rename the helper in dexter"
+    job = agent.jobs[result.data["id"]]
+    for _ in range(100):
+        if job.status != "running":
+            break
+        time.sleep(0.05)
+    assert job.status == "done" and job.exit_code == 0 and job.windowed
+    assert job.files_changed == ["a.py"] and job.final_message == "Edited a.py."
+    assert "done after" in tools_code.code_status().summary
+
+
+def test_finished_job_releases_the_engine_dexter_started(monkeypatch, tmp_path):
+    monkeypatch.setattr(code_agent, "JOBS_FILE", str(tmp_path / "jobs.json"))
+    agent = code_agent.CodeAgent()
+    stopped = []
+    monkeypatch.setattr(agent, "stop_engine", lambda: stopped.append(True) or True)
+    monkeypatch.setattr(agent, "_diff_stat", lambda path: "")
+    monkeypatch.setattr(agent, "_announce", lambda job: None)
+    agent._engine_proc = object()   # Dexter started the llama-server earlier
+    job = code_agent.CodeJob("task", {"name": "dexter", "path": str(tmp_path)}, "edits")
+    job.exit_code = 0
+    job.final_message = "ok"
+    agent._finish(job)
+    assert job.status == "done" and stopped == [True]
+    assert any("stopped the local model server" in w for w in job.warnings)

@@ -18,7 +18,7 @@ export function TaskTray({ tasks, onAnswer, onCancel, onDismiss }: Props) {
         const active = task.status === 'running' || task.status === 'queued';
         const waiting = task.status === 'waiting_confirmation';
         const failed = task.status === 'failed' || task.status === 'cancelled';
-        const accent = waiting ? '#fbbf24' : failed ? '#f87171' : active ? '#38bdf8' : '#10b981';
+        const accent = waiting ? 'var(--warn)' : failed ? 'var(--danger)' : active ? 'var(--accent)' : 'var(--success)';
         const lastProgress =
           task.progress && task.progress.length > 0 ? task.progress[task.progress.length - 1].text : '';
         return (
@@ -39,11 +39,11 @@ export function TaskTray({ tasks, onAnswer, onCancel, onDismiss }: Props) {
               <div style={{ fontSize: '9px', color: accent, fontWeight: 700, letterSpacing: '0.5px' }}>
                 TASK · {task.status.replace('_', ' ').toUpperCase()}
               </div>
-              <div style={{ fontSize: '12px', color: '#f8fafc', wordBreak: 'break-word' }}>
+              <div style={{ fontSize: '12px', color: 'var(--text)', wordBreak: 'break-word' }}>
                 {task.title}
               </div>
               {(waiting ? task.question : task.result || lastProgress) && (
-                <div style={{ fontSize: '11px', color: '#94a3b8', wordBreak: 'break-word' }}>
+                <div style={{ fontSize: '11px', color: 'var(--muted)', wordBreak: 'break-word' }}>
                   {waiting ? task.question : task.result || lastProgress}
                 </div>
               )}
@@ -54,9 +54,9 @@ export function TaskTray({ tasks, onAnswer, onCancel, onDismiss }: Props) {
                   type="button"
                   onClick={() => onAnswer(task.id, true)}
                   style={{
-                    background: 'rgba(16, 185, 129, 0.2)',
-                    color: '#10b981',
-                    border: '1px solid rgba(16, 185, 129, 0.4)',
+                    background: 'var(--success-soft)',
+                    color: 'var(--success)',
+                    border: '1px solid #bfe6cc',
                     padding: '5px 10px',
                     borderRadius: '8px',
                     fontSize: '11px',
@@ -70,9 +70,9 @@ export function TaskTray({ tasks, onAnswer, onCancel, onDismiss }: Props) {
                   type="button"
                   onClick={() => onAnswer(task.id, false)}
                   style={{
-                    background: 'rgba(248, 113, 113, 0.15)',
-                    color: '#f87171',
-                    border: '1px solid rgba(248, 113, 113, 0.4)',
+                    background: 'var(--danger-soft)',
+                    color: 'var(--danger)',
+                    border: '1px solid #f4c2c2',
                     padding: '5px 10px',
                     borderRadius: '8px',
                     fontSize: '11px',
@@ -88,9 +88,9 @@ export function TaskTray({ tasks, onAnswer, onCancel, onDismiss }: Props) {
                 type="button"
                 onClick={() => onCancel(task.id)}
                 style={{
-                  background: 'rgba(148, 163, 184, 0.15)',
-                  color: '#cbd5e1',
-                  border: '1px solid rgba(148, 163, 184, 0.3)',
+                  background: 'var(--surface-2)',
+                  color: 'var(--muted)',
+                  border: '1px solid var(--border)',
                   padding: '5px 10px',
                   borderRadius: '8px',
                   fontSize: '11px',
@@ -106,7 +106,7 @@ export function TaskTray({ tasks, onAnswer, onCancel, onDismiss }: Props) {
                 onClick={() => onDismiss(task.id)}
                 style={{
                   background: 'transparent',
-                  color: '#64748b',
+                  color: 'var(--muted)',
                   border: 'none',
                   padding: '4px',
                   flexShrink: 0,

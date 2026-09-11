@@ -45,6 +45,16 @@ class ScriptedLLM:
         # when DEXTER_FAST_MODEL is configured, instead of silently skipping it.
         return provider if provider and provider != "auto" else "ollama"
 
+    def provider_for_model(self, model, preferred=""):
+        # v8: the fast model runs wherever it is served; the stub serves it on Ollama.
+        return "ollama"
+
+    def warm_model(self, provider, model, keep_alive="2h"):
+        return True
+
+    def release_model(self, provider, model, after="0"):
+        return True
+
 
 def answer(text):
     return LLMResponse(content=text, provider="fake", model="fake")

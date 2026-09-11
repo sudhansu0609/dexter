@@ -31,24 +31,87 @@ COMMAND_TIMEOUT = float(os.environ.get("DEXTER_BROWSER_TIMEOUT", "45"))
 NAV_TIMEOUT_MS = 25_000
 
 _URL_LIKE = re.compile(r"^(?:https?://|[\w-]+(?:\.[\w-]+)+(?:[/:?#].*)?$)", re.I)
+# v11 P1.3: this table is now also the answer to "is 'youtube' an app or a
+# site?", asked by the router *before* the app launcher gets a say. Only names
+# that are web-first belong here - "spotify" and "discord" are applications on
+# this machine and must keep launching.
 _SITE_ALIASES = {
     "youtube": "https://www.youtube.com/",
     "youtube studio": "https://studio.youtube.com/",
     "yt studio": "https://studio.youtube.com/",
+    "yt": "https://www.youtube.com/",
     "gmail": "https://mail.google.com/",
+    "google mail": "https://mail.google.com/",
+    "inbox": "https://mail.google.com/",
     "google calendar": "https://calendar.google.com/",
     "calendar": "https://calendar.google.com/",
     "google drive": "https://drive.google.com/",
     "drive": "https://drive.google.com/",
+    "google docs": "https://docs.google.com/",
+    "docs": "https://docs.google.com/",
+    "google sheets": "https://sheets.google.com/",
+    "sheets": "https://sheets.google.com/",
+    "google maps": "https://www.google.com/maps",
+    "maps": "https://www.google.com/maps",
+    "google photos": "https://photos.google.com/",
     "github": "https://github.com/",
     "google": "https://www.google.com/",
     "notion": "https://www.notion.so/",
     "chatgpt": "https://chatgpt.com/",
+    "claude": "https://claude.ai/",
+    "gemini": "https://gemini.google.com/",
     "reddit": "https://www.reddit.com/",
     "twitter": "https://x.com/",
     "x": "https://x.com/",
+    "instagram": "https://www.instagram.com/",
+    "facebook": "https://www.facebook.com/",
+    "linkedin": "https://www.linkedin.com/",
+    "whatsapp": "https://web.whatsapp.com/",
+    "netflix": "https://www.netflix.com/",
+    "amazon": "https://www.amazon.in/",
+    "flipkart": "https://www.flipkart.com/",
     "wikipedia": "https://en.wikipedia.org/",
+    "stack overflow": "https://stackoverflow.com/",
+    "stackoverflow": "https://stackoverflow.com/",
+    "hacker news": "https://news.ycombinator.com/",
+    "canva": "https://www.canva.com/",
+    "analytics": "https://analytics.google.com/",
+    "google analytics": "https://analytics.google.com/",
 }
+
+_SITE_LEAD = re.compile(r"^(?:the|my|a|an)\s+", re.I)
+_SITE_TAIL = re.compile(r"\s+(?:website|site|page|web\s*site|dot\s*com|in\s+the\s+browser)$", re.I)
+
+
+def known_site(text: str) -> Optional[str]:
+    """The URL for a spoken site name, or None when this is not a site.
+
+    This is the line between "open youtube" (a tab) and "open chrome" (an app),
+    so it is deliberately strict: an exact alias after stripping "the/my" and a
+    trailing "website", nothing fuzzy.
+    """
+    name = (text or "").strip().strip("\"'.,!?").lower()
+    if not name:
+        return None
+    name = _SITE_TAIL.sub("", _SITE_LEAD.sub("", name)).strip()
+    name = re.sub(r"\s+", " ", name).rstrip("/")
+    if name in _SITE_ALIASES:
+        return _SITE_ALIASES[name]
+    # "youtube.com" and "reddit.com" name the same sites; let the URL rule own
+    # them so the caller gets one answer for both phrasings.
+    stem = re.sub(r"^(?:https?://)?(?:www\.)?", "", name)
+    stem = re.sub(r"\.(?:com|in|org|net|io|co|ai|so|dev)$", "", stem)
+    if stem != name and stem in _SITE_ALIASES:
+        return _SITE_ALIASES[stem]
+    return None
+
+
+def looks_like_a_site(text: str) -> bool:
+    """A URL or a site Dexter knows - i.e. not a thing to launch from disk."""
+    raw = (text or "").strip().strip("\"'")
+    if not raw:
+        return False
+    return bool(known_site(raw)) or bool(_URL_LIKE.match(raw))
 
 
 def normalize_target(text: str) -> str:
@@ -59,8 +122,13 @@ def normalize_target(text: str) -> str:
     lower = raw.lower().rstrip("/")
     if lower in _SITE_ALIASES:
         return _SITE_ALIASES[lower]
+    # A typed-out domain is taken literally - "github.com" must stay
+    # github.com and not be rewritten to the alias table's canonical URL.
     if _URL_LIKE.match(raw):
         return raw if raw.lower().startswith(("http://", "https://")) else f"https://{raw}"
+    site = known_site(raw)
+    if site:
+        return site
     m = re.match(r"^(?:youtube|yt)\s+(?:for\s+)?(.+)$", raw, re.I)
     if m:
         return f"https://www.youtube.com/results?search_query={quote_plus(m.group(1).strip())}"

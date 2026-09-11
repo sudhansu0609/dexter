@@ -1,0 +1,402 @@
+backend/hybrid_llm.py (lines 1-400 of 633)
+  1	"""
+  2	Hybrid LLM router.
+  3	
+  4	Dexter runs local-first (LM Studio / Ollama). That constraint drives three
+  5	design choices here:
+  6	
+  7	  * Provider health is cached. The previous version fired two blocking 1.5s
+  8	    probes on *every* generate() call and every /status poll, which alone cost
+  9	    up to 3 seconds per message.
+ 10	  * The loaded model name is discovered from /models rather than hardcoded, so
+ 11	    swapping the model in LM Studio needs no code change.
+ 12	  * Tool calling supports both the native OpenAI `tools` protocol and a plain
+ 13	    JSON-in-text fallback, because small local models advertise native tool
+ 14	    support far more often than they actually honour it.
+ 15	"""
+ 16	
+ 17	import json
+ 18	import os
+ 19	
+ 20	import env_boot  # noqa: F401  - loads .env for every entry point
+ 21	import re
+ 22	import threading
+ 23	import time
+ 24	from dataclasses import dataclass, field
+ 25	from typing import Any, Callable, Dict, List, Optional
+ 26	
+ 27	import requests
+ 28	
+ 29	DEFAULT_SYSTEM_PROMPT = (
+ 30	    "You are Dexter, an intelligent personal AI assistant. "
+ 31	    "Be concise, direct, and precise. Keep answers to 1-3 sentences "
+ 32	    "unless detail is explicitly requested. Never use filler."
+ 33	)
+ 34	
+ 35	HEALTH_TTL_SECONDS = 30.0
+ 36	_PROBE_TIMEOUT = 1.5
+ 37	
+ 38	
+ 39	@dataclass
+ 40	class LLMResponse:
+ 41	    content: str = ""
+ 42	    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+ 43	    provider: str = ""
+ 44	    model: str = ""
+ 45	    error: Optional[str] = None
+ 46	    # Set when the answering provider is not the one first selected - the
+ 47	    # request was completed by a fallback after the primary failed mid-flight.
+ 48	    fallback_from: Optional[str] = None
+ 49	    # Set when generation was deliberately stopped mid-stream (barge-in, Phase
+ 50	    # 4.5). Unlike an error this must NOT trigger provider fallback - the user
+ 51	    # asked us to stop, not to try harder elsewhere.
+ 52	    cancelled: bool = False
+ 53	
+ 54	    @property
+ 55	    def ok(self) -> bool:
+ 56	        return self.error is None
+ 57	
+ 58	
+ 59	class HybridLLMRouter:
+ 60	    def __init__(self) -> None:
+ 61	        # codeBuzz's llama-server (Qwen3.8-27B on 8089). It is only up while
+ 62	        # codeBuzz runs, but when it is, it already owns the GPU - using it
+ 63	        # beats loading a second model onto the CPU (roadmap v5, 1.5).
+ 64	        self.llamacpp_url = os.getenv("LLAMACPP_URL", "http://127.0.0.1:8089/v1")
+ 65	        self.lm_studio_url = os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
+ 66	        self.ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/v1")
+ 67	        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+ 68	        self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
+ 69	
+ 70	        # Explicit overrides; when unset the loaded model is auto-detected.
+ 71	        self.llamacpp_model = os.getenv("LLAMACPP_MODEL", "")
+ 72	        self.lm_studio_model = os.getenv("LM_STUDIO_MODEL", "")
+ 73	        self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+ 74	
+ 75	        # Preferred local backend for "auto" requests. Set to "ollama" to run
+ 76	        # Dexter on Ollama and keep LM Studio free for other work (it stays a
+ 77	        # fallback if Ollama is down); "lmstudio" forces the reverse. "auto"
+ 78	        # (default) keeps the original local-first order.
+ 79	        self.default_provider = (os.getenv("DEXTER_LLM_PROVIDER", "auto").strip().lower() or "auto")
+ 80	
+ 81	        self.session = requests.Session()
+ 82	        self._health_cache: Optional[Dict[str, Any]] = None
+ 83	        self._health_checked_at = 0.0
+ 84	        self._model_cache: Dict[str, str] = {}
+ 85	        self._lock = threading.Lock()
+ 86	
+ 87	    # ───────────────────────── health ─────────────────────────
+ 88	
+ 89	    def _check_endpoint(self, url: str) -> bool:
+ 90	        try:
+ 91	            return self.session.get(url, timeout=_PROBE_TIMEOUT).status_code == 200
+ 92	        except Exception:
+ 93	            return False
+ 94	
+ 95	    def get_available_providers(self, force: bool = False) -> Dict[str, Any]:
+ 96	        """Cached for HEALTH_TTL_SECONDS. This is on the hot path of every message."""
+ 97	        now = time.time()
+ 98	        with self._lock:
+ 99	            fresh = (
+100	                self._health_cache is not None
+101	                and (now - self._health_checked_at) < HEALTH_TTL_SECONDS
+102	            )
+103	            if fresh and not force:
+104	                return self._health_cache  # type: ignore[return-value]
+105	
+106	        llamacpp_online = self._check_endpoint(f"{self.llamacpp_url}/models")
+107	        lm_online = self._check_endpoint(f"{self.lm_studio_url}/models")
+108	        ollama_online = self._check_endpoint(f"{self.ollama_url}/models")
+109	        result = {
+110	            "llamacpp": {"online": llamacpp_online, "url": self.llamacpp_url},
+111	            "lmStudio": {"online": lm_online, "url": self.lm_studio_url},
+112	            "ollama": {"online": ollama_online, "url": self.ollama_url},
+113	            "gemini": {"configured": bool(self.gemini_api_key)},
+114	            "openai": {"configured": bool(self.openai_api_key)},
+115	        }
+116	
+117	        with self._lock:
+118	            self._health_cache = result
+119	            self._health_checked_at = time.time()
+120	        return result
+121	
+122	    def invalidate_health(self) -> None:
+123	        with self._lock:
+124	            self._health_cache = None
+125	            # The shared llama-server swaps models when codeBuzz does; do not
+126	            # keep naming a model that is no longer loaded.
+127	            self._model_cache.pop(self.llamacpp_url, None)
+128	
+129	    def _list_models_at(self, base_url: str) -> List[str]:
+130	        """All model ids a local OpenAI-compatible server currently exposes."""
+131	        try:
+132	            res = self.session.get(f"{base_url}/models", timeout=_PROBE_TIMEOUT)
+133	            if res.status_code == 200:
+134	                data = res.json().get("data") or []
+135	                return [d.get("id", "") for d in data if d.get("id")]
+136	        except Exception:
+137	            pass
+138	        return []
+139	
+140	    def list_models(self) -> Dict[str, Any]:
+141	        """
+142	        Per-provider online state + available model ids, plus the current
+143	        selection - everything the UI needs to render a provider/model picker.
+144	        """
+145	        health = self.get_available_providers(force=True)
+146	        providers = {}
+147	        for key, prov, url in (
+148	            ("llamacpp", "llamacpp", self.llamacpp_url),
+149	            ("lmStudio", "lmstudio", self.lm_studio_url),
+150	            ("ollama", "ollama", self.ollama_url),
+151	        ):
+152	            online = bool(health[key]["online"])
+153	            providers[prov] = {
+154	                "online": online,
+155	                "url": url,
+156	                "models": self._list_models_at(url) if online else [],
+157	            }
+158	        return {
+159	            "providers": providers,
+160	            "preferred": self.default_provider,
+161	            # The model each provider defaults to when none is picked explicitly.
+162	            "defaultModel": {
+163	                "llamacpp": self.llamacpp_model or None,
+164	                "lmstudio": self.lm_studio_model or None,
+165	                "ollama": self.ollama_model or None,
+166	            },
+167	        }
+168	
+169	    # ───────────────────────── model discovery ─────────────────────────
+170	
+171	    def _discover_model(self, base_url: str) -> str:
+172	        """Ask the server what is actually loaded instead of guessing a name."""
+173	        if base_url in self._model_cache:
+174	            return self._model_cache[base_url]
+175	        try:
+176	            res = self.session.get(f"{base_url}/models", timeout=_PROBE_TIMEOUT)
+177	            if res.status_code == 200:
+178	                data = res.json().get("data") or []
+179	                if data:
+180	                    model_id = data[0].get("id", "")
+181	                    if model_id:
+182	                        self._model_cache[base_url] = model_id
+183	                        print(f"[HybridLLM] Detected model at {base_url}: {model_id}")
+184	                        return model_id
+185	        except Exception:
+186	            pass
+187	        return ""
+188	
+189	    def _model_for(self, provider: str, override: Optional[str]) -> str:
+190	        if override:
+191	            return override
+192	        if provider == "llamacpp":
+193	            return self.llamacpp_model or self._discover_model(self.llamacpp_url) or "local-model"
+194	        if provider == "lmstudio":
+195	            return self.lm_studio_model or self._discover_model(self.lm_studio_url) or "local-model"
+196	        if provider == "ollama":
+197	            return self.ollama_model or self._discover_model(self.ollama_url) or "llama3.2"
+198	        if provider == "gemini":
+199	            return "gemini-1.5-pro"
+200	        if provider == "openai":
+201	            return "gpt-4o"
+202	        return "local-model"
+203	
+204	    def _is_available(self, provider: str, providers: Dict[str, Any]) -> bool:
+205	        if provider == "llamacpp":
+206	            return bool(providers.get("llamacpp", {}).get("online"))
+207	        if provider == "lmstudio":
+208	            return bool(providers["lmStudio"]["online"])
+209	        if provider == "ollama":
+210	            return bool(providers["ollama"]["online"])
+211	        if provider == "gemini":
+212	            return bool(providers["gemini"]["configured"])
+213	        if provider == "openai":
+214	            return bool(providers["openai"]["configured"])
+215	        return False
+216	
+217	    def resolve_provider(self, provider: str = "auto") -> str:
+218	        if provider and provider != "auto":
+219	            return provider
+220	        providers = self.get_available_providers()
+221	        # Configured preference wins when it is actually up; otherwise fall back
+222	        # to the original local-first order.
+223	        order = ["llamacpp", "lmstudio", "ollama", "gemini", "openai"]
+224	        if self.default_provider != "auto":
+225	            order = [self.default_provider] + [p for p in order if p != self.default_provider]
+226	        for prov in order:
+227	            if self._is_available(prov, providers):
+228	                return prov
+229	        return "lmstudio"
+230	
+231	    def _base_url_for(self, provider: str) -> str:
+232	        if provider == "llamacpp":
+233	            return self.llamacpp_url
+234	        return self.ollama_url if provider == "ollama" else self.lm_studio_url
+235	
+236	    def _provider_chain(self, provider: str, needs_tools: bool = False) -> List[str]:
+237	        """
+238	        Ordered providers to try for one request. An explicit choice is honoured
+239	        exactly; "auto" is local-first with cloud fallback so a local server
+240	        dying mid-request degrades to a configured key instead of an apology.
+241	        Gemini is chat-only here (its path has no tool calling), so it is
+242	        skipped whenever tools are required.
+243	        """
+244	        if provider and provider != "auto":
+245	            return [provider]
+246	        health = self.get_available_providers()
+247	        chain: List[str] = []
+248	        if health.get("llamacpp", {}).get("online"):
+249	            chain.append("llamacpp")
+250	        if health["lmStudio"]["online"]:
+251	            chain.append("lmstudio")
+252	        if health["ollama"]["online"]:
+253	            chain.append("ollama")
+254	        if health["openai"]["configured"]:
+255	            chain.append("openai")
+256	        if health["gemini"]["configured"] and not needs_tools:
+257	            chain.append("gemini")
+258	        # Honour the configured default: move it to the front so it is tried
+259	        # first, while the others remain as graceful fallbacks. Frees the
+260	        # non-preferred local backend (e.g. LM Studio) for other work.
+261	        if self.default_provider != "auto" and self.default_provider in chain:
+262	            chain = [self.default_provider] + [p for p in chain if p != self.default_provider]
+263	        return chain or ["lmstudio"]
+264	
+265	    # ───────────────────────── chat ─────────────────────────
+266	
+267	    def chat(
+268	        self,
+269	        messages: List[Dict[str, Any]],
+270	        provider: str = "auto",
+271	        model: Optional[str] = None,
+272	        temperature: float = 0.5,
+273	        max_tokens: int = 768,
+274	        tools: Optional[List[Dict[str, Any]]] = None,
+275	        timeout: int = 90,
+276	        on_token: Optional[Callable[[str], None]] = None,
+277	        on_fallback: Optional[Callable[[str, str], None]] = None,
+278	        should_cancel: Optional[Callable[[], bool]] = None,
+279	    ) -> LLMResponse:
+280	        """
+281	        Full multi-turn chat with optional native tool calling.
+282	
+283	        `on_token` streams content deltas as they arrive (the request is made
+284	        with stream=True); the returned LLMResponse still carries the complete
+285	        content and parsed tool calls either way.
+286	
+287	        `on_fallback(failed, next)` fires before each retry against the next
+288	        provider in the chain, so callers can reset any tokens already shown.
+289	
+290	        `should_cancel()` is polled while a stream is consumed; when it returns
+291	        True generation stops and the response is flagged `cancelled` - returned
+292	        as-is without trying the next provider (a barge-in is not a failure).
+293	        """
+294	        chain = self._provider_chain(provider, needs_tools=bool(tools))
+295	        last: Optional[LLMResponse] = None
+296	        for idx, prov in enumerate(chain):
+297	            if should_cancel and should_cancel():
+298	                return LLMResponse(provider=prov, model=model or "", cancelled=True)
+299	            if idx > 0:
+300	                print(f"[HybridLLM] {chain[idx - 1]} failed mid-request; trying {prov}.")
+301	                if on_fallback:
+302	                    try:
+303	                        on_fallback(chain[idx - 1], prov)
+304	                    except Exception:
+305	                        pass
+306	            response = self._chat_one(
+307	                prov, messages, model, temperature, max_tokens, tools, timeout,
+308	                on_token, should_cancel,
+309	            )
+310	            if response.cancelled:
+311	                return response
+312	            if response.ok:
+313	                if idx > 0:
+314	                    response.fallback_from = chain[0]
+315	                return response
+316	            last = response
+317	            # The failed probe result is stale now; let the next request re-probe.
+318	            self.invalidate_health()
+319	        return last or LLMResponse(
+320	            provider=chain[0] if chain else "none",
+321	            error="No LLM provider is available.",
+322	        )
+323	
+324	    def _chat_one(
+325	        self,
+326	        prov: str,
+327	        messages: List[Dict[str, Any]],
+328	        model: Optional[str],
+329	        temperature: float,
+330	        max_tokens: int,
+331	        tools: Optional[List[Dict[str, Any]]],
+332	        timeout: int,
+333	        on_token: Optional[Callable[[str], None]],
+334	        should_cancel: Optional[Callable[[], bool]] = None,
+335	    ) -> LLMResponse:
+336	        model_name = self._model_for(prov, model)
+337	
+338	        if prov == "gemini":
+339	            if not self.gemini_api_key:
+340	                return LLMResponse(provider=prov, model=model_name,
+341	                                   error="Gemini API key not configured")
+342	            return self._chat_gemini(messages, model_name, temperature, max_tokens)
+343	
+344	        if prov == "openai":
+345	            if not self.openai_api_key:
+346	                return LLMResponse(provider=prov, model=model_name,
+347	                                   error="OpenAI API key not configured")
+348	            return self._chat_openai_compat(
+349	                "https://api.openai.com/v1", messages, model_name, temperature,
+350	                max_tokens, tools, timeout,
+351	                headers={"Authorization": f"Bearer {self.openai_api_key}"},
+352	                provider_label="openai", on_token=on_token, should_cancel=should_cancel,
+353	            )
+354	
+355	        return self._chat_openai_compat(
+356	            self._base_url_for(prov), messages, model_name, temperature,
+357	            max_tokens, tools, timeout, provider_label=prov, on_token=on_token,
+358	            should_cancel=should_cancel,
+359	        )
+360	
+361	    def _chat_openai_compat(
+362	        self,
+363	        base_url: str,
+364	        messages: List[Dict[str, Any]],
+365	        model: str,
+366	        temperature: float,
+367	        max_tokens: int,
+368	        tools: Optional[List[Dict[str, Any]]],
+369	        timeout: int,
+370	        headers: Optional[Dict[str, str]] = None,
+371	        provider_label: str = "lmstudio",
+372	        on_token: Optional[Callable[[str], None]] = None,
+373	        should_cancel: Optional[Callable[[], bool]] = None,
+374	    ) -> LLMResponse:
+375	        streaming = on_token is not None
+376	        payload: Dict[str, Any] = {
+377	            "model": model,
+378	            "messages": messages,
+379	            "temperature": temperature,
+380	            "max_tokens": max_tokens,
+381	        }
+382	        if tools:
+383	            payload["tools"] = tools
+384	            payload["tool_choice"] = "auto"
+385	        if streaming:
+386	            payload["stream"] = True
+387	
+388	        try:
+389	            res = self.session.post(
+390	                f"{base_url}/chat/completions",
+391	                json=payload,
+392	                headers=headers or {},
+393	                timeout=timeout,
+394	                stream=streaming,
+395	            )
+396	        except Exception as exc:
+397	            return LLMResponse(
+398	                provider=provider_label, model=model,
+399	                error=f"Could not reach the local model at {base_url}: {exc}",
+400	            )
+… 233 more lines. Continue with read_file(path="backend/hybrid_llm.py", offset=401).

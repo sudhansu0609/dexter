@@ -226,6 +226,20 @@ def check_llm(report: Report) -> None:
         report.add(FAIL, "Local model", f"could not load the provider layer: {exc}")
         return
 
+    # v11.1: the preferred backend is started here if it is not running, so
+    # the launch that follows has a model to talk to. Say what happened.
+    try:
+        import llm_boot
+
+        boot = llm_boot.ensure_preferred()
+        if boot.get("provider") and boot.get("started") and boot.get("online"):
+            report.add(OK, "Model server", f"{boot['provider']} was not running; started it ({boot['seconds']}s)")
+        elif boot.get("provider") and not boot.get("online"):
+            report.add(WARN, "Model server", f"{boot['provider']} is not running: {boot.get('reason')}",
+                       "Dexter will keep trying once a minute and use whatever local server is up")
+    except Exception as exc:
+        report.add(WARN, "Model server", f"autostart check skipped: {exc}")
+
     providers = llm_router.get_available_providers(force=True)
     online = [
         name for name, key in (
@@ -296,7 +310,60 @@ FAST_CHECKS = [
     check_python_deps, check_embeddings_cache, check_env, check_data_dir,
     check_frontend, check_reminders, check_desktop_shell,
 ]
-SLOW_CHECKS = [check_llm, check_runtime, check_system_integrations]
+def check_voice(report: Report) -> None:
+    """
+    Voice (v10) is all optional and degrades piece by piece, which is exactly
+    why it is reported: a missing Kokoro file means text-only replies, a
+    missing faster-whisper means the mic button does nothing, and neither
+    says so anywhere else.
+    """
+    if os.getenv("DEXTER_VOICE", "1").strip().lower() in ("0", "false", "no", "off"):
+        report.add(OK, "Voice", "disabled by DEXTER_VOICE=0")
+        return
+    missing = [m for m in ("faster_whisper", "openwakeword", "silero_vad") if not _installed(m)]
+    if missing:
+        report.add(WARN, "Voice input", f"not installed: {', '.join(missing)} - the mic will be unavailable",
+                   "pip install faster-whisper openwakeword silero-vad")
+    else:
+        report.add(OK, "Voice input", "faster-whisper, openWakeWord and silero-vad present (wake phrase: 'hey jarvis')")
+
+    if not _installed("kokoro_onnx"):
+        report.add(WARN, "Speech output", "kokoro-onnx not installed; edge-tts (online) will be used",
+                   "pip install kokoro-onnx soundfile")
+    else:
+        try:
+            import voice_engine
+
+            files = [p for p in (voice_engine.KOKORO_MODEL_PATH, voice_engine.KOKORO_VOICES_PATH)
+                     if not os.path.exists(p)]
+            if files:
+                report.add(WARN, "Speech output", f"Kokoro model files missing: {', '.join(files)}",
+                           "Set KOKORO_DIR in .env, or drop kokoro-v1.0.onnx and voices-v1.0.bin into ./models")
+            else:
+                report.add(OK, "Speech output", f"Kokoro model found ({os.path.dirname(voice_engine.KOKORO_MODEL_PATH)})")
+        except Exception as exc:
+            report.add(WARN, "Speech output", f"could not check Kokoro: {exc}")
+
+    # The mic-permission patch reaches into pywebview's WebView2 backend, so a
+    # pywebview upgrade can silently break voice input while everything else
+    # keeps working.
+    try:
+        from webview.platforms import edgechromium as ec
+
+        if not hasattr(ec.EdgeChrome, "on_webview_ready"):
+            report.add(WARN, "Microphone permission",
+                       "pywebview's WebView2 hook has changed; the mic patch will not attach",
+                       "Voice input will not work until backend/desktop_app.py is updated")
+        else:
+            from Microsoft.Web.WebView2.Core import CoreWebView2PermissionKind  # noqa: F401
+
+            report.add(OK, "Microphone permission", "WebView2 patch will attach")
+    except Exception as exc:
+        report.add(WARN, "Microphone permission", f"could not verify the WebView2 patch: {exc}",
+                   "Voice input may not work in the desktop shell")
+
+
+SLOW_CHECKS = [check_llm, check_runtime, check_system_integrations, check_voice]
 
 
 def run_fast_checks(quiet: bool = True) -> Report:

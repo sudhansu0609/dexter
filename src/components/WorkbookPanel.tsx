@@ -11,7 +11,7 @@ interface Props {
   onCloseOut: () => void;
 }
 
-const dim = { color: '#94a3b8', fontSize: '11px' };
+const dim = { color: 'var(--muted)', fontSize: '11px' };
 
 function dueLabel(commitment: Commitment): string {
   if (!commitment.due_date) return '';
@@ -40,7 +40,7 @@ function Row({
         alignItems: 'center',
         gap: '8px',
         padding: '6px 0',
-        borderBottom: '1px solid rgba(148,163,184,0.12)',
+        borderBottom: '1px solid var(--surface-2)',
       }}
     >
       <button
@@ -50,7 +50,7 @@ function Row({
           width: '18px',
           height: '18px',
           borderRadius: '5px',
-          border: '1px solid rgba(148,163,184,0.5)',
+          border: '1px solid var(--border)',
           background: 'transparent',
           cursor: 'pointer',
           flexShrink: 0,
@@ -60,7 +60,7 @@ function Row({
         <div
           style={{
             fontSize: '12px',
-            color: tone === 'overdue' ? '#fca5a5' : '#e2e8f0',
+            color: tone === 'overdue' ? 'var(--danger)' : 'var(--text)',
             overflow: 'hidden',
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
@@ -81,7 +81,7 @@ function Row({
         style={{
           background: 'transparent',
           border: 'none',
-          color: '#64748b',
+          color: 'var(--muted)',
           cursor: 'pointer',
           padding: '2px',
           flexShrink: 0,
@@ -113,8 +113,8 @@ export function WorkbookPanel({ snapshot, busy, onCommit, onKeep, onRoll, onClos
   return (
     <div className="dexter-panel" style={{ padding: '12px', marginBottom: '14px' }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
-        <Target size={15} style={{ color: '#38bdf8' }} />
-        <h2 style={{ fontSize: '13px', color: '#f1f5f9', margin: 0, flex: 1 }}>Today</h2>
+        <Target size={15} style={{ color: 'var(--accent)' }} />
+        <h2 style={{ fontSize: '13px', color: 'var(--text)', margin: 0, flex: 1 }}>Today</h2>
         <span style={dim}>
           {today.done.length} kept · {today.due.length + today.overdue.length} open
         </span>
@@ -128,7 +128,7 @@ export function WorkbookPanel({ snapshot, busy, onCommit, onKeep, onRoll, onClos
 
       {today.overdue.length > 0 && (
         <>
-          <div style={{ ...dim, color: '#fca5a5', marginTop: '4px' }}>
+          <div style={{ ...dim, color: 'var(--danger)', marginTop: '4px' }}>
             Carried over ({today.overdue.length})
           </div>
           {today.overdue.map((c) => (
@@ -160,13 +160,13 @@ export function WorkbookPanel({ snapshot, busy, onCommit, onKeep, onRoll, onClos
             marginTop: '10px',
             padding: '8px',
             borderRadius: '8px',
-            background: 'rgba(251,191,36,0.08)',
-            border: '1px solid rgba(251,191,36,0.25)',
+            background: 'var(--warn-soft)',
+            border: '1px solid #f3dcb0',
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '4px' }}>
-            <AlertCircle size={13} style={{ color: '#fbbf24' }} />
-            <span style={{ fontSize: '11px', color: '#fde68a' }}>
+            <AlertCircle size={13} style={{ color: 'var(--warn)' }} />
+            <span style={{ fontSize: '11px', color: 'var(--warn)' }}>
               {slipping.length} slipping
             </span>
           </div>
@@ -188,11 +188,11 @@ export function WorkbookPanel({ snapshot, busy, onCommit, onKeep, onRoll, onClos
           placeholder="Commit to something…"
           style={{
             flex: 1,
-            background: 'rgba(15,23,42,0.6)',
-            border: '1px solid rgba(148,163,184,0.25)',
+            background: 'var(--surface-2)',
+            border: '1px solid var(--border)',
             borderRadius: '8px',
             padding: '6px 8px',
-            color: '#e2e8f0',
+            color: 'var(--text)',
             fontSize: '12px',
           }}
         />
@@ -200,8 +200,8 @@ export function WorkbookPanel({ snapshot, busy, onCommit, onKeep, onRoll, onClos
           onClick={submit}
           disabled={busy || !draft.trim()}
           style={{
-            background: 'rgba(56,189,248,0.15)',
-            border: '1px solid rgba(56,189,248,0.4)',
+            background: 'var(--accent-soft)',
+            border: '1px solid var(--accent-border)',
             borderRadius: '8px',
             color: '#7dd3fc',
             cursor: busy ? 'default' : 'pointer',
@@ -220,9 +220,9 @@ export function WorkbookPanel({ snapshot, busy, onCommit, onKeep, onRoll, onClos
             width: '100%',
             marginTop: '8px',
             background: 'transparent',
-            border: '1px solid rgba(148,163,184,0.25)',
+            border: '1px solid var(--border)',
             borderRadius: '8px',
-            color: '#94a3b8',
+            color: 'var(--muted)',
             fontSize: '11px',
             padding: '6px',
             cursor: busy ? 'default' : 'pointer',

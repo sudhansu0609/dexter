@@ -79,6 +79,25 @@ export interface ChatMessage {
   // A message Dexter started (check-in, event) and the one-tap answers it offers.
   kind?: string;
   quickReplies?: string[];
+  // How the message came in: spoken through the mic, or typed.
+  via?: 'voice' | 'text';
+}
+
+// What the backend reports about the voice layer (v10).
+export interface VoiceStatus {
+  enabled: boolean;
+  sttReady: boolean;
+  sttLoaded?: boolean;
+  wakeReady: boolean;
+  vadReady: boolean;
+  ttsReady?: boolean;
+  model?: string;
+  device?: string | null;
+  wakeWord?: string;
+  wakeMode?: string;
+  bargeIn?: boolean;
+  followUpWindow?: number;
+  speaker?: { available: boolean; enrolled: boolean; strict: boolean };
 }
 
 export interface MissionStatus {
@@ -99,7 +118,18 @@ export interface MissionStatus {
 
 // A single frame decoded from the /chat/stream SSE body.
 export interface StreamEvent {
-  type: 'tool_start' | 'token' | 'provider_switched' | 'reply' | 'audio' | 'error' | string;
+  type:
+    | 'tool_start'
+    | 'token'
+    | 'provider_switched'
+    | 'escalated'
+    | 'reply'
+    | 'delivery'
+    | 'audio'
+    | 'interrupted'
+    | 'error'
+    | 'done'
+    | string;
   payload?: any;
 }
 
@@ -129,6 +159,7 @@ export interface DexterStatus {
   runtime?: RuntimeHealth;
   toolCount?: number;
   intentMode?: string;
+  voice?: VoiceStatus;
 }
 
 // The workbook: goals, the commitments that serve them, and what actually
@@ -205,7 +236,7 @@ export interface SettingRow {
   key: string;
   label: string;
   help: string;
-  kind: 'bool' | 'int' | 'float' | 'string' | 'choice';
+  kind: 'bool' | 'int' | 'float' | 'string' | 'choice' | 'model';
   options: string[];
   group: string;
   value: unknown;
@@ -219,4 +250,116 @@ export interface SettingsUpdateResult {
   needsRestart: string[];
   rejected: string[];
   settings: SettingRow[];
+}
+
+// ─────────────────── Sentinel, resources and the apps (v9) ───────────────────
+//
+// Dexter asks Sentinel before loading a model or starting a project. These are
+// the shapes `/api/dexter/resources` and `/api/dexter/apps` answer with. Every
+// field is nullable on purpose: the guardian may be absent, or be the older
+// build with no RAM/disk commands, and the panel has to say which rather than
+// render an empty gauge that reads as a fault.
+
+export interface VramState {
+  name: string;
+  totalMib: number;
+  usedMib: number;
+  freeMib: number;
+  zone?: string;
+}
+
+export interface RamState {
+  zone?: string;
+  totalMib: number | null;
+  availMib: number | null;
+  commitMib: number | null;
+  commitLimitMib: number | null;
+  top?: { name?: string; pid?: number; ram_mib?: number }[];
+  source?: string;
+}
+
+export interface DiskDrive {
+  letter: string;
+  total: number;
+  free: number;
+  zone?: string;
+}
+
+export interface DiskState {
+  drives: DiskDrive[];
+  last_cleanup?: { at?: string; freed_bytes?: number; mode?: string } | null;
+  pending?: boolean;
+  source?: string;
+}
+
+export interface ResourceHolder {
+  name: string;
+  pid?: number;
+  vramMib: number;
+  frozen?: boolean;
+}
+
+export interface FrozenProcess {
+  pid?: number;
+  name: string;
+  class?: string;
+  reason?: string;
+}
+
+export interface ShedSummary {
+  level?: string;
+  reason?: string;
+  steps?: string[];
+  freedMib?: number;
+  elapsedMs?: number;
+  at?: number;
+}
+
+export interface ResourceSnapshot {
+  sentinel: { connected: boolean; version: string | null; features: string[]; registered?: boolean | null };
+  vram: VramState | null;
+  ram: RamState | null;
+  disk: DiskState | null;
+  holders: ResourceHolder[];
+  frozen: FrozenProcess[];
+  reservations: unknown[];
+  trayAlive: boolean | null;
+  models: { loaded: { name: string; sizeMb: number; vramMb: number; onGpu: boolean }[]; ours: string[] };
+  lastShed: ShedSummary;
+  budgets: { vramMib: number; ramMib: number; engineVramMib: number; engineRamMib: number };
+}
+
+export interface AppRow {
+  id: string;
+  label: string;
+  class: 'assistant' | 'interactive' | 'batch' | string;
+  running: boolean;
+  evidence?: string;
+  detail?: string;
+  pids: number[];
+  /** The port to show: the live one when it was identified, else the preferred one. */
+  port?: number | null;
+  /** Where it is, confirmed by its own health route. Null means "we could not tell". */
+  livePort?: number | null;
+  /** What it asks for at startup. It steps forward when that one is held. */
+  preferredPort?: number | null;
+  /** Sub-service ports it prefers: {comfyui: 8188}, {xtts: 8096, vite: 3005}, … */
+  extraPreferred?: Record<string, number>;
+  vramMib: number;
+  ramMib: number;
+  exclusiveWith: string[];
+  canLaunch: boolean;
+  canStop: boolean;
+  batchJob: boolean;
+  notes?: string;
+  warn?: string;
+  root?: string;
+  rssMib?: number | null;
+  uptimeSeconds?: number | null;
+}
+
+export interface ToolReply {
+  ok: boolean;
+  summary: string;
+  data?: Record<string, unknown>;
 }

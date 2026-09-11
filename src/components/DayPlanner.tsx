@@ -16,7 +16,7 @@ export function DayPlanner({ tasks, newTaskTitle, setNewTaskTitle, onAdd, onTogg
   return (
     <div className="dexter-panel" style={{ padding: '16px' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
-        <h3 style={{ fontSize: '13px', color: '#38bdf8', display: 'flex', alignItems: 'center', gap: '6px' }}>
+        <h3 style={{ fontSize: '13px', color: 'var(--accent)', display: 'flex', alignItems: 'center', gap: '6px' }}>
           <Calendar size={15} /> Today
         </h3>
         <span style={{ fontSize: '10px', color: 'var(--text-muted)' }}>{tasks.length} Tasks</span>
@@ -34,8 +34,8 @@ export function DayPlanner({ tasks, newTaskTitle, setNewTaskTitle, onAdd, onTogg
           type="submit"
           disabled={isAdding}
           style={{
-            background: '#38bdf8',
-            color: '#090d16',
+            background: 'var(--accent)',
+            color: 'var(--bg)',
             padding: '6px 10px',
             borderRadius: '8px',
             fontWeight: 800,
@@ -57,7 +57,7 @@ export function DayPlanner({ tasks, newTaskTitle, setNewTaskTitle, onAdd, onTogg
               alignItems: 'center',
               justifyContent: 'space-between',
               padding: '6px 10px',
-              background: 'rgba(15, 23, 42, 0.6)',
+              background: 'var(--surface-2)',
               borderRadius: '8px',
               border: '1px solid var(--bg-card-border)',
               fontSize: '11px',
@@ -65,17 +65,17 @@ export function DayPlanner({ tasks, newTaskTitle, setNewTaskTitle, onAdd, onTogg
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-              <CheckCircle size={12} color={t.completed ? '#10b981' : '#64748b'} />
+              <CheckCircle size={12} color={t.completed ? 'var(--success)' : 'var(--muted)'} />
               <span
                 style={{
                   textDecoration: t.completed ? 'line-through' : 'none',
-                  color: t.completed ? '#64748b' : '#f8fafc',
+                  color: t.completed ? 'var(--muted)' : 'var(--text)',
                 }}
               >
                 {t.title}
               </span>
             </div>
-            <span style={{ fontSize: '9px', color: '#94a3b8' }}>{t.time}</span>
+            <span style={{ fontSize: '9px', color: 'var(--muted)' }}>{t.time}</span>
           </div>
         ))}
       </div>

@@ -18,7 +18,7 @@ export function FileExplorer({ query, setQuery, results, isSearching, onSearch, 
       <h3
         style={{
           fontSize: '13px',
-          color: '#38bdf8',
+          color: 'var(--accent)',
           marginBottom: '10px',
           display: 'flex',
           alignItems: 'center',
@@ -39,9 +39,9 @@ export function FileExplorer({ query, setQuery, results, isSearching, onSearch, 
         <button
           type="submit"
           style={{
-            background: 'rgba(56, 189, 248, 0.2)',
-            color: '#38bdf8',
-            border: '1px solid #38bdf8',
+            background: 'var(--accent-soft)',
+            color: 'var(--accent)',
+            border: '1px solid var(--accent)',
             padding: '6px 10px',
             borderRadius: '8px',
             fontSize: '11px',
@@ -61,7 +61,7 @@ export function FileExplorer({ query, setQuery, results, isSearching, onSearch, 
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'space-between',
-              background: 'rgba(15, 23, 42, 0.6)',
+              background: 'var(--surface-2)',
               padding: '6px 8px',
               borderRadius: '8px',
               border: '1px solid var(--bg-card-border)',
@@ -70,10 +70,10 @@ export function FileExplorer({ query, setQuery, results, isSearching, onSearch, 
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: '6px', overflow: 'hidden' }}>
-              <FileText size={12} color="#38bdf8" />
+              <FileText size={12} color="var(--accent)" />
               <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{f.fileName}</span>
             </div>
-            <ExternalLink size={10} color="#94a3b8" />
+            <ExternalLink size={10} color="var(--muted)" />
           </div>
         ))}
       </div>

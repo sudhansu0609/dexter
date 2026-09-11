@@ -1,14 +1,36 @@
 {
-  "north_star": "",
+  "north_star": "creating a stoty for my hinfi animatriin channel khayal3baje",
   "why": "",
-  "focus": "",
-  "focus_set_on": "",
+  "focus": "shipping dexter v8 with instant replies",
+  "focus_set_on": "2026-09-07",
   "today_win": "",
   "today_win_date": "",
   "blockers": [],
-  "wins": [],
-  "snoozed_until": 0,
-  "sent": {},
-  "last_checkin": {},
+  "wins": [
+    {
+      "date": "2026-09-07",
+      "text": "fixed dexter's instant replies"
+    },
+    {
+      "date": "2026-09-07",
+      "text": "fixed dexter's instant replies"
+    }
+  ],
+  "snoozed_until": 1788803121.0094225,
+  "sent": {
+    "2026-09-11": [
+      "code",
+      "init:pick-win",
+      "morning",
+      "init:shed-5963677",
+      "init:shed-5963681",
+      "init:shed-5963684"
+    ]
+  },
+  "last_checkin": {
+    "kind": "code",
+    "ts": 1789117448.4399662,
+    "text": "buzzcode is done in dexter: 1 file(s) touched. It says: Edited a.py. Want to look at it together?"
+  },
   "initiative": "dexter"
 }

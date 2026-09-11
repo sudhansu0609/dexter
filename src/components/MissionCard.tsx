@@ -16,17 +16,17 @@ export function MissionCard({ mission, onPrefill, onToggleInitiative }: Props) {
   if (!mission) return null;
   const line = (icon: JSX.Element, label: string, value: string, prompt: string, ask: string) => (
     <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-start', fontSize: '12px', lineHeight: 1.35 }}>
-      <span style={{ color: '#a855f7', flexShrink: 0, marginTop: '1px' }}>{icon}</span>
+      <span style={{ color: 'var(--accent)', flexShrink: 0, marginTop: '1px' }}>{icon}</span>
       <span style={{ opacity: 0.7, flexShrink: 0, minWidth: '78px' }}>{label}</span>
       {value ? (
-        <span style={{ color: '#f8fafc' }}>{value}</span>
+        <span style={{ color: 'var(--text)' }}>{value}</span>
       ) : (
         <button
           type="button"
           onClick={() => onPrefill(prompt)}
           style={{
             background: 'transparent',
-            border: '1px dashed rgba(168, 85, 247, 0.5)',
+            border: '1px dashed var(--accent-border)',
             color: '#c4b5fd',
             borderRadius: '8px',
             padding: '2px 8px',
@@ -60,9 +60,9 @@ export function MissionCard({ mission, onPrefill, onToggleInitiative }: Props) {
             display: 'flex',
             alignItems: 'center',
             gap: '5px',
-            background: mission.initiative === 'me' ? 'rgba(56, 189, 248, 0.12)' : 'rgba(168, 85, 247, 0.18)',
-            border: `1px solid ${mission.initiative === 'me' ? 'rgba(56, 189, 248, 0.5)' : 'rgba(168, 85, 247, 0.6)'}`,
-            color: mission.initiative === 'me' ? '#bae6fd' : '#e9d5ff',
+            background: mission.initiative === 'me' ? 'var(--accent-soft)' : 'var(--accent-soft)',
+            border: `1px solid ${mission.initiative === 'me' ? 'var(--accent-border)' : 'var(--accent-border)'}`,
+            color: mission.initiative === 'me' ? '#bae6fd' : 'var(--accent)',
             borderRadius: '999px',
             padding: '2px 9px',
             fontSize: '10px',
@@ -83,7 +83,7 @@ export function MissionCard({ mission, onPrefill, onToggleInitiative }: Props) {
       {line(<Trophy size={13} />, "Today's win", mission.todayWin, "today's win is ", 'What makes today a win?')}
       {mission.blockers.length > 0 && (
         <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-start', fontSize: '12px' }}>
-          <span style={{ color: '#f59e0b', flexShrink: 0, marginTop: '1px' }}>
+          <span style={{ color: 'var(--warn)', flexShrink: 0, marginTop: '1px' }}>
             <AlertTriangle size={13} />
           </span>
           <span style={{ opacity: 0.7, minWidth: '78px', flexShrink: 0 }}>Blocked by</span>
@@ -92,7 +92,7 @@ export function MissionCard({ mission, onPrefill, onToggleInitiative }: Props) {
       )}
       {mission.now && (
         <div style={{ display: 'flex', gap: '8px', alignItems: 'center', fontSize: '11px', opacity: 0.85 }}>
-          <span style={{ color: '#38bdf8', flexShrink: 0 }}>
+          <span style={{ color: 'var(--accent)', flexShrink: 0 }}>
             <Activity size={13} />
           </span>
           <span style={{ opacity: 0.7, minWidth: '78px', flexShrink: 0 }}>Right now</span>

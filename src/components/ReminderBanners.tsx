@@ -23,16 +23,16 @@ export function ReminderBanners({ reminders, onSnooze, onDismiss }: Props) {
             display: 'flex',
             alignItems: 'center',
             gap: '10px',
-            border: '1px solid rgba(251, 191, 36, 0.5)',
-            background: 'rgba(251, 191, 36, 0.12)',
+            border: '1px solid #f3dcb0',
+            background: 'var(--warn-soft)',
           }}
         >
-          <Bell size={18} style={{ color: '#fbbf24', flexShrink: 0 }} />
+          <Bell size={18} style={{ color: 'var(--warn)', flexShrink: 0 }} />
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: '9px', color: '#fbbf24', fontWeight: 700, letterSpacing: '0.5px' }}>
+            <div style={{ fontSize: '9px', color: 'var(--warn)', fontWeight: 700, letterSpacing: '0.5px' }}>
               {reminder.missed ? 'MISSED REMINDER' : 'REMINDER'}
             </div>
-            <div style={{ fontSize: '13px', color: '#f8fafc', wordBreak: 'break-word' }}>
+            <div style={{ fontSize: '13px', color: 'var(--text)', wordBreak: 'break-word' }}>
               {reminder.text}
             </div>
           </div>
@@ -40,9 +40,9 @@ export function ReminderBanners({ reminders, onSnooze, onDismiss }: Props) {
             type="button"
             onClick={() => onSnooze(reminder)}
             style={{
-              background: 'rgba(148, 163, 184, 0.15)',
-              color: '#cbd5e1',
-              border: '1px solid rgba(148, 163, 184, 0.3)',
+              background: 'var(--surface-2)',
+              color: 'var(--muted)',
+              border: '1px solid var(--border)',
               padding: '5px 10px',
               borderRadius: '8px',
               fontSize: '11px',
@@ -56,9 +56,9 @@ export function ReminderBanners({ reminders, onSnooze, onDismiss }: Props) {
             type="button"
             onClick={() => onDismiss(reminder.id)}
             style={{
-              background: 'rgba(16, 185, 129, 0.2)',
-              color: '#10b981',
-              border: '1px solid rgba(16, 185, 129, 0.4)',
+              background: 'var(--success-soft)',
+              color: 'var(--success)',
+              border: '1px solid #bfe6cc',
               padding: '5px 10px',
               borderRadius: '8px',
               fontSize: '11px',

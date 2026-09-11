@@ -1,18 +1,24 @@
 """
-Coding delegated to buzzcode (roadmap v6, C1).
+Coding delegated to buzzcode (roadmap v6, C1; own window and memory release, v8).
 
 buzzcode (B:\\youtubeProjects\\Buzzcaf_Media\\codeBuzz, installed as
 ~/.cargo/bin/buzzcode.exe) is the owner's local coding agent: it manages the
-llama-server on port 8089 and edits a repository from a headless prompt,
-emitting JSON-lines events. Dexter starts it as a background job in one of
-the owner's own repositories, follows the events, and reports when it is
-finished, so "fix the failing test in dexter" returns immediately and the
-result arrives as a toast and a banner.
+llama-server on port 8089 and edits a repository from a one-shot prompt,
+emitting JSON-lines events. Dexter opens it in its own terminal window
+(code_console.py renders the events live and mirrors them into a job log),
+tails that log, and reports when it is finished - so "fix the failing test in
+dexter" returns immediately, the work is visible in the buzzcode window, and
+the result arrives as a toast and a banner.
+
+Memory: buzzcode stops the llama-server it started when the task ends, and
+Dexter stops any engine it started itself, so the big model leaves the GPU
+once the job is done. Set DEXTER_CODE_WINDOW=0 to go back to a hidden
+background process.
 
 Permission modes map straight through: `edits` (default) lets it read and
 write files but denies shell commands, `yolo` lets it run commands too and is
-only used when the owner asks for it in so many words; `ask` would hang
-headless and is refused.
+only used when the owner asks for it in so many words; `ask` would hang in
+one-shot mode and is refused.
 """
 
 import json
@@ -33,11 +39,17 @@ from jsonstore import load_json, save_json
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 JOBS_FILE = os.path.join(DATA_DIR, "code_jobs.json")
 JOB_LOG_DIR = os.path.join(DATA_DIR, "code_jobs")
-ENGINE_URL = (os.environ.get("LLAMACPP_URL") or "http://127.0.0.1:8089/v1").rstrip("/")
+#: buzzcode's llama-server. Not a constant any more: it steps forward from 8089
+#: when something holds that port, and the ledger is how Dexter follows it
+#: (GUARDIAN_PLAN.md section 11). `LLAMACPP_URL` still overrides everything.
+from hybrid_llm import engine_url  # noqa: E402  - one resolver, two callers
 CODE_ROOTS = [
     p.strip() for p in (os.environ.get("DEXTER_CODE_ROOTS") or r"B:\youtubeProjects\Buzzcaf_Media").split(";") if p.strip()
 ]
 MODES = {"edits": "edits", "edit": "edits", "yolo": "yolo"}
+# Open buzzcode in its own console window (default) instead of a hidden pipe.
+WINDOWED = os.environ.get("DEXTER_CODE_WINDOW", "1").strip().lower() not in ("0", "false", "no", "off")
+CONSOLE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "code_console.py")
 _PROJECT_MARKERS = (".git", "Cargo.toml", "package.json", "pyproject.toml", "requirements.txt", "go.mod")
 _EDIT_TOOLS = {"write", "edit", "write_file", "edit_file", "create_file", "apply_patch", "multi_edit"}
 
@@ -132,6 +144,8 @@ class CodeJob:
         self.exit_code: Optional[int] = None
         self.log_path = os.path.join(JOB_LOG_DIR, f"{self.id}.jsonl")
         self.process: Optional[subprocess.Popen] = None
+        self.windowed = False
+        self.launcher_exited = False
 
     def ingest(self, line: str) -> Optional[Dict[str, Any]]:
         """Fold one JSON-lines event into the job; returns a UI-worthy event or None."""
@@ -168,6 +182,11 @@ class CodeJob:
             self.turns = int(event.get("turns") or self.turns)
         elif kind == "verify":
             return {"kind": "verify", "ok": bool(event.get("ok")), "detail": str(event.get("command") or "")}
+        elif kind == "launcher_exit":
+            # Written by code_console.py once buzzcode has exited (the window
+            # itself stays open for reading, so this is the real end of the job).
+            self.launcher_exited = True
+            self.exit_code = int(event.get("code") if event.get("code") is not None else 1)
         return None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -190,6 +209,7 @@ class CodeJob:
             "diffStat": self.diff_stat,
             "exitCode": self.exit_code,
             "log": self.log_path,
+            "windowed": self.windowed,
         }
 
     def summary(self) -> str:
@@ -215,6 +235,38 @@ def _no_window() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 
 
+def _new_console() -> int:
+    return getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if sys.platform == "win32" else 0
+
+
+def console_python() -> Optional[str]:
+    """A python.exe (not pythonw) to run code_console.py in a visible window."""
+    exe = sys.executable or ""
+    base = os.path.basename(exe).lower()
+    if base.startswith("pythonw"):
+        candidate = os.path.join(os.path.dirname(exe), base.replace("pythonw", "python", 1))
+        exe = candidate if os.path.exists(candidate) else ""
+    if exe and os.path.exists(exe):
+        return exe
+    return shutil.which("python") or shutil.which("python3")
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """End a process and everything it spawned (the launcher, buzzcode, its llama-server)."""
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=15, creationflags=_no_window(),
+            )
+        else:
+            proc.terminate()
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
 class CodeAgent:
     def __init__(self) -> None:
         self.jobs: Dict[str, CodeJob] = {}
@@ -225,15 +277,19 @@ class CodeAgent:
     # ───────────────────────── engine ─────────────────────────
 
     def engine_status(self) -> Dict[str, Any]:
+        from hybrid_llm import port_open
+
+        if not port_open(engine_url()):
+            return {"online": False, "model": None, "url": engine_url(), "startedByDexter": self._engine_proc is not None}
         try:
-            res = requests.get(f"{ENGINE_URL}/models", timeout=2)
+            res = requests.get(f"{engine_url()}/models", timeout=2)
             if res.ok:
                 data = res.json().get("data") or []
                 model = data[0].get("id") if data else None
-                return {"online": True, "model": model, "url": ENGINE_URL, "startedByDexter": self._engine_proc is not None}
+                return {"online": True, "model": model, "url": engine_url(), "startedByDexter": self._engine_proc is not None}
         except Exception:
             pass
-        return {"online": False, "model": None, "url": ENGINE_URL, "startedByDexter": self._engine_proc is not None}
+        return {"online": False, "model": None, "url": engine_url(), "startedByDexter": self._engine_proc is not None}
 
     def start_engine(self, wait_seconds: int = 90) -> Dict[str, Any]:
         status = self.engine_status()
@@ -242,6 +298,10 @@ class CodeAgent:
         exe = buzzcode_path()
         if not exe:
             raise RuntimeError("buzzcode is not installed (expected ~/.cargo/bin/buzzcode.exe).")
+        # 12.1 GB of a 16 GB card. Ask before spawning, not after.
+        decision = self._reserve_engine()
+        if not decision.granted:
+            raise RuntimeError(decision.message())
         os.makedirs(JOB_LOG_DIR, exist_ok=True)
         log = open(os.path.join(JOB_LOG_DIR, "engine.log"), "ab")
         self._engine_proc = subprocess.Popen(
@@ -250,12 +310,24 @@ class CodeAgent:
         deadline = time.time() + wait_seconds
         while time.time() < deadline:
             if self._engine_proc.poll() is not None:
+                self._release_booking()
                 raise RuntimeError("buzzcode engine exited while starting; see data/code_jobs/engine.log.")
             status = self.engine_status()
             if status["online"]:
+                # Consumed: the server holds the memory now, so the booking is
+                # handed straight back rather than double-counting it.
+                self._release_booking()
                 return {**status, "started": True}
             time.sleep(2)
         return {**self.engine_status(), "started": True, "warming": True}
+
+    def _release_booking(self) -> None:
+        try:
+            import model_steward
+
+            model_steward.release("buzzcode-engine")
+        except Exception:
+            pass
 
     def stop_engine(self) -> bool:
         if self._engine_proc is None:
@@ -285,22 +357,57 @@ class CodeAgent:
         if self.running():
             current = self.running()[0]
             raise RuntimeError(f"A code task is already running ({current.id}: {current.task[:60]}). Wait for it or cancel it.")
+        # Sentinel first, then the job. Refusing here is the whole point: two
+        # parties both deciding there is room, and both then discovering there
+        # is not, is how the card ends up paging and everything stalls.
+        decision = self._reserve_engine()
+        if not decision.granted:
+            raise RuntimeError(decision.message())
         job = CodeJob(task, project, mode)
         os.makedirs(JOB_LOG_DIR, exist_ok=True)
+        self._make_room()
         env = dict(os.environ)
         env.setdefault("NO_COLOR", "1")
-        job.process = subprocess.Popen(
-            [exe, "-C", project["path"], "--mode", mode, "--json", "-p", task],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-            creationflags=_no_window(), env=env, cwd=project["path"],
-        )
+        py = console_python() if WINDOWED else None
+        if py:
+            # Its own terminal: code_console.py runs buzzcode, shows the events
+            # live and mirrors them into the job log that _follow_log tails.
+            spec_path = os.path.join(JOB_LOG_DIR, f"{job.id}.json")
+            save_json(spec_path, {
+                "jobId": job.id, "exe": exe, "cwd": project["path"], "project": project["name"],
+                "mode": mode, "task": task, "log": job.log_path,
+            })
+            open(job.log_path, "a", encoding="utf-8").close()
+            job.process = subprocess.Popen(
+                [py, "-X", "utf8", CONSOLE_SCRIPT, spec_path],
+                creationflags=_new_console(), env=env, cwd=project["path"], close_fds=True,
+            )
+            job.windowed = True
+            follow = self._follow_log
+        else:
+            job.process = subprocess.Popen(
+                [exe, "-C", project["path"], "--mode", mode, "--json", "-p", task],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                creationflags=_no_window(), env=env, cwd=project["path"],
+            )
+            follow = self._follow
         with self._lock:
             self.jobs[job.id] = job
-        threading.Thread(target=self._follow, args=(job,), name=f"dexter-code-{job.id}", daemon=True).start()
-        bus.publish("code", {"jobId": job.id, "status": "started", "task": task, "project": project["name"]})
+        threading.Thread(target=follow, args=(job,), name=f"dexter-code-{job.id}", daemon=True).start()
+        bus.publish("code", {
+            "jobId": job.id, "status": "started", "task": task, "project": project["name"], "windowed": job.windowed,
+        })
         return job
 
+    def _publish_progress(self, job: CodeJob, notable: Dict[str, Any], last_publish: float) -> float:
+        now = time.time()
+        if now - last_publish > 1.5:
+            bus.publish("code", {"jobId": job.id, "status": "running", **notable, "toolCalls": job.tool_calls})
+            return now
+        return last_publish
+
     def _follow(self, job: CodeJob) -> None:
+        """Hidden mode: buzzcode's stdout is a pipe; mirror it into the log."""
         proc = job.process
         assert proc is not None and proc.stdout is not None
         last_publish = 0.0
@@ -309,24 +416,113 @@ class CodeAgent:
                 line = raw.decode("utf-8", errors="replace")
                 log.write(line)
                 notable = job.ingest(line)
-                now = time.time()
-                if notable and now - last_publish > 1.5:
-                    last_publish = now
-                    bus.publish("code", {"jobId": job.id, "status": "running", **notable, "toolCalls": job.tool_calls})
+                if notable:
+                    last_publish = self._publish_progress(job, notable, last_publish)
         stderr = b""
         try:
             stderr = proc.stderr.read() if proc.stderr else b""
         except Exception:
             pass
         job.exit_code = proc.wait()
-        job.finished = time.time()
         if stderr.strip():
             job.errors.append(stderr.decode("utf-8", errors="replace").strip()[-800:])
+        self._finish(job)
+
+    def _follow_log(self, job: CodeJob) -> None:
+        """Windowed mode: tail the job log the console launcher writes. The job
+        ends at the launcher's exit record (the window stays open for reading)
+        or when the window is closed early."""
+        proc = job.process
+        assert proc is not None
+        last_publish = 0.0
+        position = 0
+        while True:
+            try:
+                with open(job.log_path, "r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(position)
+                    lines = fh.readlines()
+                    position = fh.tell()
+            except OSError:
+                lines = []
+            for line in lines:
+                notable = job.ingest(line)
+                if notable:
+                    last_publish = self._publish_progress(job, notable, last_publish)
+            if job.launcher_exited or job.status != "running":
+                break
+            if proc.poll() is not None:
+                if job.exit_code is None:
+                    job.exit_code = proc.returncode
+                    job.errors.append("the buzzcode window was closed before the task finished")
+                break
+            time.sleep(0.4)
+        self._finish(job)
+
+    def _finish(self, job: CodeJob) -> None:
+        job.finished = time.time()
         if job.status == "running":
             job.status = "done" if job.exit_code == 0 and (job.final_message or not job.errors) else "failed"
         job.diff_stat = self._diff_stat(job.project["path"])
         self._remember(job)
+        self._release_memory(job)
         self._announce(job)
+
+    def _reserve_engine(self) -> Any:
+        """Ask Sentinel for buzzcode's 27B *before* starting anything.
+
+        buzzcode's llama-server wants ~12 GB of a 16 GB card plus a 6 GB cache.
+        Starting it while VrDeep is rendering is how the machine locks up, so a
+        refusal here refuses the job — with the holder named, not a shrug. The
+        booking is `for_pid` the server that will consume it once we know it;
+        at task time we do not yet, so it is booked against Dexter and released
+        when the engine is up or the job ends.
+        """
+        import model_steward
+
+        decision = model_steward.reserve(
+            "buzzcode-engine",
+            model_steward.ENGINE_VRAM_MIB,
+            model_steward.ENGINE_RAM_MIB,
+            for_pid=self._engine_server_pid(),
+            ttl_secs=180,
+        )
+        return decision
+
+    def _engine_server_pid(self) -> Optional[int]:
+        """The llama-server that will hold the memory, once it exists."""
+        if self._engine_proc is not None and self._engine_proc.poll() is None:
+            return self._engine_proc.pid
+        return None
+
+    def _make_room(self) -> None:
+        """buzzcode's model wants most of the GPU: unload Dexter's own models now
+        (the steward decides which; the small fast one survives an orange)."""
+        try:
+            import model_steward
+
+            threading.Thread(
+                target=model_steward.shed, args=("red", "buzzcode is starting"),
+                name="dexter-make-room", daemon=True,
+            ).start()
+        except Exception:
+            pass
+
+    def _release_memory(self, job: CodeJob) -> None:
+        """The big model leaves the GPU once the job is over: buzzcode already
+        stops the server it started; an engine Dexter started goes too, and the
+        provider cache forgets 8089 so the next turn does not wait on it."""
+        released = False
+        self._release_booking()
+        if self._engine_proc is not None and not self.running():
+            released = self.stop_engine()
+        try:
+            from hybrid_llm import llm_router
+
+            llm_router.invalidate_health()
+        except Exception:
+            pass
+        if released:
+            job.warnings.append("stopped the local model server Dexter had started")
 
     def _diff_stat(self, path: str) -> str:
         if not os.path.isdir(os.path.join(path, ".git")):
@@ -365,11 +561,8 @@ class CodeAgent:
         if not job or job.status != "running":
             return None
         job.status = "cancelled"
-        try:
-            if job.process:
-                job.process.terminate()
-        except Exception:
-            pass
+        if job.process:
+            _kill_tree(job.process)
         return job
 
     def status(self, job_id: Optional[str] = None) -> Optional[Dict[str, Any]]:

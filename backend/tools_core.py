@@ -296,13 +296,17 @@ class AppLauncherTool:
                 errors.append(f"{run_cmd}: {e}")
                 print(f"[Smart Launcher] Attempt {idx} failed: {e}")
 
+        # v11 P1.3: a dead end used to be a statement ("I couldn't find X"), which
+        # leaves the user guessing whether they said it wrong or Dexter is broken.
+        # Ask instead, and offer the two things it could have meant.
         return {
             "success": False,
             "appName": app_name,
             "error": "; ".join(errors) or "Could not execute",
             "message": (
-                f"I couldn't find '{app_name}' on this PC. "
-                f"It may not be installed, or try the exact program name."
+                f"I don't have '{app_name}' as an app on this PC, and it isn't a site I know. "
+                f"Did you mean a website (say 'open {app_name}.com'), or is it installed "
+                f"under another name?"
             ),
         }
 
@@ -310,6 +314,26 @@ class AppLauncherTool:
 class PlaywrightBrowserTool:
     @classmethod
     def browse_url(cls, url: str) -> Dict[str, Any]:
+        # v11: one browser, and it is the user's. `webbrowser.open` is still the
+        # fallback, but it hands the URL to whatever Windows calls the default -
+        # which on this machine is a Chrome that Dexter can then no longer read
+        # or close. Going through chrome_control keeps every later command
+        # ("close that tab", "what am I looking at") pointed at the same window.
+        try:
+            import chrome_control
+
+            if chrome_control.own_mode():
+                info = chrome_control.open_url(url)
+                return {
+                    "success": True,
+                    "url": info["url"],
+                    "title": info.get("title", ""),
+                    "window": info.get("window", ""),
+                    "message": f"Opened {info.get('title') or info['url']} in Chrome.",
+                }
+        except Exception as exc:
+            print(f"[Browser] Chrome control unavailable ({exc}); using the default browser.")
+
         if not url.startswith("http://") and not url.startswith("https://"):
             url = f"https://{url}"
 

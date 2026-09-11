@@ -4,9 +4,9 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 // Every network call goes through src/api.ts by design (roadmap v3 item 11), so
 // one mock of that module isolates the whole UI from the backend.
 vi.mock('../api', () => ({
-  API_BASE: 'http://localhost:8098',
+  API_BASE: 'http://localhost',
   apiFetch: vi.fn(async () => new Response('{}')),
-  eventsUrl: vi.fn(async () => 'http://localhost:8098/events'),
+  eventsUrl: vi.fn(async () => 'http://localhost/events'),
   getStatus: vi.fn(async () => ({ status: 'online', runtime: mockRuntime })),
   getHistory: vi.fn(async () => ({ session: 'default', turns: mockTurns })),
   getPlanner: vi.fn(async () => ({ tasks: [] })),
@@ -31,11 +31,32 @@ vi.mock('../api', () => ({
   updateProfile: vi.fn(async () => ({ profile: {}, summary: '' })),
   reindexKnowledge: vi.fn(async () => ({})),
   chatStream: vi.fn(async () => {}),
+  // v10: voice. jsdom has no microphone, so the hook reports "unavailable"
+  // and the mic button renders disabled - which is the state under test.
+  voiceWsUrl: vi.fn(async () => 'ws://localhost/api/dexter/voice/ws'),
+  generateTts: vi.fn(async () => new Blob()),
+  audioUrl: vi.fn((u: string) => u),
+  voiceInterrupt: vi.fn(async () => ({ ok: true })),
+  getVoiceProfile: vi.fn(async () => ({ available: false, enrolled: false, strict: true, threshold: 0.75 })),
+  forgetVoiceProfile: vi.fn(async () => ({ available: false, enrolled: false, strict: true, threshold: 0.75 })),
+  previewVoice: vi.fn(async () => new Blob()),
   getWorkbook: vi.fn(async () => mockWorkbook),
   addCommitment: vi.fn(async () => ({ ok: true, summary: 'ok' })),
   finishCommitment: vi.fn(async () => {}),
   rollCommitment: vi.fn(async () => {}),
   closeOutDay: vi.fn(async () => ({ done: 0, rolled: 0 })),
+  // v9: the Resource and Apps panels (only rendered in the expanded dashboard,
+  // but the module mock has to cover them or an expand would explode).
+  getResources: vi.fn(async () => ({
+    sentinel: { connected: false, version: null, features: [] },
+    vram: null, ram: null, disk: null, holders: [], frozen: [], reservations: [],
+    trayAlive: null, models: { loaded: [], ours: [] }, lastShed: {},
+    budgets: { vramMib: 5120, ramMib: 3072, engineVramMib: 12500, engineRamMib: 6500 },
+  })),
+  getApps: vi.fn(async () => ({ apps: [], root: '' })),
+  startAppById: vi.fn(async () => ({ ok: true, summary: '' })),
+  stopAppById: vi.fn(async () => ({ ok: true, summary: '' })),
+  runPhrase: vi.fn(async () => ({ reply: '', action: '' })),
 }));
 
 let mockRuntime: any = null;
@@ -64,7 +85,16 @@ describe('App', () => {
     // "Dexter" appears in several places; anchor on the title bar heading and
     // the chat composer, which together prove the tree actually mounted.
     expect(await screen.findByRole('heading', { level: 1 })).toBeInTheDocument();
-    expect(screen.getByPlaceholderText(/Ask Dexter anything/i)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/Ask or tell Dexter/i)).toBeInTheDocument();
+  });
+
+  it('shows the mic and says why voice is unavailable when there is no microphone', async () => {
+    render(<App />);
+    // jsdom's getUserMedia rejects, so the voice layer must report that in
+    // words instead of a dead button (v10).
+    expect(await screen.findByText(/Voice unavailable: microphone unavailable/i)).toBeInTheDocument();
+    const mic = screen.getByRole('button', { name: /Voice unavailable/i });
+    expect(mic).toBeDisabled();
   });
 
   it('restores the previous conversation instead of a blank welcome', async () => {

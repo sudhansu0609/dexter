@@ -36,6 +36,62 @@ HEALTH_TTL_SECONDS = 30.0
 _PROBE_TIMEOUT = 1.5
 
 
+def port_open(url: str, timeout: float = 0.3) -> bool:
+    """A raw TCP connect. On this machine a connect to a closed local port
+    times out instead of being refused, so an HTTP probe of a server that is
+    simply not running cost the full probe timeout every time."""
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def local_url(url: str) -> str:
+    """'http://localhost:11434/v1' -> 'http://127.0.0.1:11434/v1' (see __init__)."""
+    return re.sub(r"^(https?://)localhost(?=[:/]|$)", r"\g<1>127.0.0.1", (url or "").strip(), flags=re.IGNORECASE)
+
+
+#: Where buzzcode's llama-server lives when nobody has said otherwise. A
+#: last-resort default, not an assumption: see `engine_url`.
+DEFAULT_LLAMACPP_URL = "http://127.0.0.1:8089/v1"
+
+
+def engine_url() -> str:
+    """buzzcode's OpenAI-compatible base URL.
+
+    `LLAMACPP_URL` wins - an address the owner typed is the whole point of the
+    variable. Failing that, the shared port ledger says where buzzcode's engine
+    actually landed: it steps forward from 8089 like everything else since
+    GUARDIAN_PLAN.md section 11, and 12 GB of model on the wrong port reads
+    exactly like no model at all.
+
+    The ledger entry is trusted on a live pid alone, without the identity check
+    the rest of discovery uses: the thing on that port is llama.cpp, and no
+    amount of asking will make its /health say `app: "buzzcode"`.
+    """
+    explicit = (os.getenv("LLAMACPP_URL") or "").strip()
+    if explicit:
+        return local_url(explicit).rstrip("/")
+    try:
+        import buzzcaf_ports
+
+        record = buzzcaf_ports.entry("buzzcode")
+        if record and buzzcaf_ports._pid_alive(record.get("pid")):
+            port = int(record.get("port") or 0)
+            if 0 < port < 65536:
+                return f"http://127.0.0.1:{port}/v1"
+    except Exception:
+        pass
+    return DEFAULT_LLAMACPP_URL
+
+
 @dataclass
 class LLMResponse:
     content: str = ""
@@ -61,9 +117,13 @@ class HybridLLMRouter:
         # codeBuzz's llama-server (Qwen3.8-27B on 8089). It is only up while
         # codeBuzz runs, but when it is, it already owns the GPU - using it
         # beats loading a second model onto the CPU (roadmap v5, 1.5).
-        self.llamacpp_url = os.getenv("LLAMACPP_URL", "http://127.0.0.1:8089/v1")
-        self.lm_studio_url = os.getenv("LM_STUDIO_URL", "http://localhost:1234/v1")
-        self.ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/v1")
+        # Always 127.0.0.1, never "localhost": on Windows, Python resolves
+        # localhost to ::1 first and waits ~2 s for the IPv6 connect to fail
+        # before trying IPv4 - which put a fixed two seconds on every model
+        # call and every health probe, and made a 0.3 s reply feel like 2.5 s.
+        self.llamacpp_url = engine_url()
+        self.lm_studio_url = local_url(os.getenv("LM_STUDIO_URL", "http://127.0.0.1:1234/v1"))
+        self.ollama_url = local_url(os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/v1"))
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
 
@@ -82,11 +142,15 @@ class HybridLLMRouter:
         self._health_cache: Optional[Dict[str, Any]] = None
         self._health_checked_at = 0.0
         self._model_cache: Dict[str, str] = {}
+        # (provider:model) -> (served?, checked_at); see provider_for_model.
+        self._served_cache: Dict[str, Any] = {}
         self._lock = threading.Lock()
 
     # ───────────────────────── health ─────────────────────────
 
     def _check_endpoint(self, url: str) -> bool:
+        if not port_open(url):
+            return False
         try:
             return self.session.get(url, timeout=_PROBE_TIMEOUT).status_code == 200
         except Exception:
@@ -103,9 +167,26 @@ class HybridLLMRouter:
             if fresh and not force:
                 return self._health_cache  # type: ignore[return-value]
 
+        # buzzcode usually starts *after* Dexter, so re-ask the ledger on every
+        # real health check rather than holding whatever was true at import.
+        if not (os.getenv("LLAMACPP_URL") or "").strip():
+            self.llamacpp_url = engine_url()
         llamacpp_online = self._check_endpoint(f"{self.llamacpp_url}/models")
         lm_online = self._check_endpoint(f"{self.lm_studio_url}/models")
         ollama_online = self._check_endpoint(f"{self.ollama_url}/models")
+        # v11.1: the preferred backend is a program, and nobody was starting it.
+        # If it is down, start it (llm_boot: detached, rate-limited, off with
+        # DEXTER_AUTOSTART_LLM=0) and probe once more. This is the one place
+        # every path goes through - the request chain, the tier pickers,
+        # preflight, /llm/models - so it is the one place to do it.
+        wanted = self.default_provider
+        down = (wanted == "ollama" and not ollama_online) or (wanted == "lmstudio" and not lm_online)
+        if down and self._revive(wanted):
+            if wanted == "ollama":
+                ollama_online = self._check_endpoint(f"{self.ollama_url}/models")
+            else:
+                lm_online = self._check_endpoint(f"{self.lm_studio_url}/models")
+
         result = {
             "llamacpp": {"online": llamacpp_online, "url": self.llamacpp_url},
             "lmStudio": {"online": lm_online, "url": self.lm_studio_url},
@@ -119,12 +200,30 @@ class HybridLLMRouter:
             self._health_checked_at = time.time()
         return result
 
+    def _revive(self, provider: str) -> bool:
+        """Start the preferred local backend when it is not answering.
+
+        True when it answers now (started here, or came up meanwhile). Never
+        raises: a backend that will not start is a health result, not a crash.
+        """
+        try:
+            import llm_boot
+
+            outcome = llm_boot.ensure_provider(provider)
+            if not outcome.get("online") and not outcome.get("reason", "").startswith("tried less than"):
+                print(f"[HybridLLM] {provider} is down and could not be started: {outcome.get('reason')}")
+            return bool(outcome.get("online"))
+        except Exception as exc:
+            print(f"[HybridLLM] autostart of {provider} failed: {exc}")
+            return False
+
     def invalidate_health(self) -> None:
         with self._lock:
             self._health_cache = None
             # The shared llama-server swaps models when codeBuzz does; do not
             # keep naming a model that is no longer loaded.
             self._model_cache.pop(self.llamacpp_url, None)
+            self._served_cache.clear()
 
     def _list_models_at(self, base_url: str) -> List[str]:
         """All model ids a local OpenAI-compatible server currently exposes."""
@@ -261,6 +360,95 @@ class HybridLLMRouter:
         if self.default_provider != "auto" and self.default_provider in chain:
             chain = [self.default_provider] + [p for p in chain if p != self.default_provider]
         return chain or ["lmstudio"]
+
+    def provider_for_model(self, model: str, preferred: str = "") -> Optional[str]:
+        """
+        The online local backend that actually serves `model` (an Ollama tag
+        like "qwen2.5:3b" or an LM Studio id). Used to run the small fast model
+        on its own server even while the shared llama-server holds the big one.
+        Returns None when no online backend lists it.
+        """
+        if not model:
+            return None
+        health = self.get_available_providers()
+        order = ["ollama", "lmstudio"]
+        if preferred in order:
+            order = [preferred] + [p for p in order if p != preferred]
+        elif self.default_provider in order:
+            order = [self.default_provider] + [p for p in order if p != self.default_provider]
+        for prov in order:
+            if not self._is_available(prov, health):
+                continue
+            key = f"{prov}:{model}"
+            now = time.time()
+            with self._lock:
+                cached = self._served_cache.get(key)
+            if cached and now - cached[1] < HEALTH_TTL_SECONDS:
+                if cached[0]:
+                    return prov
+                continue
+            ids = self._list_models_at(self._base_url_for(prov))
+            served = any(m == model or m.split(":")[0] == model for m in ids)
+            with self._lock:
+                self._served_cache[key] = (served, now)
+            if served:
+                return prov
+        return None
+
+    # ───────────────────────── model residency (Ollama) ─────────────────────────
+    #
+    # Ollama keeps a model in memory for 5 minutes after each request, whatever
+    # the request was. The instant-reply tier wants the small model resident
+    # for hours (a cold load is what makes the first answer slow), and the big
+    # model gone soon after its task so the GPU is free again. Both are one
+    # native /api/generate call with `keep_alive` and no prompt: it (re)sets
+    # the expiry without generating anything.
+
+    def _ollama_api(self) -> str:
+        return self.ollama_url[:-3] if self.ollama_url.endswith("/v1") else self.ollama_url
+
+    def set_keep_alive(self, provider: str, model: str, keep_alive: str) -> bool:
+        if provider != "ollama" or not model:
+            return False
+        try:
+            res = self.session.post(
+                f"{self._ollama_api()}/api/generate",
+                json={"model": model, "keep_alive": keep_alive, "stream": False},
+                timeout=120,
+            )
+            return res.status_code == 200
+        except Exception as exc:
+            print(f"[HybridLLM] keep_alive({model}={keep_alive}) failed: {exc}")
+            return False
+
+    def warm_model(self, provider: str, model: str, keep_alive: str = "2h") -> bool:
+        """Load `model` now (if needed) and keep it resident for `keep_alive`."""
+        return self.set_keep_alive(provider, model, keep_alive)
+
+    def release_model(self, provider: str, model: str, after: str = "0") -> bool:
+        """Unload `model` now ("0") or once idle for `after` (e.g. "3m")."""
+        return self.set_keep_alive(provider, model, after)
+
+    def loaded_models(self) -> List[Dict[str, Any]]:
+        """What Ollama currently holds in memory (name, size, VRAM share, expiry)."""
+        try:
+            res = self.session.get(f"{self._ollama_api()}/api/ps", timeout=_PROBE_TIMEOUT)
+            if res.status_code == 200:
+                out = []
+                for m in res.json().get("models") or []:
+                    size = int(m.get("size") or 0)
+                    vram = int(m.get("size_vram") or 0)
+                    out.append({
+                        "name": m.get("name") or m.get("model"),
+                        "sizeMb": size // (1024 * 1024),
+                        "vramMb": vram // (1024 * 1024),
+                        "onGpu": size > 0 and vram >= size,
+                        "expiresAt": m.get("expires_at"),
+                    })
+                return out
+        except Exception:
+            pass
+        return []
 
     # ───────────────────────── chat ─────────────────────────
 
@@ -450,6 +638,10 @@ class HybridLLMRouter:
         # Tool-call fragments arrive keyed by index; the name lands once, the
         # arguments accumulate as string fragments.
         calls_acc: Dict[int, Dict[str, str]] = {}
+        # Servers send SSE as UTF-8 without a charset; requests would otherwise
+        # guess ISO-8859-1 for text/event-stream and turn every curly quote or
+        # accent into mojibake on its way to the UI and the voice.
+        res.encoding = "utf-8"
         try:
             with res:
                 for line in res.iter_lines(decode_unicode=True):

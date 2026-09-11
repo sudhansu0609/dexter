@@ -67,6 +67,35 @@ class ToolSpec:
     confirm: bool
     category: str
     fn: Callable[..., Any]
+    #: Confirmation that depends on the *state*, not the tool. "Stop BuzzFin"
+    #: should just happen; "stop VrDeep" while it is three hours into a render
+    #: must be asked about. A flat `confirm=True` cannot tell those apart, and a
+    #: tool that asks every time is a tool people learn to say yes to blindly.
+    confirm_if: Optional[Callable[[Dict[str, Any]], bool]] = None
+
+    def needs_confirmation(self, args: Dict[str, Any]) -> bool:
+        if self.confirm:
+            return True
+        if not self.confirm_if:
+            return False
+        try:
+            return bool(self.confirm_if(args or {}))
+        except Exception as exc:
+            # A broken predicate must fail *safe*: ask.
+            print(f"[ToolRegistry] confirm_if for '{self.name}' raised: {exc}")
+            return True
+
+    def confirmation_prompt(self, args: Dict[str, Any]) -> str:
+        """Let a tool word its own question ("VrDeep has 3 jobs queued — stop it?")."""
+        builder = getattr(self.fn, "_dexter_confirm_prompt", None)
+        if builder:
+            try:
+                text = builder(args or {})
+                if text:
+                    return str(text)
+            except Exception:
+                pass
+        return ""
 
     @property
     def required(self) -> List[str]:
@@ -120,6 +149,7 @@ def tool(
     examples: Optional[List[str]] = None,
     confirm: bool = False,
     category: str = "general",
+    confirm_if: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ) -> Callable:
     """
     Register a function as a Dexter tool.
@@ -140,6 +170,7 @@ def tool(
             confirm=confirm,
             category=category,
             fn=fn,
+            confirm_if=confirm_if,
         )
         for pname, pmeta in spec.params.items():
             ptype = pmeta.get("type", "string")
