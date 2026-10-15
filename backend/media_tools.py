@@ -145,6 +145,12 @@ def _control(action: str) -> bool:
     category="media",
 )
 def media_control(action: str) -> ToolResult:
+    # MastGaane plays through ffplay, which the media keys never reach (tools_music).
+    import tools_music
+
+    handed = tools_music.take_over(action)
+    if handed is not None:
+        return handed
     if not _control(action):
         return ToolResult.fail("Nothing seems to be playing right now.")
 
@@ -172,6 +178,11 @@ def media_control(action: str) -> ToolResult:
     category="media",
 )
 def get_now_playing() -> ToolResult:
+    import tools_music
+
+    mine = tools_music.now_playing()
+    if mine is not None:
+        return mine
     if not _HAS_WINSDK:
         return ToolResult.fail(
             "Reading the current track needs winsdk. Run: pip install winsdk"

@@ -18,11 +18,13 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import cancellation
+import speaker_id as speaker_mod
 import voice_pipeline
 from stt_engine import Transcript, looks_hallucinated
 from vad import CHUNK_SAMPLES as VAD_CHUNK
 from voice_pipeline import (
     BARGE_CHUNKS,
+    BARGE_VERIFY_CHUNKS,
     END_SILENCE_CHUNKS,
     NO_SPEECH_CHUNKS,
     VoiceSession,
@@ -179,6 +181,41 @@ def test_wake_then_utterance_produces_one_transcript():
     assert stt.calls == 1
 
 
+def test_mic_off_ignores_everything_until_turned_back_on():
+    """"I switched the mic off and Dexter still heard me." Muted, the wake word
+    and the command that follows produce nothing at all; unmuted, it works
+    again. This is the one gate that has to be immune to how many windows are
+    open and which one holds the mic."""
+    stt = FakeStt("open the calendar")
+    vs = make_session(stt=stt)
+
+    vs.set_muted(True)
+    assert vs.muted is True
+    assert vs.feed(wake_block()) == []       # the wake word is not even looked at
+    assert say(vs) == []                      # nor the command after it
+    assert stt.calls == 0                     # STT never ran
+
+    vs.set_muted(False)
+    assert vs.feed(wake_block()) == [{"type": "listening", "reason": "wake"}]
+    transcripts = [e for e in say(vs) if e["type"] == "transcript"]
+    assert len(transcripts) == 1 and transcripts[0]["text"] == "open the calendar"
+
+
+def test_muting_mid_capture_drops_the_half_heard_command():
+    """Muting while a command is being recorded throws the buffer away, so the
+    tail is not transcribed the moment the mic comes back."""
+    stt = FakeStt("secret half sentence")
+    vs = make_session(stt=stt)
+
+    vs.feed(wake_block())          # capture is now open
+    vs.feed(speech(4))             # ...and half a command is in the buffer
+    vs.set_muted(True)
+    vs.set_muted(False)
+    # Falling silent must not flush the pre-mute audio as a transcript.
+    assert [e for e in vs.feed(silence(END_SILENCE_CHUNKS + 2)) if e["type"] == "transcript"] == []
+    assert stt.calls == 0
+
+
 def test_wake_word_alone_is_not_a_message():
     """'Hey Jarvis' then a pause: the tail of the wake word is speech to the
     VAD, and Whisper hears 'Jarvis'. Neither may reach the chat."""
@@ -332,6 +369,24 @@ def test_stop_drops_capture_and_cuts_reply():
         ("never mind", "cancel"),
         ("nevermind.", "cancel"),
         ("forget it", "cancel"),
+        ("Stop. Stop.", "stop"),
+        ("stop stop", "stop"),
+        ("Wait wait", "stop"),
+        ("Hold on, stop", "stop"),
+        ("Dexter stop", "stop"),
+        ("Dexter, stop", "stop"),
+        ("Dexter, please stop", "stop"),
+        ("Dexter wait", "stop"),
+        ("Dexter pause", "stop"),
+        ("Dexter shut up", "stop"),
+        ("Dexter cancel", "cancel"),
+        ("cancel that cancel that", "cancel"),
+        ("stay", "stop"),
+        ("stay!", "stop"),
+        ("shh", "stop"),
+        ("hey stop", "stop"),
+        ("hold it", "stop"),
+        ("hold up", "stop"),
         ("stop the timer", None),
         ("cancel my 3pm meeting", None),
         ("never mind the invoice, open chrome", None),
@@ -340,6 +395,14 @@ def test_stop_drops_capture_and_cuts_reply():
 )
 def test_classify_command(phrase, expected):
     assert classify_command(phrase) == expected
+
+
+def test_is_interrupt_phrase_extended():
+    assert voice_pipeline.is_interrupt_phrase("stay") == "stop"
+    assert voice_pipeline.is_interrupt_phrase("shh") == "stop"
+    assert voice_pipeline.is_interrupt_phrase("Dexter please stop talking right now") == "stop"
+    assert voice_pipeline.is_interrupt_phrase("Dexter hey please stop talking for a second") == "stop"
+    assert voice_pipeline.is_interrupt_phrase("Dexter please cancel that right now") == "cancel"
 
 
 def test_stop_phrase_is_a_command_not_a_message():
@@ -366,15 +429,53 @@ def test_cancel_phrase_closes_followup_window():
 # ───────────────────────── barge-in / echo ─────────────────────────
 
 
-def test_barge_in_during_speech_interrupts_and_cancels():
+class _FakeJudge:
+    """Stand-in speaker_id for barge tests: enabled, with a fixed verdict."""
+
+    def __init__(self, owner, reason="", enabled=True):
+        self._owner, self._reason, self._enabled = owner, reason, enabled
+
+    def enabled(self):
+        return self._enabled
+
+    def judge(self, audio):
+        return speaker_mod.Verdict(
+            self._owner, 0.9 if self._owner else 0.1, 0.2, self._reason
+        )
+
+    def summary(self):
+        return {}
+
+
+def test_owner_barge_in_interrupts_and_cancels(monkeypatch):
+    # v14.1: barge is owner-gated. The owner talking over Dexter, once ~1 s is
+    # buffered and ECAPA confirms it is them, stops Dexter and becomes a command.
     cancellation.clear("barge")
+    monkeypatch.setattr(voice_pipeline, "speaker_id", _FakeJudge(owner=True))
     vs = make_session(session="barge")
     vs.set_speaking(True)
 
-    events = vs.feed(speech(BARGE_CHUNKS + 2))
+    # BARGE_CHUNKS to start the capture, then BARGE_VERIFY_CHUNKS more before the
+    # speaker check runs (record_chunks only counts once capture has begun).
+    events = vs.feed(speech(BARGE_CHUNKS + BARGE_VERIFY_CHUNKS + 2))
     assert "interrupt" in types(events)
     assert {"type": "listening", "reason": "followup"} in events
     assert cancellation.is_cancelled("barge")
+
+
+def test_barge_in_ignores_non_owner_and_own_echo_over_tts(monkeypatch):
+    # The safety guarantee: speech over Dexter that ECAPA says is NOT the owner
+    # (a stranger, or Dexter's own speaker echo) never stops it - no interrupt,
+    # no cancel, Dexter keeps talking.
+    cancellation.clear("nonowner")
+    monkeypatch.setattr(voice_pipeline, "speaker_id", _FakeJudge(owner=False, reason="not owner"))
+    vs = make_session(session="nonowner")
+    vs.set_speaking(True)
+
+    events = vs.feed(speech(BARGE_CHUNKS + BARGE_VERIFY_CHUNKS + 4))
+    assert "interrupt" not in types(events)
+    assert not cancellation.is_cancelled("nonowner")
+    assert vs.speaking  # Dexter kept talking
 
 
 def test_barge_in_disabled_ignores_own_tts_echo():
@@ -469,8 +570,11 @@ def test_capabilities_shape():
 
 
 def test_cancelled_response_skips_provider_fallback(monkeypatch):
-    from hybrid_llm import LLMResponse, llm_router
+    from hybrid_llm import HybridLLMRouter, LLMResponse, llm_router
 
+    # This one is *about* `chat()`, so it takes the real one back off the
+    # conftest guard that otherwise keeps every test away from a live model.
+    monkeypatch.setattr(llm_router, "chat", HybridLLMRouter.chat.__get__(llm_router))
     monkeypatch.setattr(llm_router, "_provider_chain", lambda *a, **k: ["lmstudio", "ollama"])
     calls = {"n": 0}
 
@@ -713,3 +817,160 @@ def test_capture_does_not_double_the_block_it_started_in(name_mode):
 def test_name_after_a_stumble(text):
     assert voice_pipeline.starts_with_name(text, "dexter")
     assert strip_wake_word(text) in ("remind me", "what's up", "play music")
+
+
+# ───────── interrupting a reply mid-sentence (v13.8) ─────────
+#
+# "I am not able to interrupt it mid-sentence, shall be able to do that."
+#
+# The machinery was all there - "stop" has cut a reply since v10 - but the microphone was
+# ignored *entirely* while Dexter spoke, so the word never reached it. Full barge-in was
+# the only alternative and it is off by default for a good reason: it fires on any sound,
+# including Dexter's own voice coming back through the speakers, which is the echo loop
+# that cost an evening in v10.
+#
+# So the mic now stays open while Dexter talks, and what it hears may be **one thing
+# only**: a control phrase. Anything else from that window is dropped unheard. The echo
+# cannot become an instruction by construction rather than by a threshold.
+
+
+def test_saying_stop_while_dexter_talks_cuts_the_reply():
+    cancellation.clear("cut")
+    vs = make_session(session="cut", stt=FakeStt(text="stop"), barge_in=False)
+    vs.set_speaking(True)
+
+    events = vs.feed(speech(BARGE_CHUNKS + 4))
+    events += vs.feed(silence(END_SILENCE_CHUNKS + 2))
+
+    assert "interrupt" in types(events), "the reply has to actually stop"
+    assert {"type": "command", "name": "stop", "text": "stop"} in events
+    assert cancellation.is_cancelled("cut")
+
+
+def test_quiet_and_never_mind_work_the_same_way():
+    for word, name in (
+        ("be quiet", "stop"),
+        ("never mind", "cancel"),
+        ("wait", "stop"),
+        ("hold on", "stop"),
+        ("pause", "stop"),
+        ("hang on", "stop"),
+        ("Stop. Stop.", "stop"),
+        ("stop stop", "stop"),
+        ("Wait wait", "stop"),
+        ("Hold on, stop", "stop"),
+        ("Dexter stop", "stop"),
+        ("Dexter, please stop", "stop"),
+    ):
+        cancellation.clear(word)
+        vs = make_session(session=word, stt=FakeStt(text=word), barge_in=False)
+        vs.set_speaking(True)
+        events = vs.feed(speech(BARGE_CHUNKS + 4)) + vs.feed(silence(END_SILENCE_CHUNKS + 2))
+        assert any(e["type"] == "command" and e["name"] == name for e in events), word
+        if name == "stop":
+            assert "interrupt" in types(events), word
+            assert cancellation.is_cancelled(word)
+
+
+def test_interrupt_bypasses_speaker_id_rejection(monkeypatch):
+    """When Dexter is speaking, mixed speaker audio must not be dropped before
+    Whisper transcribes 'stop'."""
+    monkeypatch.setattr(voice_pipeline.speaker_id, "enabled", lambda: True)
+    class RejectVerdict:
+        reject = True
+        grey = False
+        score = 0.1
+        dexter_score = 0.9
+        reason = "dexter"
+    monkeypatch.setattr(voice_pipeline.speaker_id, "judge", lambda audio: RejectVerdict())
+
+    cancellation.clear("spk_test")
+    vs = make_session(session="spk_test", stt=FakeStt(text="stop"), barge_in=False)
+    vs.set_speaking(True)
+    events = vs.feed(speech(BARGE_CHUNKS + 4)) + vs.feed(silence(END_SILENCE_CHUNKS + 2))
+    assert "interrupt" in types(events)
+    assert cancellation.is_cancelled("spk_test")
+
+
+def test_dexters_own_voice_mid_sentence_is_dropped_unheard():
+    """The safety property, and the reason this is not plain barge-in: what comes back
+    through the microphone while Dexter speaks is Dexter's own reply, and those words are
+    not a control phrase - so they are discarded rather than answered."""
+    cancellation.clear("ownvoice")
+    vs = make_session(session="ownvoice",
+                      stt=FakeStt(text="the weather today is mostly cloudy"),
+                      barge_in=False)
+    vs.set_speaking(True)
+
+    events = vs.feed(speech(BARGE_CHUNKS + 10))
+    events += vs.feed(silence(END_SILENCE_CHUNKS + 2))
+
+    assert events == [], f"nothing may come out of that window: {events}"
+    assert not cancellation.is_cancelled("ownvoice")
+
+
+def test_a_command_mid_sentence_is_not_obeyed_either():
+    """Even a real instruction from the owner is dropped while Dexter is mid-reply: it
+    cannot be told apart from the echo without a speaker check, and obeying the echo is
+    the failure that matters. Say "stop" first, then the instruction."""
+    cancellation.clear("midcmd")
+    vs = make_session(session="midcmd", stt=FakeStt(text="open chrome for me"),
+                      barge_in=False)
+    vs.set_speaking(True)
+    events = vs.feed(speech(BARGE_CHUNKS + 6)) + vs.feed(silence(END_SILENCE_CHUNKS + 2))
+    assert "transcript" not in types(events)
+
+
+def test_with_interrupt_words_off_the_mic_is_ignored_completely(monkeypatch):
+    """The old half-duplex behaviour is still one setting away."""
+    monkeypatch.setattr(voice_pipeline, "INTERRUPT_WORDS_ENABLED", False)
+    cancellation.clear("deaf")
+    vs = make_session(session="deaf", stt=FakeStt(text="stop"), barge_in=False)
+    vs.set_speaking(True)
+    events = vs.feed(speech(BARGE_CHUNKS + 6)) + vs.feed(silence(END_SILENCE_CHUNKS + 2))
+    assert events == []
+    assert not cancellation.is_cancelled("deaf")
+
+
+def test_grey_by_name_is_soft_accepted_by_default(monkeypatch):
+    """Default (HARD_ONLY_ME off): a borderline print that says the name is taken
+    as the owner speaking off-profile and answered."""
+    monkeypatch.setattr(voice_pipeline, "HARD_ONLY_ME", False)
+    accepted, _ = voice_pipeline.accept_utterance(
+        "close vs code", "name", grey=True, by_name=True)
+    assert accepted
+
+
+def test_hard_only_me_rejects_a_stranger_who_says_the_name(monkeypatch):
+    """The fix: with HARD_ONLY_ME on, the name and the wake word no longer rescue
+    a grey (not-owner) score - a stranger saying 'Dexter' is ignored."""
+    monkeypatch.setattr(voice_pipeline, "HARD_ONLY_ME", True)
+    for reason in ("name", "wake"):
+        accepted, why = voice_pipeline.accept_utterance(
+            "close vs code", reason, grey=True, by_name=True)
+        assert not accepted and why == "not owner", (reason, accepted, why)
+
+
+def test_hard_only_me_still_trusts_the_mic_button_and_followups(monkeypatch):
+    """Only-me must not lock the owner out: pressing the mic (reason 'manual') is
+    the owner by definition, and a grey score can still ride a real follow-up the
+    owner already started."""
+    monkeypatch.setattr(voice_pipeline, "HARD_ONLY_ME", True)
+    assert voice_pipeline.accept_utterance("do it", "manual", grey=True)[0]
+    followup, _ = voice_pipeline.accept_utterance(
+        "open the project folder please", "followup", grey=True, confidence=0.9)
+    assert followup
+
+
+def test_barge_is_skipped_without_enrolment(monkeypatch):
+    """Owner-gated barge needs an enrolled voice to tell the owner from the echo.
+    With no enrolment (speaker_id disabled), talking over Dexter does NOT cut it
+    off - it falls back to the safe stop-word path - so an un-enrolled setup can
+    never self-interrupt on its own speaker echo."""
+    cancellation.clear("noenrol")
+    monkeypatch.setattr(voice_pipeline, "speaker_id", _FakeJudge(owner=True, enabled=False))
+    vs = make_session(session="noenrol", barge_in=True)
+    vs.set_speaking(True)
+    events = vs.feed(speech(BARGE_VERIFY_CHUNKS + 4))
+    assert "interrupt" not in types(events)
+    assert not cancellation.is_cancelled("noenrol")

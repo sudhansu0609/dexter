@@ -53,6 +53,21 @@ FEMALE_PARTNERS: Dict[str, str] = {
 
 DEFAULT_EMOTION = "neutral"
 
+# Edge-tts prosody per emotion: (rate, pitch, volume). edge_tts.Communicate only
+# accepts these three knobs (no SSML/express-as), so emotion here is carried by
+# how fast, how high and how loud the same neural voice speaks - one person in
+# different moods, same as the Kokoro blends above.
+EDGE_PROSODY: Dict[str, Tuple[str, str, str]] = {
+    "neutral":    ("+0%",  "+0Hz", "+0%"),
+    "upbeat":     ("+12%", "+8Hz", "+4%"),
+    "urgent":     ("+18%", "+6Hz", "+8%"),
+    "calm":       ("-8%",  "-4Hz", "+0%"),
+    "apologetic": ("-10%", "-6Hz", "-3%"),
+    "warm":       ("-2%",  "+3Hz", "+2%"),
+    "reading":    ("-5%",  "+0Hz", "+0%"),
+    "thinking":   ("-12%", "-4Hz", "+0%"),
+}
+
 
 @dataclass
 class Delivery:
@@ -62,6 +77,10 @@ class Delivery:
     blend_with: Optional[str] = None
     blend_weight: float = 0.0
     speed: float = 1.0
+    rate: str = "+0%"
+    pitch: str = "+0Hz"
+    volume: str = "+0%"
+    edge_voice: Optional[str] = None
     meta: Dict[str, str] = field(default_factory=dict)
 
     @property
@@ -376,6 +395,7 @@ def build_delivery(
         chosen = DEFAULT_EMOTION
 
     partner, weight, speed = EMOTION_PROFILES[chosen]
+    rate, pitch, volume = EDGE_PROSODY.get(chosen, EDGE_PROSODY[DEFAULT_EMOTION])
     spoken = shape_pacing(normalize_for_speech(stripped), chosen)
 
     return Delivery(
@@ -385,5 +405,8 @@ def build_delivery(
         blend_with=partner,
         blend_weight=weight,
         speed=speed,
+        rate=rate,
+        pitch=pitch,
+        volume=volume,
         meta={"source": "cue" if cue_emotion else ("explicit" if emotion else "inferred")},
     )

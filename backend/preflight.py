@@ -269,6 +269,22 @@ def check_llm(report: Report) -> None:
         if available and model not in available:
             report.add(WARN, "Configured model", f"{model} is not in the provider's model list",
                        f"ollama pull {model}, or change OLLAMA_MODEL in .env")
+        # v13, P2.1: the tiers name their own models, and a tier whose model was
+        # never pulled fails at request time with nothing useful in the UI — the
+        # fast tier simply goes quiet and every turn crawls on the big model.
+        if available:
+            import router
+
+            for label, tag, env in (
+                ("Fast model", router.FAST_MODEL, "DEXTER_FAST_MODEL"),
+                ("Smart model", router.SMART_MODEL, "DEXTER_SMART_MODEL"),
+                ("Smart model (fallback)", router.SMART_MODEL_FALLBACK, "DEXTER_SMART_MODEL_FALLBACK"),
+            ):
+                tag = (tag or "").strip()
+                if not tag or tag in available:
+                    continue
+                report.add(WARN, label, f"{tag} is not pulled on any local server",
+                           f"ollama pull {tag}, or set {env} in .env / Settings → Model")
     except Exception:
         pass
 
@@ -363,7 +379,36 @@ def check_voice(report: Report) -> None:
                    "Voice input may not work in the desktop shell")
 
 
-SLOW_CHECKS = [check_llm, check_runtime, check_system_integrations, check_voice]
+def check_hand_mouse(report: Report) -> None:
+    """The hand mouse (v13.1) is entirely optional, and it fails in two distinct
+    ways - a missing package and a missing model - which need different answers."""
+    try:
+        import hand_tracker
+
+        packages = hand_tracker.packages()
+    except Exception as exc:
+        report.add(WARN, "Hand mouse", f"could not check: {exc}")
+        return
+
+    if packages.get("mediapipe"):
+        report.add(OK, "Hand mouse", "mediapipe present (the faster pipeline)")
+        return
+    missing = [name for name in ("cv2", "onnxruntime") if not packages.get(name)]
+    if missing:
+        names = {"cv2": "opencv-python", "onnxruntime": "onnxruntime"}
+        report.add(WARN, "Hand mouse", f"not installed: {', '.join(missing)} - the webcam "
+                                       "cannot drive the pointer",
+                   f"pip install {' '.join(names[m] for m in missing)}")
+        return
+    ready, why = hand_tracker.available()
+    if ready:
+        report.add(OK, "Hand mouse", f"ready (models in {hand_tracker.MODELS_DIR})")
+    else:
+        report.add(WARN, "Hand mouse", why, 'Say "set up hand tracking" (8 MB, once)')
+
+
+SLOW_CHECKS = [check_llm, check_runtime, check_system_integrations, check_voice,
+               check_hand_mouse]
 
 
 def run_fast_checks(quiet: bool = True) -> Report:

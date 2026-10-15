@@ -1,6 +1,53 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+// The voice hook talks to a real backend over a WebSocket, which jsdom cannot
+// provide; mocking it lets a test drive `heard` directly instead of racing a
+// connection that will never come up.
+const { useVoice, mockVoice } = vi.hoisted(() => {
+  const mockVoice: any = {
+    state: 'idle',
+    hint: '',
+    level: 0,
+    heard: '',
+    muted: false,
+    silent: false,
+    active: true,
+    caps: null,
+    wakeWord: 'Dexter',
+    wakeMode: 'name',
+    unavailableReason: '',
+    micLabel: '',
+    micSilent: false,
+    mics: [],
+    micId: '',
+    enroll: { active: false, seconds: 0, target: 10 },
+    dictation: null,
+    mutedRef: { current: false },
+    lastSpokenTextRef: { current: '' },
+    setThinking: () => {},
+    toggleMuted: () => {},
+    setMuted: () => {},
+    toggleSilent: () => {},
+    setSilent: () => {},
+    talkNow: () => {},
+    stopSpeaking: () => {},
+    enqueueAudio: () => {},
+    speakText: async () => {},
+    playBlob: () => {},
+    replyLanded: () => {},
+    setWakeMode: () => {},
+    startEnroll: () => {},
+    cancelEnroll: () => {},
+    selectMic: async () => {},
+    refreshMics: async () => {},
+    claim: () => {},
+    canSpeak: () => false,
+  };
+  return { useVoice: () => mockVoice, mockVoice };
+});
+vi.mock('../hooks/useVoice', () => ({ useVoice }));
+
 // The pop-up (v11.1): the microphone and the model can be changed without
 // opening the full window. Same isolation as App.test.tsx - every network call
 // goes through src/api.ts, so one mock covers the UI.
@@ -15,6 +62,7 @@ vi.mock('../api', () => ({
   generateTts: vi.fn(async () => new Blob()),
   audioUrl: vi.fn((u: string) => u),
   voiceInterrupt: vi.fn(async () => ({ ok: true })),
+  cancelChat: vi.fn(async () => ({ ok: true })),
   getModels: vi.fn(async () => ({
     preferred: 'ollama',
     providers: {
@@ -23,6 +71,13 @@ vi.mock('../api', () => ({
     },
   })),
   runPhrase: vi.fn(async () => ({ reply: '', action: '' })),
+  getTokenUsage: vi.fn(async () => ({
+    since: '', sessionSince: '',
+    allTime: { calls: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    session: { calls: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    providers: [], models: [], sessionProviders: [], sessionModels: [],
+  })),
+  resetTokenUsage: vi.fn(async () => ({})),
 }));
 
 import Popup from '../Popup';
@@ -70,5 +125,34 @@ describe('Popup quick settings', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Quick settings' }));
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(screen.queryByRole('dialog', { name: 'Quick settings' })).toBeNull();
+  });
+
+  it('shows Stop button while generating and cancels on click or Esc', async () => {
+    const { chatStream, cancelChat } = await import('../api');
+    let resolveStream: any;
+    (chatStream as any).mockImplementationOnce(
+      () => new Promise((resolve) => { resolveStream = resolve; }),
+    );
+
+    render(<Popup />);
+    const input = screen.getByRole('textbox');
+    fireEvent.change(input, { target: { value: 'Write a long essay' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    // While busy, the Stop button is visible
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Stop (Esc)' })).toBeTruthy();
+    });
+
+    // Clicking Stop cancels the turn
+    fireEvent.click(screen.getByRole('button', { name: 'Stop (Esc)' }));
+    expect(cancelChat).toHaveBeenCalled();
+
+    // After cancellation, Send button returns
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Send' })).toBeTruthy();
+    });
+
+    if (resolveStream) resolveStream(new Response(''));
   });
 });

@@ -247,6 +247,65 @@ def test_schedule_bad_time_rejected(queue):
     assert not tasks.schedule_goal("goal", "whenever you feel like it")["ok"]
 
 
+def test_scheduled_command_action_dispatches(queue, monkeypatch):
+    """A scheduled command fires the shell, not the goal planner."""
+    import subprocess
+
+    import notify
+
+    seen = {}
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **k: seen.setdefault("argv", argv))
+    monkeypatch.setattr(notify, "toast_async", lambda *a, **k: None)
+
+    res = tasks.create_scheduled({"type": "command", "command": "echo hi", "shell": "cmd"}, "tomorrow at 9am")
+    assert res["ok"]
+    entry = tasks.list_scheduled()[0]
+    assert entry["action"]["type"] == "command"
+
+    tasks._run_action(entry)
+    assert "argv" in seen and "echo hi" in " ".join(seen["argv"])
+
+
+def test_scheduled_app_action_dispatches(queue, monkeypatch):
+    import notify
+    import tools_core
+
+    monkeypatch.setattr(notify, "toast_async", lambda *a, **k: None)
+    seen = {}
+
+    def fake_launch(cls, name):
+        seen["app"] = name
+        return {"success": True}
+
+    monkeypatch.setattr(tools_core.AppLauncherTool, "launch_app", classmethod(fake_launch))
+
+    res = tasks.create_scheduled({"type": "app", "app": "Notepad"}, "tomorrow at 9am")
+    assert res["ok"]
+    tasks._run_action(tasks.list_scheduled()[0])
+    assert seen.get("app") == "Notepad"
+
+
+def test_run_now_fires_without_removing(queue, monkeypatch):
+    import notify
+
+    monkeypatch.setattr(notify, "toast_async", lambda *a, **k: None)
+    res = tasks.create_scheduled({"type": "goal", "goal": "brief me"}, "every friday at 5pm")
+
+    fired = {}
+    monkeypatch.setattr(tasks.task_queue, "submit", lambda goal, **k: fired.setdefault("goal", goal))
+
+    assert tasks.run_now(res["id"]) is True
+    assert fired["goal"] == "brief me"
+    assert len(tasks.list_scheduled()) == 1, "run-now must not retire a recurring entry"
+
+
+def test_cancel_scheduled_by_id(queue):
+    res = tasks.create_scheduled({"type": "app", "app": "Notepad"}, "every friday at 5pm")
+    assert tasks.cancel_scheduled_by_id(res["id"]) is True
+    assert tasks.list_scheduled() == []
+    assert tasks.cancel_scheduled_by_id(res["id"]) is False
+
+
 # ───────────────────────── proactive ─────────────────────────
 
 

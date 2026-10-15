@@ -19,6 +19,7 @@ The tool names, arguments and example phrasings are unchanged, so the router and
 the model do not have to know which mode is in force.
 """
 
+import re
 from typing import Any, Callable, Dict, Optional
 
 import chrome_control
@@ -29,6 +30,27 @@ from tool_registry import ToolResult, tool
 
 def _own() -> bool:
     return chrome_control.own_mode()
+
+
+def _extract_section(text: str, section: str, window: int = 1500) -> str:
+    """The slice of the page around the first mention of a heading/label.
+
+    "read the ingredients section" is a whole-page read plus a find: locate where
+    the section is named and hand back the text from there. Falls back to matching
+    any single word of the request so "the summary" still lands on "Summary".
+    """
+    if not text:
+        return ""
+    low = text.lower()
+    idx = low.find(section.lower())
+    if idx < 0:
+        for word in (w for w in re.split(r"\s+", section.lower()) if len(w) > 2):
+            idx = low.find(word)
+            if idx >= 0:
+                break
+    if idx < 0:
+        return ""
+    return text[idx: idx + max(200, int(window))].strip()
 
 
 def _guard(fn: Callable[[], ToolResult]) -> ToolResult:
@@ -85,9 +107,15 @@ def browser_open(target: str, new_tab: bool = False) -> ToolResult:
     name="browser_read_page",
     description=(
         "Read the page in the front Chrome tab: its title, URL and text. "
-        "Use it to answer questions about what the user is looking at."
+        "Use it to answer questions about what the user is looking at. Give 'section' "
+        "to read just the part around a heading or label the user names."
     ),
-    params={"max_chars": {"type": "integer", "description": "How much text to read (default 6000)", "required": False}},
+    params={
+        "max_chars": {"type": "integer", "description": "How much text to read (default 6000)", "required": False},
+        "section": {"type": "string",
+                    "description": "A heading/label to read around, e.g. 'ingredients', 'summary', 'reviews'",
+                    "required": False},
+    },
     examples=[
         "read this page",
         "what does this page say",
@@ -95,27 +123,41 @@ def browser_open(target: str, new_tab: bool = False) -> ToolResult:
         "summarize the page that's open",
         "what's on the screen in the browser",
         "read the article",
+        "read the ingredients section",
+        "what does the summary section say",
     ],
     category="browser",
 )
-def browser_read_page(max_chars: int = 6000) -> ToolResult:
+def browser_read_page(max_chars: int = 6000, section: Optional[str] = None) -> ToolResult:
     def _do():
         limit = int(max_chars or 6000)
-        if _own():
-            info = chrome_control.read_active_tab(limit)
-            preview = (info.get("text") or "")[:600].replace("\n", " ")
-            title = info.get("title") or info.get("url") or "this tab"
-            if not preview:
+        info = chrome_control.read_active_tab(limit) if _own() else browser.read(max_chars=limit)
+        text = info.get("text") or ""
+        title = info.get("title") or info.get("url") or "this tab"
+
+        if section and section.strip():
+            excerpt = _extract_section(text, section.strip())
+            if not excerpt:
                 return ToolResult(
-                    ok=True,
-                    summary=f"You're on {title} ({info.get('url') or 'no URL read'}). "
-                            "I couldn't get any text out of the page.",
-                    data=info,
+                    ok=False,
+                    summary=f"I couldn't find a '{section}' section on {title}.",
+                    data={**info, "section": section},
                 )
-            return ToolResult(ok=True, summary=f"{title}: {preview}", data=info)
-        info = browser.read(max_chars=limit)
-        preview = info.get("text", "")[:600].replace("\n", " ")
-        return ToolResult(ok=True, summary=f"{info.get('title')}: {preview}", data=info)
+            return ToolResult(
+                ok=True,
+                summary=f"{title} — '{section}': {excerpt[:700]}" + ("…" if len(excerpt) > 700 else ""),
+                data={**info, "section": section, "excerpt": excerpt},
+            )
+
+        preview = text[:600].replace("\n", " ")
+        if not preview:
+            return ToolResult(
+                ok=True,
+                summary=f"You're on {title} ({info.get('url') or 'no URL read'}). "
+                        "I couldn't get any text out of the page.",
+                data=info,
+            )
+        return ToolResult(ok=True, summary=f"{title}: {preview}", data=info)
 
     return _guard(_do)
 
@@ -136,6 +178,14 @@ def browser_read_page(max_chars: int = 6000) -> ToolResult:
 )
 def browser_click(target: str) -> ToolResult:
     def _do():
+        try:
+            import browser_cdp
+            if browser_cdp.active_mode():
+                info = browser_cdp.session.click_text(target)
+                return ToolResult(ok=True, summary=f"Clicked '{info['clicked']}'. Now on {info.get('title') or info.get('url')}.", data=info)
+        except Exception:
+            pass
+
         if _own():
             info = chrome_control.click(target)
             return ToolResult(ok=True, summary=f"Clicked '{info['clicked']}'{_where(info)}.", data=info)
@@ -167,6 +217,16 @@ def browser_click(target: str) -> ToolResult:
 )
 def browser_type(text: str, into: Optional[str] = None, submit: bool = False) -> ToolResult:
     def _do():
+        try:
+            import browser_cdp
+            if browser_cdp.active_mode():
+                info = browser_cdp.session.fill(into or "", text, submit=bool(submit))
+                tail = " and pressed Enter" if submit else ""
+                target = into or "the focused field"
+                return ToolResult(ok=True, summary=f"Typed into {target}{tail}.", data=info)
+        except Exception:
+            pass
+
         if _own():
             # A named field is clicked first (UIA), then typed into; without a
             # name the keystrokes go wherever the page already has focus, which

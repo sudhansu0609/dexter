@@ -1,18 +1,13 @@
 """
-Web search and weather - the assistant's only window onto the world.
+Web search, page fetch and weather - the assistant's window onto the world.
 
-Dexter had 55 tools and not one of them could look anything up. Paired with a
-local model whose knowledge is frozen at training time, that meant every
-question about the actual world ("what's the weather", "who won", "what's the
-latest on X") was answered from memory, confidently, and often wrongly. This is
-the single largest capability gap in the product.
+Search and fetching are delegated to `web_research` (the same privacy-first design
+BuzzcafAI uses): every query is sanitised on-device, sent to a self-hosted SearXNG
+first (default http://localhost:8080), and falls back to Wikipedia and DuckDuckGo.
+See web_research.py and searxng/README.md.
 
-Both providers are keyless on purpose, matching the local-first stance: DuckDuckGo
-for search, wttr.in for weather. Neither needs an account, and both degrade to a
-plain "I couldn't reach it" rather than an exception.
-
-Results are handed back with their sources so the agent can cite them, and the
-spoken summary stays short - reading five search results aloud is unusable.
+Weather stays here: keyless wttr.in, geolocated by IP when no place is given.
+Results carry their sources so the agent can cite them; spoken summaries stay short.
 """
 
 import re
@@ -20,35 +15,16 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+import web_research
 from tool_registry import ToolResult, tool
 
 _TIMEOUT = 12
 _USER_AGENT = "Dexter/2.0 (local assistant)"
 
-try:
-    from ddgs import DDGS
-
-    _HAS_SEARCH = True
-except ImportError:  # pragma: no cover - depends on the install
-    DDGS = None  # type: ignore
-    _HAS_SEARCH = False
-
 
 def _clean(text: str) -> str:
-    """Search snippets arrive with markup and runs of whitespace."""
+    """Weather strings arrive with markup and runs of whitespace."""
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", text or "")).strip()
-
-
-def _search(query: str, limit: int) -> List[Dict[str, str]]:
-    with DDGS() as ddgs:
-        return [
-            {
-                "title": _clean(item.get("title", "")),
-                "snippet": _clean(item.get("body", "")),
-                "url": item.get("href", ""),
-            }
-            for item in ddgs.text(query, max_results=limit)
-        ]
 
 
 @tool(
@@ -56,7 +32,8 @@ def _search(query: str, limit: int) -> List[Dict[str, str]]:
     description=(
         "Search the web for current information the local model cannot know - "
         "news, facts, prices, documentation, anything after its training cutoff. "
-        "Use this instead of guessing."
+        "Private: the query is scrubbed on-device and sent to your self-hosted "
+        "SearXNG first, then Wikipedia/DuckDuckGo. Use this instead of guessing."
     ),
     params={
         "query": {"type": "string", "description": "What to search for"},
@@ -73,46 +50,118 @@ def _search(query: str, limit: int) -> List[Dict[str, str]]:
     category="web",
 )
 def web_search(query: str, count: int = 4) -> ToolResult:
-    query = (query or "").strip()
-    if not query:
+    raw = (query or "").strip()
+    if not raw:
         return ToolResult.fail("What should I search for?")
-    if not _HAS_SEARCH:
-        return ToolResult.fail(
-            "Web search needs the ddgs package. Install it with: pip install ddgs"
-        )
+
+    # Scrub before anything leaves the machine - the privacy guarantee.
+    clean_q = web_research.sanitize_search_query(raw)
+    if not clean_q:
+        return ToolResult.fail("There was nothing safe to search for in that.")
 
     count = max(1, min(int(count or 4), 8))
     try:
-        results = _search(query, count)
+        results = web_research.search_web(clean_q, max_results=count)
     except Exception as exc:
-        return ToolResult.fail(f"I couldn't reach the search service: {exc}")
+        return ToolResult.fail(f"I couldn't reach a search service: {exc}")
 
     if not results:
+        cfg = web_research._config()
+        if cfg["search_provider"] == "searxng":
+            return ToolResult.fail(
+                f"SearXNG didn't answer at {web_research.searxng_url()}. Start it with "
+                "`docker compose up -d` in the searxng/ folder, or set DEXTER_SEARXNG_URL."
+            )
         return ToolResult(
             ok=True,
-            summary=f"Nothing came back for '{query}'.",
-            data={"query": query, "results": []},
+            summary=f"Nothing came back for '{clean_q}'.",
+            data={"query": clean_q, "results": []},
         )
 
-    # Spoken: the top answer only. Reading four results aloud is unusable, and
-    # the rest are in `data` for the UI and for the agent to reason over.
+    # Spoken: the top answer only. The rest are in `data` for the UI and the agent.
     top = results[0]
-    spoken = top["snippet"] or top["title"]
+    spoken = top.get("snippet") or top.get("title") or ""
     if len(spoken) > 320:
         spoken = spoken[:317].rsplit(" ", 1)[0] + "..."
 
-    source = re.sub(r"^www\.", "", (top["url"].split("/")[2] if "//" in top["url"] else ""))
-    summary = f"{spoken}"
+    url = top.get("url", "")
+    source = top.get("source") or re.sub(r"^www\.", "", (url.split("/")[2] if "//" in url else ""))
+    summary = spoken
     if source:
         summary += f" (from {source})"
     if len(results) > 1:
         summary += f" I have {len(results) - 1} more result(s) if you want them."
+    if any(str(r.get("source", "")).lower().startswith("searxng") for r in results):
+        summary += " (private search)"
 
     return ToolResult(
         ok=True,
         summary=summary,
-        data={"query": query, "results": results},
+        data={"query": clean_q, "results": results},
     )
+
+
+@tool(
+    name="web_fetch",
+    description=(
+        "Fetch a public web page and read its clean text (no scripts, cookies or "
+        "tracking). Use to read an article, docs page or a result you found, without "
+        "opening the browser."
+    ),
+    params={
+        "url": {"type": "string", "description": "The http(s) URL to read"},
+        "max_chars": {"type": "integer", "description": "How much text (default 3500)", "required": False},
+    },
+    examples=[
+        "read that article for me",
+        "fetch https://en.wikipedia.org/wiki/Bhangarh_Fort",
+        "open that link and summarize it",
+        "what does this page say: https://example.com/post",
+    ],
+    category="web",
+)
+def web_fetch(url: str, max_chars: int = 3500) -> ToolResult:
+    text = web_research.fetch_page_content(url, max_chars=max(200, int(max_chars or 3500)))
+    if text.startswith(("Error:", "Could not fetch")):
+        return ToolResult.fail(text)
+    preview = text[:600].replace("\n", " ")
+    return ToolResult(
+        ok=True,
+        summary=f"{preview}" + ("…" if len(text) > 600 else ""),
+        data={"url": url, "text": text, "length": len(text)},
+    )
+
+
+@tool(
+    name="search_status",
+    description=(
+        "Check whether private web search (self-hosted SearXNG) is running, and which "
+        "provider Dexter will use. Use for 'is private search on', 'test searxng'."
+    ),
+    params={},
+    examples=[
+        "is private search on",
+        "test searxng",
+        "is my private search working",
+        "check the search provider",
+    ],
+    category="web",
+)
+def search_status() -> ToolResult:
+    cfg = web_research._config()
+    state = web_research.searxng_status()
+    provider = cfg["search_provider"]
+    if state["ok"]:
+        summary = (f"Private search is on: SearXNG answered at {state['url']} "
+                   f"(provider mode: {provider}).")
+    else:
+        summary = (f"SearXNG isn't reachable at {state['url']} ({state['detail']}). "
+                   f"Provider mode is '{provider}'; "
+                   + ("searches will fall back to Wikipedia/DuckDuckGo. "
+                      if provider == "auto" else "")
+                   + "Start it with `docker compose up -d` in the searxng/ folder.")
+    return ToolResult(ok=True, summary=summary,
+                      data={"provider": provider, "searxng": state})
 
 
 @tool(

@@ -338,11 +338,110 @@ def _save_scheduled(items: List[Dict[str, Any]]) -> None:
     save_json(SCHEDULED_FILE, items)
 
 
+def _entry_action(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """The action for an entry, defaulting a legacy bare-goal entry to a goal."""
+    action = entry.get("action")
+    if isinstance(action, dict) and action.get("type"):
+        return action
+    return {"type": "goal", "goal": entry.get("goal", "")}
+
+
+def action_summary(action: Dict[str, Any]) -> str:
+    """A short human label for an action - used by the UI list and by voice."""
+    kind = (action or {}).get("type", "goal")
+    if kind == "goal":
+        return action.get("goal", "").strip() or "a task"
+    if kind == "command":
+        return f"run: {action.get('command', '').strip()[:80]}"
+    if kind == "app":
+        return f"open {action.get('app', '').strip()}"
+    if kind == "workflow":
+        return f"run workflow {action.get('projectId', '').strip()}"
+    if kind == "code_task":
+        proj = action.get("project")
+        return f"code: {action.get('task', '').strip()[:70]}" + (f" ({proj})" if proj else "")
+    return kind
+
+
+def _run_action(entry: Dict[str, Any]) -> None:
+    """Dispatch a fired scheduled entry to the right subsystem.
+
+    Every branch reuses an existing capability rather than reimplementing it, and
+    the whole thing is best-effort: a failing action must never take down the
+    scheduler thread. A banner goes out either way so a scheduled action is never
+    silent.
+    """
+    action = _entry_action(entry)
+    kind = action.get("type", "goal")
+    label = action_summary(action)
+    detail = ""
+    try:
+        if kind == "goal":
+            task_queue.submit(action.get("goal", ""), source=f"schedule:{entry['id']}")
+            detail = "started"
+        elif kind == "command":
+            import shlex
+            import subprocess
+
+            cmd = (action.get("command") or "").strip()
+            if not cmd:
+                raise ValueError("empty command")
+            shell = (action.get("shell") or "powershell").lower()
+            if os.name == "nt" and shell == "powershell":
+                argv = ["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd]
+            elif os.name == "nt":
+                argv = ["cmd", "/c", cmd]
+            else:
+                argv = shlex.split(cmd)
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            subprocess.Popen(argv, creationflags=flags)  # fire-and-forget
+            detail = "launched"
+        elif kind == "app":
+            from tools_core import AppLauncherTool
+
+            result = AppLauncherTool.launch_app(action.get("app", ""))
+            detail = "opened" if (result or {}).get("success", True) else (result or {}).get("error", "failed")
+        elif kind == "workflow":
+            from buzzcaf_client import buzzcaf_client
+
+            buzzcaf_client.execute_step(action.get("projectId", ""), action.get("feedback"))
+            detail = "workflow step run"
+        elif kind == "code_task":
+            import tools_code
+
+            res = tools_code.code_task(
+                action.get("task", ""), action.get("project"), action.get("mode", "edits")
+            )
+            detail = "started" if getattr(res, "ok", True) else getattr(res, "message", "failed")
+        else:
+            raise ValueError(f"unknown action type {kind!r}")
+        ok = True
+    except Exception as exc:
+        ok, detail = False, str(exc)
+        print(f"[Scheduler] Scheduled action {entry.get('id')} ({kind}) failed: {exc}")
+
+    spoken = f"Scheduled: {label}" + (f" - {detail}" if detail else "")
+    try:
+        import notify
+
+        notify.toast_async("Dexter - scheduled", label)
+    except Exception:
+        pass
+    bus.publish("reminder", {
+        "id": f"sched-{entry.get('id')}",
+        "text": label,
+        "spoken": spoken,
+        "speak": False,
+        "banner": True,
+        "ok": ok,
+    })
+
+
 def _fire_scheduled(entry_id: str) -> None:
     entry = next((e for e in _load_scheduled() if e.get("id") == entry_id), None)
     if not entry:
         return
-    task_queue.submit(entry["goal"], source=f"schedule:{entry_id}")
+    _run_action(entry)
     items = _load_scheduled()
     for item in items:
         if item.get("id") == entry_id:
@@ -366,11 +465,24 @@ def _arm(entry: Dict[str, Any]) -> bool:
     return scheduler.add_date_job(job_id, fire_at, _fire_scheduled, [entry["id"]])
 
 
-def schedule_goal(goal: str, when_text: str) -> Dict[str, Any]:
-    """Voice-schedulable automation: recurring cron or one-shot datetime."""
-    goal = (goal or "").strip()
-    if not goal:
+def create_scheduled(action: Dict[str, Any], when_text: str) -> Dict[str, Any]:
+    """Schedule any action (goal / command / app / workflow / code_task).
+
+    This is the one place a scheduled entry is born - the voice path
+    (`schedule_goal`) and the REST path both funnel through here so cron vs
+    one-shot parsing, persistence and arming stay in a single spot.
+    """
+    action = action or {}
+    kind = action.get("type", "goal")
+    if kind == "goal" and not (action.get("goal") or "").strip():
         return {"ok": False, "error": "Empty goal."}
+    if kind == "command" and not (action.get("command") or "").strip():
+        return {"ok": False, "error": "Empty command."}
+    if kind == "app" and not (action.get("app") or "").strip():
+        return {"ok": False, "error": "Which app?"}
+    if kind == "code_task" and not (action.get("task") or "").strip():
+        return {"ok": False, "error": "What should be coded?"}
+
     recurrence = parse_recurrence(when_text)
     fire_at = None if recurrence else parse_when(when_text)
     if not recurrence and not fire_at:
@@ -378,7 +490,9 @@ def schedule_goal(goal: str, when_text: str) -> Dict[str, Any]:
 
     entry = {
         "id": uuid.uuid4().hex[:10],
-        "goal": goal,
+        "action": action,
+        # Keep `goal` populated for legacy readers when the action is a goal.
+        "goal": action.get("goal", "") if kind == "goal" else action_summary(action),
         "whenText": when_text,
         "cron": recurrence,
         "at": fire_at.isoformat(timespec="seconds") if fire_at else None,
@@ -389,11 +503,67 @@ def schedule_goal(goal: str, when_text: str) -> Dict[str, Any]:
     _save_scheduled(items)
     armed = _arm(entry)
     human = humanize(fire_at) if fire_at else f"repeating ({when_text})"
-    return {"ok": True, "id": entry["id"], "when": human, "armed": armed}
+    return {"ok": True, "id": entry["id"], "when": human, "armed": armed, "entry": entry}
+
+
+def schedule_goal(goal: str, when_text: str) -> Dict[str, Any]:
+    """Voice-schedulable automation: recurring cron or one-shot datetime."""
+    return create_scheduled({"type": "goal", "goal": (goal or "").strip()}, when_text)
+
+
+def update_scheduled(entry_id: str, action: Optional[Dict[str, Any]] = None,
+                     when_text: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Edit a scheduled entry's action and/or time, then re-arm it."""
+    from scheduler import scheduler
+
+    items = _load_scheduled()
+    entry = next((e for e in items if e.get("id") == entry_id), None)
+    if not entry:
+        return None
+
+    if action:
+        entry["action"] = action
+        entry["goal"] = action.get("goal", "") if action.get("type") == "goal" else action_summary(action)
+    if when_text is not None:
+        recurrence = parse_recurrence(when_text)
+        fire_at = None if recurrence else parse_when(when_text)
+        if not recurrence and not fire_at:
+            return {"ok": False, "error": f"I couldn't work out when '{when_text}' is."}
+        entry["whenText"] = when_text
+        entry["cron"] = recurrence
+        entry["at"] = fire_at.isoformat(timespec="seconds") if fire_at else None
+
+    _save_scheduled(items)
+    scheduler.remove_job(f"goal-{entry_id}")
+    entry["armed"] = _arm(entry)
+    entry["ok"] = True
+    return entry
+
+
+def run_now(entry_id: str) -> bool:
+    """Fire a scheduled entry immediately without disturbing its schedule."""
+    entry = next((e for e in _load_scheduled() if e.get("id") == entry_id), None)
+    if not entry:
+        return False
+    _run_action(entry)
+    return True
 
 
 def list_scheduled() -> List[Dict[str, Any]]:
     return _load_scheduled()
+
+
+def cancel_scheduled_by_id(entry_id: str) -> bool:
+    """Cancel one scheduled entry by id (the REST/UI path)."""
+    from scheduler import scheduler
+
+    items = _load_scheduled()
+    remaining = [e for e in items if e.get("id") != entry_id]
+    if len(remaining) == len(items):
+        return False
+    _save_scheduled(remaining)
+    scheduler.remove_job(f"goal-{entry_id}")
+    return True
 
 
 def cancel_scheduled(fragment: str) -> Optional[Dict[str, Any]]:
@@ -401,7 +571,10 @@ def cancel_scheduled(fragment: str) -> Optional[Dict[str, Any]]:
 
     fragment = (fragment or "").strip().lower()
     items = _load_scheduled()
-    match = next((e for e in items if fragment and fragment in e.get("goal", "").lower()), None)
+    match = next(
+        (e for e in items if fragment and fragment in (e.get("goal", "") or "").lower()),
+        None,
+    )
     if not match:
         return None
     _save_scheduled([e for e in items if e.get("id") != match["id"]])

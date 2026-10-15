@@ -5,6 +5,7 @@ detected, and the phrasings route without a model.
 """
 
 import json
+import datetime
 import os
 import time
 
@@ -41,6 +42,12 @@ def _write_session(folder, session_id, cwd, prompts, files, commands, title=None
     return path
 
 
+def _seconds_since_midnight() -> int:
+    """How far into the day we are - the budget for "earlier today"."""
+    now = datetime.datetime.now()
+    return max(120, now.hour * 3600 + now.minute * 60 + now.second)
+
+
 @pytest.fixture
 def logs(tmp_path, monkeypatch):
     root = tmp_path / "projects"
@@ -51,7 +58,11 @@ def logs(tmp_path, monkeypatch):
                    [r"B:\p\BuzzAnimate\rig.py", r"B:\p\BuzzAnimate\sound.py"], ["python -m pytest -q"],
                    title="Director or scenery not responding", age_seconds=60, branch="rigging")
     _write_session(root / "B--p-dexter", "bbb", r"B:\p\dexter", ["fix the tray"], [r"B:\p\dexter\backend\desktop_app.py"], [],
-                   age_seconds=3 * 3600)
+                   # Old enough to sort second, new enough to still count as "today"
+                   # whatever time the suite runs: three hours before midnight is
+                   # yesterday, and this is the kind of test that fails once at 00:24
+                   # and gets blamed on whatever was last changed.
+                   age_seconds=min(3 * 3600, _seconds_since_midnight() - 60))
     _write_session(root / "B--p-old", "ccc", r"B:\p\old", ["ancient"], [], [], age_seconds=40 * 86400)
     return root
 

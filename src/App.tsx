@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react';
-import { Maximize2 } from 'lucide-react';
+import { Maximize2, MessageSquare, CalendarClock, LayoutGrid, Settings as SettingsIcon } from 'lucide-react';
 import { launchApp } from './api';
 
 import { useChat } from './hooks/useChat';
@@ -12,6 +12,7 @@ import { useServerEvents } from './hooks/useServerEvents';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { useRuntimeHealth } from './hooks/useRuntimeHealth';
 import { useWorkbook } from './hooks/useWorkbook';
+import { useHandMouse } from './hooks/useHandMouse';
 
 import { Header } from './components/Header';
 import ProviderSelector from './components/ProviderSelector';
@@ -28,7 +29,13 @@ import { FileExplorer } from './components/FileExplorer';
 import { BuzzcafPanel } from './components/BuzzcafPanel';
 import { AppsPanel } from './components/AppsPanel';
 import { ResourcePanel } from './components/ResourcePanel';
+import { HandMousePanel, liveLine } from './components/HandMousePanel';
 import { SkillsPanel } from './components/SkillsPanel';
+import { FacePanel } from './components/FacePanel';
+import { SchedulerPanel } from './components/SchedulerPanel';
+import { PairDevicePanel } from './components/PairDevicePanel';
+import { useSchedule } from './hooks/useSchedule';
+import { useIsMobile } from './hooks/useIsMobile';
 
 // App is composition + layout only. Every unit of behaviour lives in a hook
 // (src/hooks) and every unit of UI in a component (src/components); this file
@@ -36,9 +43,14 @@ import { SkillsPanel } from './components/SkillsPanel';
 // shared refs break the natural voice<->chat cycle - the mic (registered once,
 // in useVoice) reads the thinking flag and dispatches recognised commands
 // through them, while chat owns and updates both.
+type MobileTab = 'chat' | 'schedule' | 'apps' | 'settings';
+
 export default function App() {
   const [isExpanded, setIsExpanded] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  // Phone layout: a bottom tab bar over the same hooks the desktop app uses.
+  const isMobile = useIsMobile();
+  const [mobileTab, setMobileTab] = useState<MobileTab>('chat');
 
   // Buzzcaf/app-launch narration is pushed into chat; a ref lets those hooks
   // reach the chat sink even though chat is created after them.
@@ -54,7 +66,13 @@ export default function App() {
   const online = useOnlineStatus();
   const runtime = useRuntimeHealth();
   const workbook = useWorkbook();
+  // The webcam hand mouse. Polled always, not only when the dashboard is open:
+  // the header chip is the only way to tell it is on without the camera window.
+  const hand = useHandMouse();
   const missionState = useMission();
+  // The scheduler feed. Fetched only while its panel is visible (its mobile tab,
+  // or the expanded desktop dashboard), so the compact layout stays quiet.
+  const schedule = useSchedule(isMobile ? mobileTab === 'schedule' : isExpanded);
 
   const chat = useChat({
     voice,
@@ -84,6 +102,12 @@ export default function App() {
     },
     // Reminders and check-ins are said out loud when voice is on (v10).
     onSpeak: (text, emotion, isReminder) => voice.speakText(text, emotion, isReminder),
+    onChatTurn: (p) => {
+      chat.appendRemoteTurn(p);
+      planner.refresh();
+      workbook.refresh();
+      missionState.refresh();
+    },
   });
 
   const toggleExpandWindow = () => {
@@ -104,6 +128,110 @@ export default function App() {
       console.warn('Could not launch app', e);
     }
   };
+
+  if (isMobile) {
+    const tabs: { id: MobileTab; label: string; icon: JSX.Element }[] = [
+      { id: 'chat', label: 'Chat', icon: <MessageSquare size={18} /> },
+      { id: 'schedule', label: 'Schedule', icon: <CalendarClock size={18} /> },
+      { id: 'apps', label: 'Apps', icon: <LayoutGrid size={18} /> },
+      { id: 'settings', label: 'Settings', icon: <SettingsIcon size={18} /> },
+    ];
+    return (
+      <div style={{ minHeight: '100dvh', display: 'flex', flexDirection: 'column' }}>
+        <div style={{ flex: 1, overflowY: 'auto', padding: '12px', paddingBottom: 'calc(72px + env(safe-area-inset-bottom))' }}>
+          <RuntimeBanner
+            warnings={runtime.warnings}
+            onDismiss={(code) => runtime.dismiss(code)}
+          />
+          <ReminderBanners
+            reminders={events.reminders}
+            onSnooze={events.snoozeReminder}
+            onDismiss={events.dismissReminder}
+          />
+          <TaskTray
+            tasks={events.bgTasks}
+            onAnswer={events.answerTask}
+            onCancel={events.cancelBgTask}
+            onDismiss={events.dismissBgTask}
+          />
+
+          {mobileTab === 'chat' && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+              <ProviderSelector />
+              <MissionCard
+                mission={missionState.mission}
+                onPrefill={(t) => chat.setInputMsg(t)}
+                onToggleInitiative={missionState.toggleInitiative}
+              />
+              <ChatFeed
+                chatLog={chat.chatLog}
+                isThinking={chat.isThinking}
+                isBusy={chat.isBusy}
+                toolActivity={chat.toolActivity}
+                inputMsg={chat.inputMsg}
+                setInputMsg={chat.setInputMsg}
+                onSend={() => chat.handleSendMessage()}
+                onCancel={() => chat.cancelTurn()}
+                onQuickReply={(t) => chat.handleSendMessage(t)}
+                isExpanded={false}
+                voice={voice}
+              />
+            </div>
+          )}
+
+          {mobileTab === 'schedule' && (
+            <SchedulerPanel
+              items={schedule.items}
+              loading={schedule.loading}
+              onAdd={schedule.add}
+              onRemove={schedule.remove}
+              onRunNow={schedule.runNow}
+            />
+          )}
+
+          {mobileTab === 'apps' && (
+            <AppsPanel
+              onLaunch={handleLaunchApp}
+              onMessage={(text) => chat.pushDexterMessage(text)}
+              tick={events.resourceTick}
+            />
+          )}
+
+          {mobileTab === 'settings' && (
+            <SettingsPanel onClose={() => setMobileTab('chat')} voice={voice} />
+          )}
+        </div>
+
+        <nav
+          style={{
+            position: 'fixed', bottom: 0, left: 0, right: 0,
+            display: 'flex', justifyContent: 'space-around',
+            background: 'var(--surface-2, #1a1a24)',
+            borderTop: '1px solid var(--bg-card-border, #333)',
+            paddingBottom: 'env(safe-area-inset-bottom)',
+            zIndex: 50,
+          }}
+        >
+          {tabs.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => setMobileTab(t.id)}
+              style={{
+                flex: 1, background: 'transparent', border: 'none',
+                color: mobileTab === t.id ? 'var(--accent)' : 'var(--muted)',
+                display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '2px',
+                padding: '10px 0 8px', fontSize: '10px', fontWeight: 700, cursor: 'pointer',
+              }}
+            >
+              {t.icon}
+              {t.label}
+            </button>
+          ))}
+        </nav>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -166,9 +294,15 @@ export default function App() {
         online={online}
         onToggleSettings={() => setShowSettings((v) => !v)}
         voiceState={voice.state}
+        voiceSilent={voice.silent}
+        onToggleSilent={voice.toggleSilent}
         voiceReason={voice.unavailableReason}
         voiceMode={voice.wakeMode}
         onToggleVoice={voice.toggleMuted}
+        handRunning={!!hand.status?.running}
+        handSeeing={!!hand.status?.seeingHand}
+        handLine={liveLine(hand.status)}
+        onStopHand={hand.stop}
       />
 
       {/* Pick the LLM backend + model (or leave on Auto). */}
@@ -186,10 +320,12 @@ export default function App() {
           <ChatFeed
             chatLog={chat.chatLog}
             isThinking={chat.isThinking}
+            isBusy={chat.isBusy}
             toolActivity={chat.toolActivity}
             inputMsg={chat.inputMsg}
             setInputMsg={chat.setInputMsg}
             onSend={() => chat.handleSendMessage()}
+            onCancel={() => chat.cancelTurn()}
             onQuickReply={(t) => chat.handleSendMessage(t)}
             isExpanded={isExpanded}
             voice={voice}
@@ -257,6 +393,24 @@ export default function App() {
               onApprove={buzzcaf.approve}
               onStart={buzzcaf.start}
             />
+            <HandMousePanel
+              status={hand.status}
+              busy={hand.busy}
+              error={hand.error}
+              onStart={hand.start}
+              onStop={hand.stop}
+              onBind={hand.bind}
+              onSpeed={hand.setSpeed}
+            />
+            <SchedulerPanel
+              items={schedule.items}
+              loading={schedule.loading}
+              onAdd={schedule.add}
+              onRemove={schedule.remove}
+              onRunNow={schedule.runNow}
+            />
+            <PairDevicePanel />
+            <FacePanel />
             <ResourcePanel tick={events.resourceTick} />
             <AppsPanel
               onLaunch={handleLaunchApp}

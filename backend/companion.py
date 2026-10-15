@@ -77,6 +77,14 @@ def context_block() -> str:
         now_lines.append(machine)
     if now_lines:
         block += "\n\n## Right now\n" + "\n".join(now_lines)
+    try:
+        import changelog_tracker
+
+        cl_block = changelog_tracker.context_block()
+        if cl_block:
+            block += "\n\n" + cl_block
+    except Exception:
+        pass
     return block
 
 

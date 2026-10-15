@@ -15,6 +15,7 @@ language model, deliberately kept short: a small local model drowns if you hand
 it a raw JSON blob, so the tool itself decides what is worth saying.
 """
 
+import contextvars
 import json
 import time
 import traceback
@@ -292,6 +293,33 @@ def validate_args(
 
 
 # ───────────────────────── Execution ─────────────────────────
+
+
+# ───────────────────────── which conversation is this? ─────────────────────────
+#
+# A few tools belong to a conversation rather than to the machine: dictation is
+# per session (a note dictated in the pop-up is not the one being dictated in the
+# full window), and so is anything that has to be stopped by the same person who
+# started it. Passing a session id as a tool *parameter* would put it in the
+# schema the model sees and invite it to invent one, so it travels beside the
+# call instead. `_run_tool` sets it; a tool asks for it with `session_now()`.
+_session_now = contextvars.ContextVar("dexter_tool_session", default="default")
+
+
+def set_session(session: str) -> Any:
+    """Bind the session for the tool about to run. Returns a reset token."""
+    return _session_now.set(str(session or "default"))
+
+
+def reset_session(token: Any) -> None:
+    try:
+        _session_now.reset(token)
+    except Exception:
+        pass
+
+
+def session_now() -> str:
+    return _session_now.get()
 
 
 def execute(name: str, args: Optional[Dict[str, Any]] = None) -> ToolResult:

@@ -192,6 +192,82 @@ def test_a_warning_on_the_record_is_passed_on(fake_world, monkeypatch):
     assert "0.0.0.0" in result.summary
 
 
+# ───────────────────────── v12: Dexter steps aside ─────────────────────────
+#
+# Owner, 2026-09-11: "buzzcode does not run every time, neither does buzzedit,
+# how can sentinel handle this situation?" Most of the time the thing holding
+# the last gigabytes was Dexter's own model, and Dexter read the refusal out
+# instead of giving it back. It yields to what the owner asked for — and only
+# ever its own models.
+
+
+OUR_BLOCKER = {"label": "Ollama runner (Dexter)", "pid": 4711, "vram_mib": 5000,
+               "class": "assistant"}
+
+
+@pytest.fixture()
+def room_maker(monkeypatch, fake_world):
+    """Shedding recorded, never real; the second query is granted."""
+    calls = {"shed": [], "released": []}
+
+    def fake_shed(level="orange", reason="", want_mib=0, move_fast=True):
+        calls["shed"].append((level, reason, move_fast))
+        fake_world["granted"] = True       # the card is free now
+        fake_world["blockers"] = []
+        return {"level": level, "steps": ["unloaded qwen2.5:7b"], "freedMib": 5017}
+
+    monkeypatch.setattr(model_steward, "shed", fake_shed)
+    monkeypatch.setattr(model_steward, "release", lambda why="": calls["released"].append(why))
+    monkeypatch.setattr(model_steward, "_resident_mib", lambda: 0)
+    return calls
+
+
+def test_dexter_gives_its_own_model_back_so_the_app_can_start(fake_world, room_maker):
+    fake_world["granted"] = False
+    fake_world["blockers"] = [OUR_BLOCKER]
+
+    result = tools_apps.open_app("batchy")
+
+    assert result.ok and fake_world["launched"] == ["batchy"]
+    # move_fast=False: the owner asked for an app; loading 3 GB back into RAM in
+    # the same breath is the opposite of making room (v13, P3.3).
+    assert room_maker["shed"] == [("preempt", "making room for Batchy", False)]
+    assert room_maker["released"] == ["making room"]
+    assert result.summary.startswith("Gave back qwen2.5:7b (4.9 GB) so Batchy could start.")
+    assert "Batchy is up" in result.summary
+
+
+def test_someone_elses_render_is_sentinels_call_not_dexters(fake_world, room_maker):
+    """VrDeep has the card: Dexter unloading its own 3B frees nothing that
+    matters, and the app still cannot start. Say so, shed nothing."""
+    fake_world["granted"] = False
+    fake_world["blockers"] = [{"process": "VrDeep", "pid": 33228, "vram_mib": 10240,
+                               "class": "batch"}]
+
+    result = tools_apps.open_app("batchy")
+
+    assert result.ok is False and fake_world["launched"] == []
+    assert room_maker["shed"] == [], "Dexter must never shed for someone else's work"
+    assert "Not enough room for Batchy" in result.summary and "VrDeep" in result.summary
+
+
+def test_a_refusal_that_survives_the_shed_still_launches_nothing(fake_world, monkeypatch):
+    fake_world["granted"] = False
+    fake_world["blockers"] = [OUR_BLOCKER]
+    shed = []
+    monkeypatch.setattr(model_steward, "shed", lambda level="orange", reason="", want_mib=0, move_fast=True: (
+        shed.append(level) or {"level": level, "steps": [], "freedMib": 0}
+    ))
+    monkeypatch.setattr(model_steward, "release", lambda why="": None)
+    monkeypatch.setattr(model_steward, "_resident_mib", lambda: 0)
+
+    result = tools_apps.open_app("batchy")
+
+    assert shed == ["preempt"], "it tried"
+    assert result.ok is False and fake_world["launched"] == []
+    assert "Not enough room for Batchy" in result.summary
+
+
 # ───────────────────────── stopping, and asking first ─────────────────────────
 
 

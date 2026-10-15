@@ -34,39 +34,42 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROFILE_PATH = os.path.join(ROOT_DIR, "data", "voice_profile.json")
 
 SAMPLE_RATE = 16000
+EMBED_DIM = 192
 
 STRICT = os.getenv("DEXTER_SPEAKER_ONLY", "1").strip().lower() not in ("0", "false", "no", "off")
-# Measured with the real encoder (Kokoro voices as stand-ins): the enrolled
-# voice scored 0.81-0.90, other voices 0.46-0.73, Dexter's own 0.92+. Then
-# measured on the owner's real microphone (v11.1, data/dexter.log 2026-09-11):
-# the owner's own sentences scored 0.45-0.74 most of the time and 0.75 was
-# throwing away 141 of 169 things said. A print from ten seconds of enrolment
-# does not cover a room, a distance and a mood; 0.60 is where the same speaker
-# on the same mic lands, and the grey zone + adaptation below close the rest.
-THRESHOLD = float(os.getenv("DEXTER_SPEAKER_THRESHOLD", "0.60"))
+# Measured with the real ECAPA-TDNN encoder: same-speaker cosine ~0.83,
+# different-speaker cosine ~0.02 (0.008-0.026 across the pairs tried) - a
+# clean separation, unlike resemblyzer's overlapping 0.45-0.74 same-speaker /
+# 0.46-0.73 different-speaker ranges that let strangers through. 0.45 sits
+# well clear of the different-speaker scores while leaving headroom below the
+# same-speaker score, and the grey zone + adaptation below close the rest.
+THRESHOLD = float(os.getenv("DEXTER_SPEAKER_THRESHOLD", "0.45"))
 # Below the threshold by no more than this, the pipeline may still accept the
 # sentence when it is plainly addressed to Dexter (it opens with the name, or
 # it is a follow-up to something the owner just said). Nobody else in the room
 # is calling Dexter by name mid-conversation.
-GREY_ZONE = float(os.getenv("DEXTER_SPEAKER_GREY", "0.15"))
+GREY_ZONE = float(os.getenv("DEXTER_SPEAKER_GREY", "0.10"))
 # Every confidently-accepted sentence nudges the owner's print toward how the
 # owner actually sounds on this mic (an exponential moving average), so the
 # scores climb with use instead of staying stuck at the enrolment conditions.
 ADAPT_RATE = float(os.getenv("DEXTER_SPEAKER_ADAPT", "0.08"))
+# How close a clip needs to be to Dexter's own enrolled voice to be treated
+# as an echo rather than the owner speaking.
+DEXTER_MATCH = float(os.getenv("DEXTER_SPEAKER_DEXTER", "0.50"))
 # Under this much audio a print is too noisy to reject anyone on.
 MIN_SECONDS = 0.9
 ENROLL_SECONDS = float(os.getenv("DEXTER_ENROLL_SECONDS", "10"))
 
 try:
-    if "webrtcvad" not in sys.modules:
-        sys.modules["webrtcvad"] = types.ModuleType("webrtcvad")
-    from resemblyzer import VoiceEncoder  # type: ignore
-    from resemblyzer.audio import normalize_volume  # type: ignore
+    import torch  # type: ignore
+    from speechbrain.inference.speaker import EncoderClassifier  # type: ignore
+    from speechbrain.utils.fetching import LocalStrategy  # type: ignore
 
     _IMPORT_OK = True
 except Exception as _exc:  # pragma: no cover - optional dependency
-    VoiceEncoder = None  # type: ignore
-    normalize_volume = None  # type: ignore
+    torch = None  # type: ignore
+    EncoderClassifier = None  # type: ignore
+    LocalStrategy = None  # type: ignore
     _IMPORT_OK = False
     _IMPORT_ERROR = str(_exc)
 
@@ -121,10 +124,12 @@ class SpeakerId:
         return _IMPORT_OK and not self._load_failed
 
     def enrolled(self) -> bool:
-        return isinstance(self._profile.get("owner"), list) and len(self._profile["owner"]) > 0
+        owner = self._profile.get("owner")
+        return isinstance(owner, list) and len(owner) == EMBED_DIM
 
     def has_dexter(self) -> bool:
-        return isinstance(self._profile.get("dexter"), list) and len(self._profile["dexter"]) > 0
+        dexter = self._profile.get("dexter")
+        return isinstance(dexter, list) and len(dexter) == EMBED_DIM
 
     def enabled(self) -> bool:
         """Whether judge() can reject anything at all."""
@@ -212,9 +217,15 @@ class SpeakerId:
                 return self._encoder
             try:
                 t0 = time.time()
-                self._encoder = VoiceEncoder(device="cpu", verbose=False)
+                self._encoder = EncoderClassifier.from_hparams(
+                    source="speechbrain/spkrec-ecapa-voxceleb",
+                    savedir=os.path.join(ROOT_DIR, "models", "ecapa"),
+                    run_opts={"device": "cpu"},
+                    local_strategy=LocalStrategy.COPY_SKIP_CACHE,
+                )
                 # First call pays torch's thread start-up; take it now.
-                self._encoder.embed_utterance(np.zeros(SAMPLE_RATE * 2, dtype=np.float32) + 1e-4)
+                warm = torch.from_numpy(np.zeros(SAMPLE_RATE * 2, dtype=np.float32) + 1e-4)
+                self._encoder.encode_batch(warm.unsqueeze(0))
                 print(f"[Speaker] Voice encoder ready in {time.time() - t0:.1f}s.")
             except Exception as exc:
                 print(f"[Speaker] Voice encoder unavailable: {exc}")
@@ -232,8 +243,10 @@ class SpeakerId:
         if wav.size < int(SAMPLE_RATE * MIN_SECONDS):
             return None
         try:
-            wav = normalize_volume(wav, -30, increase_only=True)
-            return np.asarray(encoder.embed_utterance(wav), dtype=np.float32)
+            emb = encoder.encode_batch(torch.from_numpy(wav).unsqueeze(0)).squeeze().numpy()
+            emb = np.asarray(emb, dtype=np.float32)
+            norm = float(np.linalg.norm(emb)) or 1e-9
+            return emb / norm
         except Exception as exc:
             print(f"[Speaker] Embedding failed: {exc}")
             return None
@@ -278,7 +291,7 @@ class SpeakerId:
         dexter_score = _cos(emb, np.asarray(self._profile["dexter"], dtype=np.float32)) if self.has_dexter() else 0.0
 
         # Dexter's own voice, leaking back in through the speakers.
-        if self.has_dexter() and dexter_score >= 0.80 and dexter_score > owner_score:
+        if self.has_dexter() and dexter_score >= DEXTER_MATCH and dexter_score > owner_score:
             return Verdict(False, owner_score, dexter_score, "dexter", embedding=emb)
         if STRICT and self.enrolled():
             if owner_score >= THRESHOLD:

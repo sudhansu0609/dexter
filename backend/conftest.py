@@ -52,6 +52,55 @@ def _no_live_machine(monkeypatch, tmp_path):
         # wastes an afternoon.
         model_steward._last_shed.clear()
         model_steward._ours.clear()
+        # Same reasoning for the v12 ladder note: the rung one test's turn ran
+        # on must not be the rung another test's panel reads back.
+        model_steward._last_ladder.clear()
+        model_steward._relief.clear()
+        # v13: and where each model was put.
+        model_steward._places.clear()
+    except Exception:
+        pass
+
+    # v13: the residency API itself. Until now every test that could reach it
+    # patched it by hand, and the ladder growing a third rung (RAM) made that a
+    # matter of remembering — `ensure` now loads a model on a path that used to
+    # stop at a reservation. A test that wants a load asserts on its own stub;
+    # one that forgets gets a loud failure instead of the owner's 12B being
+    # dropped mid-sentence.
+    try:
+        import hybrid_llm
+
+        def _no_residency(what):
+            def _raise(*args, **kwargs):
+                raise AssertionError(f"a test tried to {what} for real")
+
+            return _raise
+
+        for name, what in (
+            ("warm_model", "load a model"),
+            ("release_model", "unload a model"),
+            ("set_keep_alive", "change a model's residency"),
+        ):
+            monkeypatch.setattr(hybrid_llm.llm_router, name, _no_residency(what), raising=False)
+        # Reading is harmless in principle, but it is an HTTP call to whatever
+        # Ollama is running on this machine; "nothing is loaded" is both safe
+        # and the state most worth testing against.
+        monkeypatch.setattr(hybrid_llm.llm_router, "loaded_models", lambda: [], raising=False)
+
+        # And the model itself. Ollama *is* running on this machine, so an
+        # unstubbed `chat()` does not fail — it answers, slowly, with whatever
+        # the owner has loaded, and then the tool it picked runs for real.
+        # Caught exactly that way while v13 was being built: a ladder test that
+        # never mentions a model listed the owner's open windows. The default is
+        # therefore "no provider is up", which is a real state Dexter handles and
+        # a deterministic one; a test that wants an answer stubs `chat`.
+        def _no_model(*args, **kwargs):
+            return hybrid_llm.LLMResponse(
+                provider="none", model="",
+                error="no model server in tests (stub llm_router.chat to answer)",
+            )
+
+        monkeypatch.setattr(hybrid_llm.llm_router, "chat", _no_model, raising=False)
     except Exception:
         pass
 
@@ -81,12 +130,24 @@ def _no_live_machine(monkeypatch, tmp_path):
         # Reading is harmless, but a UIA walk of the owner's screen is slow and
         # non-deterministic, so it is absent unless a test fakes it.
         monkeypatch.setattr(desktop_control, "_uia_window", lambda hwnd: None, raising=False)
+        # v13: the same for the process table. `find_processes` scans every
+        # running process to match an app by its path or file description; in a
+        # test that is both slow and dependent on whatever the owner has open.
+        monkeypatch.setattr(desktop_control, "_process_table", lambda: [], raising=False)
+        # The clipboard is shared with the owner's actual work. A test that
+        # copies must not leave its marker sitting in it.
+        monkeypatch.setattr(desktop_control, "_clipboard_text", lambda: "", raising=False)
+        monkeypatch.setattr(desktop_control, "_set_clipboard", lambda text: True, raising=False)
     except Exception:
         pass
 
     try:
         import chrome_control
 
+        # v13.8: no test may believe any Chrome on this machine is Dexter's own debug
+        # one. `page_control.precise()` asks that question now, and the honest answer
+        # depends on a process-table scan the suite must not do.
+        monkeypatch.setattr(chrome_control, "dexter_chrome_pids", lambda: set(), raising=False)
         monkeypatch.setattr(
             chrome_control, "_spawn",
             lambda args: (_ for _ in ()).throw(
@@ -94,6 +155,68 @@ def _no_live_machine(monkeypatch, tmp_path):
             ),
             raising=False,
         )
+    except Exception:
+        pass
+
+    # v13.4: the CDP route. `browser_cdp.available()` asks a real port whether a real
+    # debuggable Chrome is there, so leaving it live makes the suite's behaviour
+    # depend on whether the owner happens to have one open - and it did: nineteen
+    # page tests took the exact route the moment one was running. Off by default;
+    # test_browser_cdp.py turns it on against a recorder.
+    try:
+        import browser_cdp
+
+        monkeypatch.setattr(browser_cdp, "ENABLED", False, raising=False)
+        monkeypatch.setattr(browser_cdp, "available", lambda timeout=0.5: False, raising=False)
+        monkeypatch.setattr(browser_cdp, "version", lambda timeout=0.5: None, raising=False)
+        monkeypatch.setattr(
+            browser_cdp, "launch",
+            lambda wait=0: (_ for _ in ()).throw(
+                AssertionError("a test tried to start a real debuggable Chrome")
+            ),
+            raising=False,
+        )
+    except Exception:
+        pass
+
+    # v13.8: reading the screen and clicking words on it. `screen_text.click` moves the
+    # owner's real pointer and presses a real button, and `read` photographs whatever is
+    # on their screen and runs OCR over it - neither belongs in a unit test. Tests that
+    # are *about* this install their own fake engine.
+    try:
+        import screen_text
+
+        monkeypatch.setattr(
+            screen_text, "capture",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("a test tried to photograph the owner's screen")
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            screen_text, "raise_window",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("a test tried to rearrange the owner's windows")
+            ),
+            raising=False,
+        )
+        monkeypatch.setattr(screen_text, "_engine", None, raising=False)
+    except Exception:
+        pass
+
+    try:
+        import mouse_input
+
+        # The same reasoning as the keystroke guards: a stray click lands in whatever
+        # the owner happens to have open.
+        for name in ("move_to", "click", "down", "up", "scroll"):
+            monkeypatch.setattr(
+                mouse_input, name,
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("a test tried to move or click the real mouse")
+                ),
+                raising=False,
+            )
     except Exception:
         pass
 
@@ -112,6 +235,25 @@ def _no_live_machine(monkeypatch, tmp_path):
     except Exception:
         pass
     yield
+
+
+@pytest.fixture(autouse=True)
+def _hand_settings_do_not_leak():
+    """Put the hand-mouse environment back after every test.
+
+    `settings_store.update` writes `os.environ` directly - that is how a setting
+    takes effect without a restart - so monkeypatch cannot undo it. Once the
+    gesture map became a setting (v13.6), one test saving "a fist is the right
+    click" changed what a fist meant for every test that ran afterwards, in
+    another file, with no clue as to why.
+    """
+    prefix = "DEXTER_HAND_"
+    before = {key: value for key, value in os.environ.items() if key.startswith(prefix)}
+    yield
+    for key in [k for k in os.environ if k.startswith(prefix)]:
+        if key not in before:
+            del os.environ[key]
+    os.environ.update(before)
 
 
 @pytest.fixture(autouse=True)

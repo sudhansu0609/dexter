@@ -15,6 +15,7 @@ import time
 from typing import Any, List, Optional, Tuple
 
 import env_boot  # noqa: F401  - loads .env for every entry point
+import espeak_cache  # one espeak library per process, not two copies per sentence
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AUDIO_DIR = os.path.join(ROOT_DIR, "data", "audio")
@@ -42,6 +43,19 @@ CLIP_MAX_AGE_S = float(os.getenv("DEXTER_AUDIO_CLIP_MAX_AGE", "900"))
 
 # Which Kokoro voice Dexter speaks with (Settings -> Voice -> Dexter's voice).
 DEFAULT_VOICE_KEY = os.getenv("DEXTER_VOICE_KEY", "michael").strip().lower() or "michael"
+
+# v14: edge-tts (Microsoft's cloud neural voices) is the primary voice - it takes
+# per-sentence rate/pitch/volume prosody, so emotion actually varies line to
+# line instead of one fixed mood per reply. Kokoro (CPU, offline) stays the
+# fallback: "auto" and "edge" both try edge-tts first; "kokoro" skips it.
+TTS_ENGINE = os.getenv("DEXTER_TTS_ENGINE", "auto").strip().lower() or "auto"
+EDGE_VOICE = os.getenv("DEXTER_EDGE_VOICE", "en-US-AndrewMultilingualNeural").strip() or "en-US-AndrewMultilingualNeural"
+
+# An offline machine must not pay a network timeout on every single chunk of
+# every reply; after one failure, edge-tts is skipped for this long and Kokoro
+# answers instead.
+EDGE_FAILURE_COOLDOWN_S = 30.0
+_edge_cooldown_until = 0.0
 
 
 def default_voice_key() -> str:
@@ -134,6 +148,30 @@ def clean_text_for_speech(text: str, limit: int = MAX_SPEECH_CHARS) -> str:
     return re.sub(r"\s+", " ", text).strip()[:limit]
 
 
+async def _edge_synth(text: str, voice: str, rate: str, pitch: str, volume: str, path: str) -> None:
+    """The actual edge-tts network call. Kept as a bare module-level function -
+    not a method - so a test can replace it with a fake and never touch the
+    network."""
+    import edge_tts
+
+    await edge_tts.Communicate(text, voice=voice, rate=rate, volume=volume, pitch=pitch).save(path)
+
+
+def _run_edge_synth(text: str, voice: str, rate: str, pitch: str, volume: str, path: str) -> None:
+    """Sync wrapper around `_edge_synth`; same asyncio.run + ThreadPoolExecutor
+    fallback pattern as `generate_speech` below, so it also works when called
+    from a thread that already has a running loop."""
+    try:
+        asyncio.run(_edge_synth(text, voice, rate, pitch, volume, path))
+    except RuntimeError:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(
+                asyncio.run, _edge_synth(text, voice, rate, pitch, volume, path)
+            ).result()
+
+
 class DexterVoiceEngine:
     VOICE_PROFILES = {
         "christopher": "en-US-ChristopherNeural",
@@ -181,6 +219,17 @@ class DexterVoiceEngine:
             self.generate_speech_kokoro("Ready.", prepared=True)
         except Exception:
             pass
+        # Clear up after older versions of ourselves: before v13.7d, phonemizer
+        # copied the espeak DLL three or four times per spoken sentence and left
+        # every copy behind - 468 MB of them on this machine. Nothing new
+        # accumulates now, but the backlog is real and this is a background thread.
+        try:
+            swept = espeak_cache.sweep()
+            if swept["removed"]:
+                print(f"[Voice] Cleared {swept['removed']} stale espeak library "
+                      f"copies from the temp folder ({swept['freedMb']} MB).")
+        except Exception as exc:
+            print(f"[Voice] Could not sweep the espeak copies: {exc}")
         return True
 
     def _ensure_kokoro(self):
@@ -193,6 +242,12 @@ class DexterVoiceEngine:
             if not self.kokoro_available():
                 print(f"[Voice] Kokoro model not found (looked for {KOKORO_MODEL_PATH}); using edge-tts.")
                 return None
+            # Before the first phonemize: share one espeak library instead of
+            # copying the DLL twice per sentence (v13.7d).
+            try:
+                espeak_cache.install()
+            except Exception as exc:
+                print(f"[Voice] espeak caching skipped: {exc}")
             try:
                 t0 = time.time()
                 from kokoro_onnx import Kokoro
@@ -272,9 +327,15 @@ class DexterVoiceEngine:
             voice = voice_name
             if blend_with and blend_weight > 0:
                 voice = self._blended_style(voice_name, blend_with, blend_weight)
-            samples, sample_rate = self.kokoro_instance.create(
-                clean_text, voice=voice, speed=speed, lang="en-us"
-            )
+            # Serialised, because the espeak library is now shared across the
+            # process rather than copied per call, and espeak-ng keeps its state in
+            # globals. Synthesis was already effectively sequential - chunks are
+            # spoken in order - so this costs nothing and removes the one risk that
+            # sharing introduces.
+            with espeak_cache.synthesis_lock:
+                samples, sample_rate = self.kokoro_instance.create(
+                    clean_text, voice=voice, speed=speed, lang="en-us"
+                )
             filename = f"speech_kokoro_{int(time.time() * 1000000)}.wav"
             file_path = os.path.join(AUDIO_DIR, filename)
             sf.write(file_path, samples, sample_rate)
@@ -283,6 +344,39 @@ class DexterVoiceEngine:
         except Exception as exc:
             print(f"[Voice] Kokoro synthesis error: {exc}")
             return None
+
+    def generate_speech_edge(
+        self,
+        text: str,
+        delivery: Any = None,
+        edge_voice: Optional[str] = None,
+        prepared: bool = False,
+    ) -> Optional[str]:
+        """Synthesise one chunk with edge-tts; None when a failure this recent
+        put edge into its cooldown, the text is empty, or the call itself fails."""
+        global _edge_cooldown_until
+        if time.time() < _edge_cooldown_until:
+            return None
+        clean_text = text if prepared else clean_text_for_speech(text)
+        if not clean_text.strip():
+            return None
+        voice = edge_voice or getattr(delivery, "edge_voice", None) or EDGE_VOICE
+        rate = getattr(delivery, "rate", "+0%")
+        pitch = getattr(delivery, "pitch", "+0Hz")
+        volume = getattr(delivery, "volume", "+0%")
+        filename = f"speech_edge_{int(time.time() * 1000000)}.mp3"
+        file_path = os.path.join(AUDIO_DIR, filename)
+        try:
+            _run_edge_synth(clean_text, voice, rate, pitch, volume, file_path)
+        except Exception as exc:
+            _edge_cooldown_until = time.time() + EDGE_FAILURE_COOLDOWN_S
+            print(f"[Voice] Edge-tts synthesis failed: {exc}")
+            return None
+        if not os.path.exists(file_path):
+            _edge_cooldown_until = time.time() + EDGE_FAILURE_COOLDOWN_S
+            return None
+        self._maybe_prune()
+        return file_path
 
     async def generate_speech_async(
         self, text: str, voice_key: str = "michael", rate: str = "+0%", pitch: str = "+0Hz"
@@ -322,8 +416,10 @@ class DexterVoiceEngine:
         )
         return delivery, split_sentences(delivery.text, prepared=True)
 
-    def synthesize_chunk(self, chunk: str, delivery: Any, voice_key: str = "michael") -> Optional[str]:
-        """Render one planned chunk with the delivery's voice, blend and speed."""
+    def _synthesize_chunk_kokoro(self, chunk: str, delivery: Any, voice_key: str = "michael") -> Optional[str]:
+        """The original Kokoro-first rendering: blend, speed, then the generic
+        (Kokoro-then-edge) fallback. Used as-is when DEXTER_TTS_ENGINE=kokoro,
+        and as the offline fallback when edge-tts is primary."""
         base_voice = self.KOKORO_VOICES.get((voice_key or "").lower(), getattr(delivery, "voice", "am_michael"))
         partner = getattr(delivery, "blend_with", None)
         if partner and base_voice[:1] in ("a", "b") and base_voice[1:2] == "f":
@@ -340,6 +436,21 @@ class DexterVoiceEngine:
             prepared=True,
         )
         return path or self.generate_speech(chunk, voice_key)
+
+    def synthesize_chunk(self, chunk: str, delivery: Any, voice_key: str = "michael") -> Optional[str]:
+        """Render one planned chunk with the delivery's voice, blend and speed.
+
+        Edge-tts is the primary engine ("auto"/"edge"): it carries emotion as
+        per-sentence rate/pitch/volume prosody, which Kokoro's fixed voice
+        blends cannot. Any edge failure - offline, an exception, no output -
+        falls back to Kokoro so a network hiccup never leaves Dexter silent.
+        DEXTER_TTS_ENGINE=kokoro keeps the original Kokoro-first behaviour.
+        """
+        if TTS_ENGINE in ("edge", "auto"):
+            path = self.generate_speech_edge(chunk, delivery=delivery, prepared=True)
+            if path:
+                return path
+        return self._synthesize_chunk_kokoro(chunk, delivery, voice_key)
 
     def speak_expressive(
         self,

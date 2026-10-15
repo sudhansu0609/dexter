@@ -91,6 +91,36 @@ class _Tee:
         return self._original.fileno()
 
 
+class _HandlerMirror:
+    """The print mirror, written through the rotating handler's own stream.
+
+    It used to be a second `open()` of dexter.log. On Windows that handle stops
+    the handler renaming the file (WinError 32), so every rollover failed: the
+    log grew past 17 MB, and each failure printed a traceback to stderr - which
+    the tee wrote straight back into the file. One stream, one owner.
+    """
+
+    def __init__(self, handler: RotatingFileHandler) -> None:
+        self._handler = handler
+
+    def write(self, text: str) -> None:
+        h = self._handler
+        h.acquire()
+        try:
+            if h.stream is None:
+                h.stream = h._open()
+            h.stream.write(text)
+            h.stream.flush()
+            # Roll only at a line end, so one print never straddles two files.
+            if text.endswith("\n") and h.maxBytes > 0 and h.stream.tell() >= h.maxBytes:
+                h.doRollover()
+        finally:
+            h.release()
+
+    def flush(self) -> None:
+        self._handler.flush()
+
+
 def log_path() -> str:
     return _LOG_PATH
 
@@ -117,9 +147,10 @@ def setup(level: int = logging.INFO) -> str:
         root.setLevel(level)
         root.addHandler(handler)
 
-        # A second, plain handle on the same file for the print mirror - going
-        # through `logging` would wrap every print in a second timestamp.
-        mirror = open(_LOG_PATH, "a", encoding="utf-8", errors="replace", buffering=1)
+        # Prints share the handler's stream (not `logging`, which would wrap
+        # every print in a second timestamp; not a second open(), which blocks
+        # rotation on Windows).
+        mirror = _HandlerMirror(handler)
         sys.stdout = _Tee(sys.stdout, mirror, "out")  # type: ignore[assignment]
         sys.stderr = _Tee(sys.stderr, mirror, "err")  # type: ignore[assignment]
 

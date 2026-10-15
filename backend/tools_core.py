@@ -221,6 +221,11 @@ class AppLauncherTool:
         """
         return app_index.lookup(app_name)
 
+    #: Console or windowed, from the PE header. One implementation, in app_index,
+    #: because the same question decides what gets indexed as an "application" and
+    #: how the launcher has to start it.
+    is_console_program = staticmethod(app_index.is_console_exe)
+
     @classmethod
     def _launch_target(cls, target: str) -> None:
         """
@@ -228,12 +233,23 @@ class AppLauncherTool:
         resolves protocol URIs (ms-stk:), App Paths names (chrome), and PATH
         executables - everything `start` did, minus the injection surface of
         interpolating a user-derived name into a command line.
+
+        A console program is the exception, and it is started through Popen with
+        **stdin closed**. Dexter is not a terminal: nothing it launches should ever
+        be waiting for somebody to type into it, and a misresolved name that leaves
+        a process wedged in the background is worse than a clean failure.
         """
         target = target.strip().strip('"')
         if target.lower().startswith("start "):
             target = target[6:].strip().strip('"')
         if not target:
             raise OSError("empty launch target")
+        if os.path.isabs(target) and cls.is_console_program(target):
+            subprocess.Popen(
+                [target], stdin=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            )
+            return
         try:
             os.startfile(target)
         except OSError:
@@ -242,7 +258,8 @@ class AppLauncherTool:
             if not resolved:
                 raise
             subprocess.Popen(
-                [resolved], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                [resolved], stdin=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
 
     @classmethod
@@ -258,12 +275,55 @@ class AppLauncherTool:
         except Exception:
             return False
 
+    #: A whole spoken sentence reaching the launcher means something above it
+    #: failed - the model passed the raw utterance as the app name. Rather than
+    #: reporting "I don't have 'okay open chrome for me' as an app", the verb and
+    #: the politeness are stripped here too, so the last layer still does the
+    #: obvious thing (v13.2, reported live).
+    _SPOKEN = re.compile(
+        r"^(?:(?:please|hey|ok(?:ay)?|kay|so|um|uh|well|alright|can you|could you|would you|"
+        r"i want you to|i need you to|go ahead and|now)\b[\s,]*)+",
+        re.IGNORECASE,
+    )
+    _VERBS = re.compile(
+        r"^(?:open|launch|start|run|fire\s+up|boot\s+up|bring\s+up|load|execute|"
+        r"pull\s+up|get\s+me|give\s+me|show\s+me)\b\s*(?:up\s+)?(?:the\s+|my\s+|a\s+)?",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def clean_name(cls, app_name: str) -> str:
+        """The app a spoken sentence was about: "okay, open Chrome for me" -> "chrome"."""
+        text = (app_name or "").strip().strip(" .!?,'\"")
+        text = cls._SPOKEN.sub("", text)
+        text = cls._VERBS.sub("", text)
+        text = text.lower()
+        for filler in (" on my pc", " on my computer", " for me", " right now", " now",
+                       " app", " application", " please", " thanks", " thank you"):
+            text = text.replace(filler, "")
+        return re.sub(r"\s+", " ", text).strip(" .!?,'\"")
+
     @classmethod
     def launch_app(cls, app_name: str) -> Dict[str, Any]:
-        clean_name = app_name.lower().strip()
-        for filler in [" on my pc", " on my computer", " for me", " app", " application", " please"]:
-            clean_name = clean_name.replace(filler, "")
-        clean_name = clean_name.strip()
+        clean_name = cls.clean_name(app_name)
+        lookup_name = clean_name or (app_name or "").strip()
+
+        # If a window for this app is already open, bring it forward rather than
+        # spawning a duplicate instance.
+        try:
+            import desktop_control as dc
+            existing = dc.find_windows(lookup_name)
+            if existing:
+                front = existing[0]
+                if dc.focus(front):
+                    return {
+                        "success": True,
+                        "appName": lookup_name,
+                        "window": front.describe(),
+                        "message": f"Switched to {front.describe()}.",
+                    }
+        except Exception:
+            pass
 
         # Mapped protocol/shell commands win: they handle UWP apps (ms-stk:,
         # outlookcal:) that have no plain executable on disk.
@@ -653,8 +713,32 @@ def list_notes() -> ToolResult:
     category="media",
 )
 def play_on_youtube(query: str) -> ToolResult:
+    # v13: this used to open a *results page* in whatever Windows calls the
+    # default browser and then say "Playing 'X' on YouTube" - a search is not
+    # playing, and the page was often not even in the Chrome the owner uses. Now
+    # the first result is resolved to a video and opened in their Chrome, and the
+    # old behaviour is the fallback when YouTube cannot be reached.
+    try:
+        import youtube_control
+
+        rows = youtube_control.search(query, limit=1)
+        info = youtube_control.chrome_control.open_url(rows[0]["url"])
+        title = rows[0]["title"] or query
+        channel = f" ({rows[0]['channel']})" if rows[0]["channel"] else ""
+        return ToolResult(
+            ok=True,
+            summary=f"Playing '{title}'{channel} on YouTube.",
+            data={"query": query, **rows[0], "window": info.get("window", "")},
+        )
+    except Exception as exc:
+        print(f"[YouTube] Could not resolve '{query}' to a video ({exc}); opening the search.")
     raw = youtube_tool.search_and_play(query)
-    return ToolResult(ok=True, summary=f"Playing '{query}' on YouTube.", data=raw)
+    return ToolResult(
+        ok=True,
+        summary=f"I couldn't reach YouTube's search, so I've opened the results for "
+                f"'{query}' - say \"play the first one\" and I'll start it.",
+        data=raw,
+    )
 
 
 def registered_categories() -> List[str]:

@@ -121,12 +121,71 @@ describe('ResourcePanel', () => {
     await waitFor(() => expect(screen.getByText(/tray is not running/)).toBeInTheDocument());
   });
 
+  it('names the rung Dexter is thinking on and why it is not the better one', async () => {
+    mockResources = {
+      ...connectedResources,
+      ladder: {
+        model: 'qwen2.5:7b',
+        provider: 'ollama',
+        steppedDownFrom: 'gemma-4-12b',
+        blockers: [{ process: 'BuzzEdit', vram_mib: 9216 }],
+      },
+    };
+    render(<ResourcePanel />);
+    await waitFor(() => expect(screen.getByText(/Thinking on/)).toBeInTheDocument());
+    expect(screen.getByText('qwen2.5:7b')).toBeInTheDocument();
+    expect(screen.getByText(/stepped down from gemma-4-12b/)).toBeInTheDocument();
+    expect(screen.getByText(/BuzzEdit has the card/)).toBeInTheDocument();
+  });
+
+  it('shows no rung line at all before the first escalated turn', async () => {
+    render(<ResourcePanel />);
+    await waitFor(() => expect(screen.getByText('VRAM')).toBeInTheDocument());
+    expect(screen.queryByText(/Thinking on/)).toBeNull();
+  });
+
   it('offers only the moves Sentinel allows, as the phrases Dexter understands', async () => {
     render(<ResourcePanel />);
     await waitFor(() => expect(screen.getByText('Pause batch')).toBeInTheDocument());
     expect(screen.queryByText(/kill/i)).toBeNull();
     fireEvent.click(screen.getByText('Safe clean'));
     await waitFor(() => expect(phrases).toEqual(['clean up space']));
+  });
+
+  // v13, P3.5: a model can be on the card, in system memory, or split across
+  // both, and the difference is about five times the speed. A list of names and
+  // gigabytes could not tell the owner why an answer was crawling.
+  it('says where each resident model actually is', async () => {
+    mockResources = {
+      ...connectedResources,
+      models: {
+        loaded: [
+          { name: 'qwen3.5:4b', sizeMb: 3000, vramMb: 0, onGpu: false, place: 'cpu' },
+          { name: 'qwen2.5:7b', sizeMb: 5000, vramMb: 5000, onGpu: true, place: 'gpu' },
+          { name: 'gemma-4-12b', sizeMb: 8000, vramMb: 2000, onGpu: false, place: 'split' },
+        ],
+        ours: [],
+      },
+    };
+    render(<ResourcePanel />);
+    await waitFor(() => expect(screen.getByText(/qwen3.5:4b 2.9 GB \(CPU\)/)).toBeInTheDocument());
+    expect(screen.getByText(/qwen2.5:7b 4.9 GB \(GPU\)/)).toBeInTheDocument();
+    expect(screen.getByText(/gemma-4-12b 2.0 GB \(split\)/)).toBeInTheDocument();
+  });
+
+  it('names system memory as the reason an escalated turn is slow', async () => {
+    mockResources = {
+      ...connectedResources,
+      ladder: {
+        model: 'qwen2.5:7b',
+        provider: 'ollama',
+        steppedDownFrom: null,
+        place: 'cpu',
+        blockers: [],
+      },
+    };
+    render(<ResourcePanel />);
+    await waitFor(() => expect(screen.getByText(/in system memory/)).toBeInTheDocument());
   });
 });
 

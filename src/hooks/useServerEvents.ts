@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { addReminder, cancelTask, confirmTask, eventsUrl, getTasks } from '../api';
+import { addReminder, cancelTask, confirmTask, CLIENT_ID, eventsUrl, getTasks } from '../api';
 import type { BgTask, ReminderBanner } from '../types';
 
 interface EventDeps {
@@ -13,6 +13,9 @@ interface EventDeps {
   onResources?: () => void;
   // v10: something worth saying out loud arrived (a reminder, a check-in).
   onSpeak?: (text: string, emotion: string | undefined, isReminder: boolean) => void;
+  // A turn completed on another device on this session (phone ↔ PC) → append it
+  // to the chat feed here.
+  onChatTurn?: (payload: { user?: string; reply?: string; action?: string; quickReplies?: string[] }) => void;
 }
 
 // A notice about the machine that persists until it is read: the GPU being too
@@ -29,7 +32,7 @@ export interface MachineNotice {
 // - plus the reminder banners and background-task tray it feeds. Reconnects on
 // error (roadmap Phase 6, item 17). The listeners are registered once, so they
 // dispatch through a ref that always holds the current-render callbacks.
-export function useServerEvents({ refreshPlanner, refreshBuzzcaf, onCompanion, onResources, onSpeak }: EventDeps) {
+export function useServerEvents({ refreshPlanner, refreshBuzzcaf, onCompanion, onResources, onSpeak, onChatTurn }: EventDeps) {
   const [reminders, setReminders] = useState<ReminderBanner[]>([]);
   const [bgTasks, setBgTasks] = useState<BgTask[]>([]);
   const [connected, setConnected] = useState(false);
@@ -37,8 +40,8 @@ export function useServerEvents({ refreshPlanner, refreshBuzzcaf, onCompanion, o
   // Bumped on every `resources` frame so the panels refetch instead of polling harder.
   const [resourceTick, setResourceTick] = useState(0);
 
-  const depsRef = useRef({ refreshPlanner, refreshBuzzcaf, onCompanion, onResources, onSpeak });
-  depsRef.current = { refreshPlanner, refreshBuzzcaf, onCompanion, onResources, onSpeak };
+  const depsRef = useRef({ refreshPlanner, refreshBuzzcaf, onCompanion, onResources, onSpeak, onChatTurn });
+  depsRef.current = { refreshPlanner, refreshBuzzcaf, onCompanion, onResources, onSpeak, onChatTurn };
 
   const dismissNotice = (id: string) => setNotices((prev) => prev.filter((n) => n.id !== id));
 
@@ -196,6 +199,16 @@ export function useServerEvents({ refreshPlanner, refreshBuzzcaf, onCompanion, o
           depsRef.current.refreshPlanner();
         } catch (e) {
           console.warn('Malformed companion event', e);
+        }
+      });
+
+      source.addEventListener('chat_turn', (evt: MessageEvent) => {
+        try {
+          const { payload } = JSON.parse(evt.data);
+          if (!payload || payload.origin === CLIENT_ID) return; // our own turn
+          depsRef.current.onChatTurn?.(payload);
+        } catch (e) {
+          console.warn('Malformed chat_turn event', e);
         }
       });
 

@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { Maximize2, Send, Settings as SettingsIcon, X } from 'lucide-react';
+import { Hand, Maximize2, Send, Settings as SettingsIcon, Square, Volume2, VolumeX, X } from 'lucide-react';
 import { useChat } from './hooks/useChat';
 import { useVoice } from './hooks/useVoice';
 import { useServerEvents } from './hooks/useServerEvents';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
+import { useHandMouse } from './hooks/useHandMouse';
+import { liveLine } from './components/HandMousePanel';
 import { MicButton, VoiceHint } from './components/VoiceControl';
 import PopupSettings from './components/PopupSettings';
 
@@ -12,7 +14,10 @@ import PopupSettings from './components/PopupSettings';
 type ShellApi = {
   show_popup?: () => Promise<unknown>;
   hide_popup?: () => Promise<unknown>;
+  // Returns false when the shell could not bring the window up, so the button
+  // can say so instead of looking broken (v13.2).
   open_full?: () => Promise<unknown>;
+  maximize_full?: () => Promise<unknown>;
 };
 const shell = (): ShellApi => ((window as any).pywebview?.api as ShellApi) || {};
 
@@ -31,6 +36,7 @@ export default function Popup() {
   // v11.1: the mic and the model can be changed here, not only in the full window.
   const [showSettings, setShowSettings] = useState(false);
   const online = useOnlineStatus();
+  const hand = useHandMouse();
 
   // Voice (v10): the pop-up is the window that is usually up, so it listens
   // too. The backend gives the mic to whichever window was shown last.
@@ -86,11 +92,18 @@ export default function Popup() {
   // the input whenever the window comes forward.
   const voiceRef = useRef(voice);
   voiceRef.current = voice;
+  const chatRef = useRef(chat);
+  chatRef.current = chat;
   const showSettingsRef = useRef(showSettings);
   showSettingsRef.current = showSettings;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && voiceRef.current.state !== 'speaking') {
+      if (e.key === 'Escape') {
+        if (chatRef.current.isBusy || voiceRef.current.state === 'speaking') {
+          e.preventDefault();
+          chatRef.current.cancelTurn();
+          return;
+        }
         // Esc closes the settings first; a second Esc hides the pop-up.
         if (showSettingsRef.current) setShowSettings(false);
         else shell().hide_popup?.();
@@ -137,6 +150,11 @@ export default function Popup() {
   const you = youIdx >= 0 ? log[youIdx] : undefined;
   const youIsNewer = you && (lastDexterIdx < 0 || youIdx > lastDexterIdx);
 
+  // What Dexter heard, shown the instant it is recognised - before the chat
+  // log gains the matching entry. Once the log's own "you" line says the same
+  // thing, that line takes over and this one steps aside.
+  const heardPending = Boolean(voice.heard) && voice.heard !== you?.text;
+
   const state = !online
     ? 'offline'
     : chat.isThinking
@@ -155,6 +173,32 @@ export default function Popup() {
         <span className={`dexter-status-dot${!online ? ' off' : chat.isThinking ? ' busy' : ''}`} />
         <span className="title">Dexter</span>
         <span className="state">{state}</span>
+        {/* v13.6: the hand mouse, when it is on. The pop-up is the window that is
+            always to hand, and something quietly driving the pointer has to be
+            visible - and stoppable - from it. */}
+        {hand.status?.running && (
+          <button
+            type="button"
+            title={`${liveLine(hand.status)} - click to stop`}
+            aria-label="Stop the hand mouse"
+            style={{ color: hand.status.seeingHand ? 'var(--success)' : 'var(--warn)' }}
+            onClick={() => hand.stop()}
+          >
+            <Hand size={14} />
+          </button>
+        )}
+        {/* v13: mute from the pop-up. This silences Dexter's *voice* and leaves
+            the mic alone - the common case is "stop talking" while a call or a
+            recording is going, not "stop listening" (that is the mic button). */}
+        <button
+          type="button"
+          title={voice.silent ? 'Unmute Dexter (it will speak again)' : 'Mute Dexter (it keeps listening)'}
+          aria-label={voice.silent ? 'Unmute Dexter' : 'Mute Dexter'}
+          aria-pressed={voice.silent}
+          onClick={() => voice.toggleSilent()}
+        >
+          {voice.silent ? <VolumeX size={14} /> : <Volume2 size={14} />}
+        </button>
         <button
           type="button"
           title="Microphone and model"
@@ -164,7 +208,35 @@ export default function Popup() {
         >
           <SettingsIcon size={14} />
         </button>
-        <button type="button" title="Open Dexter" onClick={() => shell().open_full?.()}>
+        <button
+          type="button"
+          title="Open the main Dexter window"
+          aria-label="Open the main Dexter window"
+          onClick={async () => {
+            // v13.2: the shell now raises the window and tucks the pop-up away.
+            // If it cannot (no shell, or Windows refused the foreground), say so -
+            // silence here reads as a dead button, which is how this was reported.
+            const api = shell();
+            if (!api.open_full) {
+              pushRef.current(
+                'I can only open the main window from the desktop shell. Use the tray icon.',
+                'companion',
+              );
+              return;
+            }
+            try {
+              const ok = await api.open_full();
+              if (ok === false) {
+                pushRef.current(
+                  "I couldn't bring the main window forward. Try the tray icon (near the clock).",
+                  'companion',
+                );
+              }
+            } catch {
+              pushRef.current('The main window did not answer. Try the tray icon.', 'companion');
+            }
+          }}
+        >
           <Maximize2 size={14} />
         </button>
         <button type="button" title="Hide (Esc)" onClick={() => shell().hide_popup?.()}>
@@ -215,11 +287,16 @@ export default function Popup() {
           </div>
         )}
 
-        {you && (youIsNewer || last) && (
-          <div className="dexter-popup-you">
-            {you.via === 'voice' ? 'You said: ' : 'You: '}
-            {you.text}
-          </div>
+        {heardPending ? (
+          <div className="dexter-popup-you">You said: {voice.heard}</div>
+        ) : (
+          you &&
+          (youIsNewer || last) && (
+            <div className="dexter-popup-you">
+              {you.via === 'voice' ? 'You said: ' : 'You: '}
+              {you.text}
+            </div>
+          )
         )}
 
         {youIsNewer && chat.isThinking ? (
@@ -246,7 +323,14 @@ export default function Popup() {
           placeholder={voice.state !== 'off' && voice.state !== 'unavailable' ? `Say “${voice.wakeWord}” or type...` : 'Ask or tell Dexter...'}
           value={chat.inputMsg}
           onChange={(e) => chat.setInputMsg(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && send()}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              send();
+            } else if (e.key === 'Escape' && (chat.isBusy || voice.state === 'speaking')) {
+              e.preventDefault();
+              chat.cancelTurn();
+            }
+          }}
         />
         <MicButton
           state={voice.state}
@@ -254,9 +338,24 @@ export default function Popup() {
           size={32}
           onPress={voice.state === 'speaking' ? () => voice.stopSpeaking(true) : voice.talkNow}
         />
-        <button type="button" onClick={() => send()} title="Send">
-          <Send size={15} />
-        </button>
+        {chat.isBusy || voice.state === 'speaking' ? (
+          <button
+            type="button"
+            onClick={() => chat.cancelTurn()}
+            title="Stop (Esc)"
+            style={{
+              background: '#ef4444',
+              color: '#ffffff',
+              cursor: 'pointer',
+            }}
+          >
+            <Square size={14} fill="currentColor" />
+          </button>
+        ) : (
+          <button type="button" onClick={() => send()} title="Send">
+            <Send size={15} />
+          </button>
+        )}
       </div>
       <div style={{ padding: '0 10px 6px' }}>
         <VoiceHint state={voice.state} hint={voice.hint} level={voice.level} wakeMode={voice.wakeMode} onWakeMode={voice.setWakeMode} />

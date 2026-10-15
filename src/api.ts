@@ -17,6 +17,7 @@ import type {
   BuzzcafState,
   DexterStatus,
   FileResult,
+  HandMouseStatus,
   SettingRow,
   SettingsUpdateResult,
   SkillItem,
@@ -26,7 +27,22 @@ import type {
  MissionStatus,
   ResourceSnapshot,
   AppRow,
+  ScheduleItem,
+  ScheduleAction,
+  PairCodeInfo,
+  PairedDevice,
   ToolReply } from './types';
+
+// A stable id for this page/tab, generated once per load. Sent on every chat
+// turn so the SSE `chat_turn` mirror can skip the device that originated the
+// turn (it already rendered it) while every other open device appends it.
+export const CLIENT_ID: string = (() => {
+  try {
+    return crypto.randomUUID();
+  } catch {
+    return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+})();
 
 function resolveApiBase(): string {
   // Served by the backend itself - the pywebview window, and anything that
@@ -50,7 +66,52 @@ const DEXTER = `${API_BASE}/api/dexter`;
 let token: string | null = null;
 let tokenPromise: Promise<string | null> | null = null;
 
+// A paired phone keeps its long-lived device token here; a PC shell fetches the
+// shared session token instead. localStorage can be absent/blocked, so every
+// access is guarded.
+const DEVICE_TOKEN_KEY = 'dexter.deviceToken';
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '']);
+
+/** Are we one of the PC's own shells? Only those may fetch the shared token. */
+export function isLocalShell(): boolean {
+  try {
+    return LOOPBACK_HOSTS.has((window.location?.hostname || '').toLowerCase());
+  } catch {
+    return true;
+  }
+}
+
+function readDeviceToken(): string | null {
+  try {
+    return window.localStorage.getItem(DEVICE_TOKEN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export function storeDeviceToken(value: string | null): void {
+  try {
+    if (value) window.localStorage.setItem(DEVICE_TOKEN_KEY, value);
+    else window.localStorage.removeItem(DEVICE_TOKEN_KEY);
+  } catch {
+    /* private mode - keep it in memory only */
+  }
+  token = value;
+}
+
+/** A remote device with no paired token yet: the app shows the pairing screen
+ *  rather than failing every call with 401. */
+export function needsPairing(): boolean {
+  return !isLocalShell() && !readDeviceToken();
+}
+
 async function fetchToken(): Promise<string | null> {
+  // Off-box: never hit /auth/token (the backend refuses it), use the stored
+  // device token straight from pairing.
+  if (!isLocalShell()) {
+    token = readDeviceToken();
+    return token;
+  }
   try {
     const res = await fetch(`${DEXTER}/auth/token`);
     if (res.ok) {
@@ -65,6 +126,11 @@ async function fetchToken(): Promise<string | null> {
 
 function ensureToken(): Promise<string | null> {
   if (token) return Promise.resolve(token);
+  const stored = !isLocalShell() ? readDeviceToken() : null;
+  if (stored) {
+    token = stored;
+    return Promise.resolve(stored);
+  }
   if (!tokenPromise) {
     tokenPromise = fetchToken().finally(() => {
       tokenPromise = null;
@@ -196,6 +262,53 @@ export const confirmTask = (taskId: string, approve: boolean) =>
   post(`/tasks/${taskId}/confirm`, { approve });
 export const cancelTask = (taskId: string) => post(`/tasks/${taskId}/cancel`);
 
+// ─────────────────────── device pairing (mobile) ───────────────────────
+
+/** Minted on the PC (loopback only) to show a QR the phone scans. */
+export const mintPairingCode = () => postJson<PairCodeInfo>('/pair/code');
+
+/** Redeem a pairing code from the phone; stores the returned device token. */
+export async function redeemPairing(code: string, name?: string): Promise<{ token: string; id: string }> {
+  // /pair/redeem is token-exempt, so call fetch directly - apiFetch would try to
+  // attach a token we do not have yet.
+  const res = await fetch(`${DEXTER}/pair/redeem`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ code: (code || '').trim().toUpperCase(), name: name || 'phone' }),
+  });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error((detail as { detail?: string }).detail || 'Pairing failed.');
+  }
+  const data = (await res.json()) as { token: string; id: string };
+  storeDeviceToken(data.token);
+  return data;
+}
+
+export const listDevices = () => getJson<{ devices: PairedDevice[] }>('/devices');
+export const revokeDevice = (id: string) =>
+  apiFetch(`${DEXTER}/devices/${id}`, { method: 'DELETE' }).then((r) => r.json());
+
+// ─────────────────────────── scheduler ───────────────────────────
+
+export const getSchedule = () =>
+  getJson<{ items: ScheduleItem[]; scheduler: Record<string, unknown> }>('/schedule');
+
+export const createSchedule = (action: ScheduleAction, when: string) =>
+  postJson<{ ok: boolean; when?: string; id?: string; error?: string }>('/schedule', { action, when });
+
+export const updateSchedule = (id: string, body: { action?: ScheduleAction; when?: string }) =>
+  apiFetch(`${DEXTER}/schedule/${id}`, {
+    method: 'PUT',
+    headers: jsonHeaders,
+    body: JSON.stringify(body),
+  }).then((r) => r.json());
+
+export const deleteSchedule = (id: string) =>
+  apiFetch(`${DEXTER}/schedule/${id}`, { method: 'DELETE' }).then((r) => r.json());
+
+export const runScheduleNow = (id: string) => post(`/schedule/${id}/run`);
+
 // ───────────────────────── reminders ───────────────────────────
 
 export const addReminder = (text: string, when: string) =>
@@ -218,6 +331,32 @@ export interface LlmModelsResponse {
 // Which providers are up and what models each exposes - drives the UI picker.
 export const getModels = () => getJson<LlmModelsResponse>('/llm/models');
 
+// Token accounting: every model call's prompt/completion tokens, all-time and
+// this session, per provider and per model (backend/token_ledger.py).
+export interface TokenUsageBucket {
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+export interface TokenUsageRow extends TokenUsageBucket {
+  name: string; // provider, or "provider/model"
+  provider?: string;
+  model?: string;
+}
+export interface TokenUsageResponse {
+  since: string;
+  sessionSince: string;
+  allTime: TokenUsageBucket;
+  session: TokenUsageBucket;
+  providers: TokenUsageRow[];
+  models: TokenUsageRow[];
+  sessionProviders: TokenUsageRow[];
+  sessionModels: TokenUsageRow[];
+}
+export const getTokenUsage = () => getJson<TokenUsageResponse>('/llm/usage');
+export const resetTokenUsage = () => postJson<TokenUsageResponse>('/llm/usage/reset');
+
 // ─────────────────────── streaming chat ────────────────────────
 
 // Returns the raw streaming Response; the caller decodes the SSE body itself so
@@ -236,12 +375,15 @@ export function chatStream(
   provider: string = 'auto',
   model: string | null = null,
   options: ChatStreamOptions = {},
+  signal?: AbortSignal,
 ): Promise<Response> {
   return apiFetch(`${DEXTER}/chat/stream`, {
     method: 'POST',
     headers: jsonHeaders,
+    signal,
     body: JSON.stringify({
       message,
+      origin: CLIENT_ID,
       provider: provider || 'auto',
       model: model || null,
       voiceEnabled: Boolean(options.speak),
@@ -277,8 +419,20 @@ export async function generateTts(text: string, emotion: string | undefined, isR
 // Absolute URL for a streamed audio clip (the backend returns a relative path).
 export const audioUrl = (url: string) => (url.startsWith('http') ? url : `${API_BASE}${url}`);
 
+// Publish the voice state (one of idle|listening|thinking|speaking) to the bus
+// files the ai-visualizer face polls. Fire-and-forget: the face is non-critical,
+// so a failed post must never disturb the voice loop.
+export const postVoiceBus = (state: string, samples?: number[]) =>
+  post('/voice-bus', samples && samples.length ? { state, samples } : { state });
+
 // Cut the reply that is being generated (the stop button / Esc).
 export const voiceInterrupt = (session = 'default') => post('/voice/interrupt', { session });
+// Mic off/on for the whole session. Independent of the audio socket on purpose:
+// muting a window closes its socket, and the backend would otherwise hand the
+// mic to the other window. Setting it here mutes the session no matter which
+// window holds the mic.
+export const voiceMic = (muted: boolean, session = 'default') => post('/voice/mic', { muted, session });
+export const cancelChat = (session = 'default') => post('/chat/cancel', { session });
 
 // Who Dexter listens to (v10.2): enrolment state and the speaker settings.
 export interface VoiceProfile {
@@ -328,3 +482,21 @@ export const stopAppById = (id: string, confirm = false) =>
 // sentence. One code path for "pause batch jobs", whether tapped or typed.
 export const runPhrase = (message: string) =>
   postJson<{ reply: string; action: string }>('/chat', { message });
+
+// ───────────────────── the webcam hand mouse (v13.6) ─────────────────────
+//
+// Its own endpoint rather than a slice of /status: the panel needs the gesture
+// map and the catalogues behind it, and while tracking is on it wants a faster
+// tick than the status poll gives.
+
+export const getHandMouse = () => getJson<HandMouseStatus>('/handmouse');
+
+export const startHandMouse = (opts: { dryRun?: boolean; camera?: number } = {}) =>
+  postJson<ToolReply>('/handmouse/start', { dryRun: !!opts.dryRun, camera: opts.camera ?? null });
+
+export const stopHandMouse = () => postJson<ToolReply>('/handmouse/stop');
+
+// Changing a gesture goes through the same tool the spoken route uses, so the
+// panel and "make a fist the right click" can never disagree.
+export const bindHandGesture = (pose: string, action: string) =>
+  postJson<ToolReply>('/handmouse/bind', { pose, action });

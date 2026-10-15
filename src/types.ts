@@ -71,11 +71,25 @@ export interface BgTask {
 
 export type ChatSender = 'user' | 'dexter';
 
+// Which smart rung a turn ran on, and what pushed it down one (v12, D4).
+export interface LadderInfo {
+  model: string;
+  provider: string;
+  /** The better model Sentinel refused, or null when we got our first choice. */
+  steppedDownFrom?: string | null;
+  /** Where the rung ran (v13). "cpu" is slow but right, and worth saying so. */
+  place?: 'gpu' | 'cpu' | 'split';
+  blockers?: { client?: string; process?: string; label?: string; name?: string; vramMib?: number; vram_mib?: number }[];
+  at?: number;
+}
+
 export interface ChatMessage {
   id: string;
   sender: ChatSender;
   text: string;
   action?: string;
+  /** Set only when the reply came from the fallback rung; the UI says so once, quietly. */
+  ladder?: LadderInfo;
   // A message Dexter started (check-in, event) and the one-tap answers it offers.
   kind?: string;
   quickReplies?: string[];
@@ -154,12 +168,83 @@ export interface RuntimeHealth {
   checkedAt: number;
 }
 
+// The webcam hand mouse (v13, on the dashboard in v13.6).
+//
+// Two names for what is happening, and both matter: `pose` is the shape of the
+// hand the tracker read, `action` is what that shape is bound to. "It saw a fist
+// and deliberately did nothing" and "it never saw my hand" are different problems
+// with the same symptom, and showing only one of them is how the first version of
+// this was reported as broken.
+export interface HandPoseRow {
+  pose: string;
+  label: string;
+  hint: string;
+  action: string;
+  default: string;
+}
+
+export interface HandMouseStatus {
+  running: boolean;
+  pose: string;
+  action: string;
+  gesture: string;
+  bindings: Record<string, string>;
+  poses: HandPoseRow[];
+  actions: { action: string; label: string }[];
+  buttons: { left: boolean; right: boolean; middle: boolean };
+  // v13.8: the pointer is held still through a click so the press lands where it was
+  // aimed; past the drag distance it follows the hand again.
+  locked: boolean;
+  dragging: boolean;
+  speed: number;
+  region: number[];
+  dragThresholdPx: number;
+  confirmFrames: number;
+  fps: number;
+  camera: number | null;
+  engine: string;
+  dryRun: boolean;
+  frames: number;
+  handFrames: number;
+  seeingHand: boolean;
+  minutes: number;
+  hotkey: string;
+  ready: boolean;
+  why: string;
+  error: string;
+  // How close the camera came to seeing a hand, so "it doesn't work" has a number
+  // attached rather than a shrug.
+  palmScore: number;
+  bestScore: number;
+  palmNeeded: number;
+  preview: { enabled: boolean; open: boolean; error: string };
+}
+
+// The glanceable half, carried on the status poll for the header chip.
+export interface HandMouseSummary {
+  running: boolean;
+  pose?: string;
+  action?: string;
+  fps?: number;
+  ready?: boolean;
+  why?: string;
+  error?: string;
+  palmScore?: number;
+  palmNeeded?: number;
+  seeingHand?: boolean;
+  camera?: number | null;
+  minutes?: number;
+  dryRun?: boolean;
+  previewOpen?: boolean;
+}
+
 export interface DexterStatus {
   status: string;
   runtime?: RuntimeHealth;
   toolCount?: number;
   intentMode?: string;
   voice?: VoiceStatus;
+  handMouse?: HandMouseSummary;
 }
 
 // The workbook: goals, the commitments that serve them, and what actually
@@ -324,8 +409,17 @@ export interface ResourceSnapshot {
   frozen: FrozenProcess[];
   reservations: unknown[];
   trayAlive: boolean | null;
-  models: { loaded: { name: string; sizeMb: number; vramMb: number; onGpu: boolean }[]; ours: string[] };
+  models: {
+    loaded: {
+      name: string; sizeMb: number; vramMb: number; onGpu: boolean;
+      /** Read off Ollama's own numbers: all on the card, all in RAM, or split. */
+      place?: 'gpu' | 'cpu' | 'split';
+    }[];
+    ours: string[];
+  };
   lastShed: ShedSummary;
+  /** The rung the last escalated turn ran on. Absent until one has (v12, P3.3). */
+  ladder?: LadderInfo;
   budgets: { vramMib: number; ramMib: number; engineVramMib: number; engineRamMib: number };
 }
 
@@ -362,4 +456,60 @@ export interface ToolReply {
   ok: boolean;
   summary: string;
   data?: Record<string, unknown>;
+}
+
+// ─────────────────── the scheduler (reminders + actions) ───────────────────
+//
+// One entry can be a reminder or an *action* Dexter performs on a schedule. The
+// action's `type` decides which extra fields matter; the rest are optional so a
+// single form and a single list can cover every kind.
+export type ScheduleActionType =
+  | 'reminder'
+  | 'goal'
+  | 'command'
+  | 'app'
+  | 'workflow'
+  | 'code_task';
+
+export interface ScheduleAction {
+  type: ScheduleActionType;
+  text?: string;       // reminder
+  goal?: string;       // goal
+  command?: string;    // command
+  shell?: 'powershell' | 'cmd';
+  app?: string;        // app
+  projectId?: string;  // workflow
+  feedback?: string | null;
+  task?: string;       // code_task
+  project?: string;
+  mode?: string;
+  channels?: string[]; // reminder delivery channels
+}
+
+export interface ScheduleItem {
+  id: string;
+  kind: 'reminder' | 'action';
+  actionType: ScheduleActionType;
+  label: string;
+  action?: ScheduleAction;
+  whenText?: string | null;
+  at?: string | null;
+  cron?: Record<string, unknown> | null;
+  channels?: string[] | null;
+  lastRun?: string | null;
+}
+
+// ─────────────────── device pairing (mobile access) ───────────────────
+export interface PairCodeInfo {
+  code: string;
+  expiresIn: number;
+  url: string | null;
+  pairUrl: string | null;
+}
+
+export interface PairedDevice {
+  id: string;
+  name: string;
+  createdAt: number;
+  lastSeen: number;
 }

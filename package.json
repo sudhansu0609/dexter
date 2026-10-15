@@ -11,7 +11,25 @@
     "desktop": "concurrently -k \"vite\" \"electron .\"",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check": "python backend/preflight.py --quiet && python -m pytest backend -q && tsc --noEmit && vitest run --passWithNoTests"
+    "check": "python backend/preflight.py --quiet && python -m pytest backend -q && tsc --noEmit && vitest run --passWithNoTests",
+    "build:exe": "powershell -ExecutionPolicy Bypass -File ./build_launcher.ps1",
+    "build:installer": "powershell -ExecutionPolicy Bypass -File ./build_installer.ps1"
+  },
+  "build": {
+    "appId": "com.buzzcaf.dexter",
+    "productName": "Dexter AI Super Assistant",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon.ico"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "assets/**/*"
+    ]
   },
   "dependencies": {
     "lucide-react": "^0.294.0",

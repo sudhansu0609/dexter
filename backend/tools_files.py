@@ -32,10 +32,13 @@ except ImportError:  # pragma: no cover - depends on the install
 
 
 def _resolve_existing(path: str) -> tuple:
-    """(resolved, error) for a path that must already exist and be allowed."""
-    allowed = pathguard.resolve(path)
+    """(resolved, error) for a path that must already exist and be allowed.
+
+    The stricter `resolve_write`: every caller of this helper changes the file.
+    """
+    allowed = pathguard.resolve_write(path)
     if not allowed:
-        return None, pathguard.denial(path)
+        return None, pathguard.denial(path, write=True)
     if not os.path.exists(allowed):
         return None, f"I can't find {os.path.basename(path)}."
     return allowed, None
@@ -43,9 +46,9 @@ def _resolve_existing(path: str) -> tuple:
 
 def _resolve_destination(path: str) -> tuple:
     """(resolved, error) for a destination, which need not exist yet."""
-    allowed = pathguard.resolve(path)
+    allowed = pathguard.resolve_write(path)
     if not allowed:
-        return None, pathguard.denial(path)
+        return None, pathguard.denial(path, write=True)
     return allowed, None
 
 
@@ -238,4 +241,178 @@ def delete_file(path: str) -> ToolResult:
         summary=f"Sent {os.path.basename(source)} to the Recycle Bin. "
                 "It's recoverable from there.",
         data={"deleted": source},
+    )
+
+
+# ───────────────────────── browsing (drives and folders) ─────────────────────────
+#
+# "open c drive", "what's in D:\films", "list that folder" - the three sentences
+# that used to come back with "that's outside the folders Dexter is allowed to
+# touch". Permission is pathguard's (DEXTER_FS_SCOPE); the vocabulary that turns
+# "the C drive" into a path is folders.spoken_path.
+
+
+def _target_of(path: str) -> tuple:
+    """(resolved path, error) for a spoken folder name or a written path."""
+    import folders
+
+    text = (path or "").strip()
+    if not text:
+        return None, "Which folder?"
+    guess = folders.spoken_path(text)
+    if not guess:
+        hint = ""
+        if not os.path.isabs(text):
+            hint = " Give me the full path, or the drive letter (\"D drive\")."
+        return None, f"I couldn't find a folder called '{text}'.{hint}"
+    return guess, None
+
+
+@tool(
+    name="list_drives",
+    description=(
+        "List the drives on this PC with their labels and free space. Use for "
+        "'what drives do I have', 'how full is my D drive', 'this PC'."
+    ),
+    params={},
+    examples=[
+        "what drives do I have",
+        "list my drives",
+        "show me this pc",
+        "how much space is left on my drives",
+        "what disks are on this machine",
+        "open this pc",
+    ],
+    category="files",
+)
+def list_drives() -> ToolResult:
+    import folders
+
+    rows = folders.drives()
+    if not rows:
+        return ToolResult.fail("I couldn't read the drive list on this machine.")
+    return ToolResult(
+        ok=True,
+        summary=f"{len(rows)} drive(s): " + folders.describe_drives(rows) + ".",
+        data={"drives": rows},
+    )
+
+
+@tool(
+    name="list_folder",
+    description=(
+        "List what is inside a folder or a drive: sub-folders first, then files "
+        "with their size and date. Takes a full path, a drive ('C:'), or a spoken "
+        "name ('my downloads', 'the BuzzAnimate folder')."
+    ),
+    params={
+        "path": {"type": "string", "description": "Folder path, drive letter, or spoken name"},
+        "pattern": {"type": "string", "description": "Only names containing this", "required": False},
+        "show_hidden": {"type": "boolean", "description": "Include hidden items", "required": False},
+        "limit": {"type": "integer", "description": "How many entries (default 60)", "required": False},
+    },
+    examples=[
+        "what's in my downloads folder",
+        r"list the files in C:\Users",
+        "show me what's on the D drive",
+        r"list the folders in B:\youtubeProjects",
+        "what files are in that folder",
+        "show me the contents of my desktop",
+        "what's inside the BuzzAnimate folder",
+    ],
+    category="files",
+)
+def list_folder(
+    path: str,
+    pattern: Optional[str] = None,
+    show_hidden: bool = False,
+    limit: int = 60,
+) -> ToolResult:
+    import folders
+
+    target, error = _target_of(path)
+    if error:
+        return ToolResult.fail(error)
+    result = folders.list_folder(target, limit=int(limit or 60),
+                                 show_hidden=bool(show_hidden), pattern=pattern)
+    if not result.get("ok"):
+        # A file was named where a folder was expected: say what it is instead.
+        if result.get("isFile"):
+            return ToolResult(ok=True, summary=result["error"], data=result)
+        return ToolResult.fail(result["error"], **result)
+    return ToolResult(ok=True, summary=folders.describe_listing(result), data=result)
+
+
+@tool(
+    name="open_folder",
+    description=(
+        "Open a folder, a drive or a file in File Explorer so the user can see it. "
+        "Takes a full path, a drive ('C:'), or a spoken name ('my downloads')."
+    ),
+    params={
+        "path": {"type": "string", "description": "Folder path, drive letter, or spoken name"},
+        "select": {"type": "boolean", "description": "Open the parent with this item selected",
+                   "required": False},
+    },
+    examples=[
+        "open the c drive",
+        "open my downloads folder",
+        r"open d:\films in explorer",
+        "show me that folder",
+        "open the BuzzAnimate folder",
+        "open file explorer at my documents",
+        "show that file in explorer",
+    ],
+    category="files",
+)
+def open_folder(path: str, select: bool = False) -> ToolResult:
+    import folders
+
+    if folders.is_this_pc(path):
+        try:
+            os.startfile("shell:MyComputerFolder")  # noqa: S606 - a shell constant
+            rows = folders.drives()
+            return ToolResult(ok=True, summary="Opened This PC. " + folders.describe_drives(rows) + ".",
+                              data={"drives": rows})
+        except Exception as exc:
+            return ToolResult.fail(f"I couldn't open This PC: {exc}")
+    target, error = _target_of(path)
+    if error:
+        return ToolResult.fail(error)
+    result = folders.open_in_explorer(target, select=bool(select))
+    if not result.get("ok"):
+        return ToolResult.fail(result["error"], **result)
+    return ToolResult(ok=True, summary=result["message"], data=result)
+
+
+@tool(
+    name="find_folder",
+    description=(
+        "Find where a folder is by its name, when the full path isn't known. "
+        "Searches the user's folders and their projects."
+    ),
+    params={"name": {"type": "string", "description": "The folder's name, e.g. 'films'"}},
+    examples=[
+        "where is my films folder",
+        "find the folder called invoices",
+        "which folder is the renders in",
+        "locate the assets folder",
+    ],
+    category="files",
+)
+def find_folder(name: str) -> ToolResult:
+    import folders
+
+    hits = folders.find_folder(name)
+    if not hits:
+        return ToolResult.fail(
+            f"I couldn't find a folder called '{name}' in your usual places. "
+            "Give me the full path and I'll open it."
+        )
+    if len(hits) == 1:
+        return ToolResult(ok=True, summary=f"{name}: {hits[0]}", data={"paths": hits})
+    return ToolResult(
+        ok=True,
+        summary=f"{len(hits)} folders called '{name}': " + "; ".join(hits),
+        data={"paths": hits},
     )

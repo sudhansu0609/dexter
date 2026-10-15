@@ -4,6 +4,1392 @@ Running record of what has actually landed, newest first. Plan: [`PLAN.md`](PLAN
 Every row is either **done** (with the evidence that proves it) or **open**.
 Nothing is marked done on intent.
 
+## 2026-10-15 — MastGaane is Dexter's music
+
+The owner asked for MastGaane inside Dexter. (An Alexa skill route was built and then removed the
+same day: Dexter controls the home devices directly, so Alexa is not needed and nothing is public.)
+
+- `tools_music.py`: `mastgaane_play(focus)` ("play some ghazals", "play Hawa Mahal", "play songs by
+  Jagjit Singh", bare "play some music") and `mastgaane_feedback` ("I like this song", "never play
+  this again"), over MastGaane's new `/api/player/*` (its jockey on the PC speakers via ffplay).
+  MastGaane is found by `live_port` and started through `open_app` if needed. `media_control` /
+  `get_now_playing` hand over to MastGaane while it plays (ffplay never reaches the media keys).
+  Fast rules in `router.py` ahead of the rest; "play some lofi music" / "put on some jazz" stay
+  `play_on_youtube`.
+
+**Evidence.** `test_tools_music.py` 20 passed. Full backend suite: 12 failures, the same 12 fail
+with the music rules stripped out (pre-existing). Live, Dexter's tools against MastGaane on 8788:
+"play hawa mahal" → episode playing, pause / resume / stop via `media_control`.
+**Open:** Dexter restart to load the tools.
+
+## v13.9.1 (2026-09-12) — The same screen is not read twice
+
+The one caveat left open by v13.9: *"reading the screen costs 2-3 s per look and isn't
+cached, so picking text is deliberate rather than instant."* It is cached now, and the
+interesting part is what a frame hash alone turned out **not** to fix.
+
+### A frame hash works, and almost never fires
+
+Every reading is filed under a blake2b fingerprint of the pixels it read - 5.5 ms at
+1080p, 22 ms at 4K, against seconds of OCR. Identical frame, identical answer:
+
+| | |
+|---|---|
+| first read, both monitors (3840×1080, 178 boxes) | **11.9 s** |
+| the same frame again | **0.012 s** |
+| a fresh capture of the same desktop | **10.4 s — cache missed** |
+
+That third row is the finding. A real desktop is never byte-for-byte the same twice: a
+clock ticks, a caret blinks, an FPS counter counts. Measured over four captures 0.6 s
+apart, **0.03-0.07% of pixels changed every time** - 13 tiles of 384, scattered widely
+enough that re-reading "the changed region" would mean re-reading half the screen. A
+cache that only fires on an identical frame would therefore have missed on almost every
+real repeat pick, which is exactly the case it was built for.
+
+### So the unit of proof is the word, not the frame
+
+In that same measurement, **206 of 210 words sat on pixels that had not changed at
+all**. So a click proves the smaller and far more useful thing: the pixels *under the
+word asked for*. If they are unchanged, that word is still drawn there - nothing
+scrolled it away and nothing is covering it, because either would have changed them.
+Each reading therefore stores a fingerprint per word as well as per frame.
+
+Live, on the owner's desktop, 1.2 s after a full read:
+
+| | |
+|---|---|
+| first read of both monitors | **9.8 s** |
+| `recall("Example Domains")` → clickable position | **2.9 ms** |
+| `recall("BuzzAnimate")` | **2.2 ms** |
+| `recall("FPS60GPU36%CPU12%")` | **refused** — its own pixels had changed, so it bought a real read |
+
+That last row is the safety property working out loud, and it is the reason this is a
+recall rather than a guess. Absence from a remembered reading proves nothing either -
+the word may have appeared since - so a miss always buys a full read.
+
+### What it cost
+
+`backend/screen_text.py` gains the frame cache (`DEXTER_SCREEN_CACHE`, TTL 120 s, six
+frames), per-word fingerprints, and `recall()`; `click()` now captures once and tries
+the recall before paying for OCR. `read_screen` - "what does this say" - still pays in
+full unless the frame is identical: there is nothing to prove a word by when every word
+is wanted. The reply says which route it took ("still exactly where I last saw it")
+so the speed is never mysterious. 34 tests in `test_screen_text.py`, 1618 backend green
+(the two `test_buzzcaf_ports.py` failures are the same pre-existing drift in the sibling
+repo).
+
+## v13.9 (2026-09-12) — Better tracking, the right Chrome, clicking words, every project, and "stop"
+
+Five asks in one sitting, and three of them turned on a measurement rather than an opinion.
+
+### "Improve the hand tracking"
+
+Measured first, on the owner's own webcam:
+
+| | |
+|---|---|
+| palm detection | 5.7 ms per frame |
+| landmark model | 3.1 ms per frame |
+| camera, DirectShow 640×480 | **16.6 fps** |
+| camera, Media Foundation 640×360 | **30.3 fps** (30.2 / 30.3 / 30.3 across three trials) |
+
+**The models were never the problem.** Nine milliseconds of work was waiting sixty for a
+frame. So:
+
+1. **Twice the frames.** Media Foundation at 640×360 is this camera's native 16:9 mode -
+   same horizontal detail as 640×480, double the rate. Frames are the currency of
+   everything else: smoothing, debouncing, and motion blur per frame.
+2. **The landmarks are filtered before anything reads them.** This was the real gap -
+   *every* pose decision (finger out, pinch width, thumb reach) was computed from
+   coordinates that jitter a pixel or two per frame, so a hand held still could flicker
+   between poses. A one-euro filter now sits under all of it, **tuned by measurement**
+   because the published defaults assume metres and these are fractions of a frame:
+
+   | | still | slow move | fast move |
+   |---|---|---|---|
+   | unfiltered | 7.6 px error / 10.8 jitter | 7.6 / 11.0 | 7.6 / 12.4 |
+   | 1.2 Hz, β=8 | 2.8 / 1.8 | 5.3 / 2.9 | 8.9 / 6.2 |
+   | **1.2 Hz, β=30** | **3.3 / 2.3** | **4.4 / 3.5** | **5.7 / 6.5** |
+   | 1.2 Hz, β=60 | 3.9 / 2.8 | 4.5 / 4.1 | 5.3 / 7.0 |
+
+   β=30 is the knee: **more accurate than no filter at every speed**, with half the
+   jitter. β=0.35 (my first guess) bought stillness with lag.
+3. **A finger is "out" by the angle at its joint**, not by how far its tip is from the
+   wrist. The old measure fails on a hand tilted towards the camera, where foreshortening
+   shrinks every distance equally - and it has a dead band now, so a finger resting at the
+   threshold stops turning two fingers into three and back.
+
+### "Open a website in the Chrome I open, not a different one"
+
+My fault, from v13.4. Dexter's debuggable Chrome is a separate browser on its own profile,
+and nothing told the rest of the code that: `chrome_windows()` counted it as the owner's,
+so "open youtube" could bring *Dexter's* browser forward and everything after it pointed
+at a window they were not using. It is now identified by its profile on the command line
+and excluded from "the Chrome you use", and `precise()` demotes itself to the
+accessibility route whenever the browser in front is the owner's. Nothing to configure:
+whichever browser is in play decides.
+
+### "Click on a text on the browser or screen without the precise browser"
+
+Measured, because the obvious answer kept failing:
+
+| route | what it saw of the page |
+|---|---|
+| UIA on the Chrome window | 35 controls - Minimize, Back, Reload, Bookmark, the profile button - **nothing from the page** |
+| after the documented `WM_GETOBJECT` poke | unchanged (Chrome answered; the tree stayed empty) |
+| walking the render widget directly | 0 named nodes |
+| MSAA through `oleacc` | 0 named nodes |
+| the system screen-reader flag | already on, and still nothing |
+
+**Modern Chrome does not publish page content to Windows accessibility at all** unless it
+was started with `--force-renderer-accessibility`. That is the whole reason "select the
+first profile" and "click the text X" failed - and the profile picker is itself a page.
+
+So Dexter reads the screen. `screen_text.py` captures the window, OCRs it with
+`rapidocr_onnxruntime` (already installed, offline, ONNX), and clicks the words. Verified
+live: **27 pieces of text from a Chrome window in 2.2 s, "Learn more" found at score 1.0,
+clicked, and the tab navigated.** Full resolution turned out to be both faster *and* more
+accurate than downscaling - the detector resizes internally anyway, and shrinking first
+turns "BuzzAnimate" into "BursAnirute".
+
+Three things fell out of building it:
+
+* **`SetForegroundWindow` does not work** from a background process - plain calls and
+  `ShowWindow(SW_RESTORE)` both changed nothing, while minimize-then-restore won the
+  foreground first time. A window that is not in front cannot be photographed, and a
+  capture of the region would otherwise be a picture of the desktop - which is exactly
+  what the first attempt produced.
+* **`PrintWindow` comes back blank** for GPU-composited Chrome, so the window has to be
+  raised rather than captured in place.
+* The fallback is wired into what already exists rather than bolted on beside it:
+  `chrome_control.click` tries the accessible name first and reads the screen second,
+  `select_nth` falls back to reading the screen, and so does "is there a video called X".
+  Plain "click sign in" therefore keeps its instant path and gains a slow one.
+
+### "Launch all my projects by name"
+
+Twenty-one folders next to Dexter, sixteen with a launcher, named however they were named:
+`BuzzAnimate.bat`, `start_buzzcafai.bat`, `START_APP.bat`, `run.bat`, `start.cmd`. Finding
+the project is fuzzy ("mission reminder" reaches a folder spelled `missionRemider`);
+finding the *launcher* is a judgement, because the folders also hold `stop_app.bat`,
+`setup.bat`, `launch_debug.bat`, `make-installer.bat` and `uninstall`. Scripts are scored:
+the project's own name and start/launch/run earn points, teardown and build words lose
+them heavily. **Twelve projects come out startable, and four are named instead of guessed
+at** - BuzzCode, BuzzWorlds, MastGaane and Sentinel have only build scripts, and running
+one of those on "open" is not a small mistake. The twelve in `apps_registry` still go
+through their own route, so Sentinel is still asked for memory before a render starts.
+
+### "I can't interrupt it mid-sentence"
+
+The word already worked - "stop" has cut a reply since v10 - but the microphone was ignored
+*entirely* while Dexter spoke, so it never arrived. Full barge-in was the only alternative
+and it is off for a good reason: it fires on any sound, including Dexter's own voice coming
+back through the speakers, which is the echo loop that cost an evening in v10.
+
+Now the mic stays open while Dexter talks and what it hears may be **one thing only**: a
+control phrase. Everything else from that window is dropped unheard. That is what makes it
+safe where barge-in is not - Dexter's own voice transcribes to the words of its own reply,
+and those are not control phrases, so **the echo loop is unreachable rather than
+unlikely**. Say "stop", "be quiet" or "never mind" over a reply and it stops. Full barge-in
+remains one setting away for headphones.
+
+### Also
+
+Two test flakes fixed rather than re-run: `test_activity` asserted "30 min" where a clock
+tick makes it 29, and `test_claude_sessions` seeded a session "three hours ago" - which at
+00:24 is *yesterday*. And three ordering regressions of my own, all caught by existing
+tests: a generic "is X open" rule stealing `local_model_status`, a screen-reading rule
+stealing "what's on my screen" from `get_active_window` and "read this page" from
+`browser_read_page`, and a new click rule stealing "click sign in" from `browser_click`.
+The fast path rewards specificity, and a catch-all belongs last.
+
+Evidence: 15 cases in `backend/test_hand_tracking.py`, 20 in `test_screen_text.py`, 24 in
+`test_project_launcher.py`, 6 new voice-interrupt cases, and conftest guards so no test can
+photograph the owner's screen, move their mouse, or mistake a real Chrome for Dexter's.
+Suite: **1604 backend passing**, the same 2 pre-existing drift failures; **42 frontend**;
+bundle rebuilt.
+
+## v13.8 (2026-09-12) — A pointer you can aim, a click that lands, and answers instead of lists
+
+Three asks in one sitting.
+
+### "Can we control the speed of the hand mouse pointer?"
+
+Yes — and it is worth saying what "speed" even means here, because the pointer is
+**absolute**: a rectangle of the camera image maps onto the whole screen, so your hand
+has a *place* rather than a velocity. Speed is therefore the **size of that
+rectangle**, scaled about its centre: above 1 it shrinks, so less hand movement
+crosses the screen (faster, twitchier); below 1 it grows (slower, far easier to aim).
+Clamped to 0.5–2.5, and never allowed to hang off the edge of the frame, because then
+the far side of the screen would need a hand that has left the picture.
+
+Three ways to set it, all live while tracking: a **slider on the dashboard panel**,
+Settings → Hand mouse, or out loud — *"make the hand mouse slower"*, *"the hand
+pointer is too fast"*, *"set the hand speed to 1.5"*. The spoken route matters more
+than it looks: **when the pointer is too fast, reaching the slider that fixes it is
+precisely the thing you cannot do.**
+
+### "Clicking seems difficult as it is unstable"
+
+Three separate things were fighting the owner's hand, and all three are now fixed:
+
+| | |
+|---|---|
+| **The pointer kept moving through the click.** Pinching *is* a movement — thumb and finger come together, the whole hand shifts — so the press landed a few pixels from wherever it had been aimed. | The pointer now **holds still** from the moment a click pose appears, before the button is even confirmed. Move past the drag distance *and* hold for 0.3 s and it is unmistakably a drag, so the lock is dropped and the pointer follows again. The same "tap or drag?" rule a touchscreen uses: time, then distance. |
+| **One noisy frame could fire a click, or drop one.** | A button goes down only after the pose has been seen `confirm_frames` (2) times in a row, and comes up only once it has been gone that many. At ~20 fps that is a tenth of a second — far below a deliberate tap, far above a single frame of landmark noise. **Park is exempt**: "any button is released" has to mean *now*. |
+| **Holding a pinch curls the finger it pinches with**, which lowers the very `pinch_reach` measurement that had allowed the pinch to start — so a held click could fail its own test and be dropped mid-gesture. | While a pinch is held, its bar is relaxed to 72%. Only that pinch, so a **fist is still never a click** — the reason the bar exists. |
+
+The drag distance was **sized from the geometry rather than guessed**: at speed 1 the
+control rectangle is 0.64 of the frame across 1920 px, so one centimetre of hand at
+arm's length is about 60 px, the incidental movement of making a pinch is 30–90, and a
+deliberate drag is 300+. 120 sits cleanly between, and scales with speed. The first
+attempt used 30 px, which every real pinch would have broken into a drag — caught by
+a test that moved a hand the distance a hand actually moves.
+
+The panel and the preview window both say **"holding still"** when the pointer is
+locked, because a pointer that stops without explanation looks like a freeze, and this
+project has earned that suspicion.
+
+### "Dexter can't check if Chrome is open, or if a tab is open, or if a video is on the page"
+
+Correct, and the reason is worth recording: every capability already existed —
+`desktop_control` enumerates windows and processes, `browser_cdp` lists a real Chrome's
+tabs with their URLs, `page_control.results()` reads what is on a page. But **every
+tool returned a list**, and the model had to turn a list into a yes or no. That
+inference is exactly where a confident wrong answer comes from.
+
+So `backend/verify.py` + `tools_verify.py` answer questions, each with **how it knows**:
+
+| asked | answered |
+|---|---|
+| "is chrome open" | *Yes — chrome is open with 1 window (from the open windows): Google Chrome.* |
+| "is youtube open" | *Yes — youtube is open (tab 1): lofi hip hop radio - YouTube (exactly, reading Chrome's own tabs).* |
+| "is there a video called lofi hip hop on this page" | *Yes — number 1 is "1 A.M Study Session 📚 [lofi hip hop]" (and 4 more like it). Checked 16 items, exactly, reading Chrome's own tabs.* |
+| "what page am I on" | the title and the URL |
+
+Verified live over Playwright/CDP against a real YouTube results page — the titles and
+counts above are that run, not an example.
+
+**Three things deliberately built in:**
+
+1. **"I can't tell" is a real answer.** Without the exact route, Windows shows only the
+   *front* tab of each browser window — so a "no" about some other tab would be a
+   guess. It says so, and says how to fix it: *"Say 'start precise browser' and I can
+   read every tab."*
+2. **Weak evidence is not a yes.** `find_processes` also matches an app's name anywhere
+   in a process's **command line**, which is right for "stop the thing I named" and
+   much too loose for a question — asking "is notepad open?" from a shell whose own
+   command line contained the word answered **yes, three times over**. A verdict needs
+   the name to *be* the program.
+3. **A generic check goes last.** `is_app_open` initially claimed "is the local model
+   running", which `local_model_status` owns and answers far better. Every specific
+   checker comes first; the window scan is the last resort. Caught by an existing test,
+   which is the second time this week that ordering in the fast path has mattered more
+   than the rule itself.
+
+### Also
+
+Two unrelated test flakes, fixed rather than re-run: `test_activity` asserted "30 min"
+where a clock tick makes it 29, and `test_claude_sessions` seeded a session "three
+hours ago" — which, at 00:24, is *yesterday*, so "today" counted one session instead of
+two. A suite that fails after midnight is a defect in the suite.
+
+Evidence: 12 new cases in `backend/test_hand_gestures.py` (speed as rectangle size,
+the screen corners still reachable at every speed, the pointer holding still, a drag
+still working, a flicker neither firing nor dropping a click, a held pinch surviving
+the curl, a fist still never clicking), 26 in `backend/test_verify.py`, 4 in
+`src/test/HandMouse.test.tsx`, and 6 router cases. Fifteen existing click tests were
+updated to the new contract — a click now has to persist — with their assertions
+unchanged. Suite: **1539 backend passing**, same 2 pre-existing drift failures; **42
+frontend**; bundle rebuilt.
+
+## v13.7d (2026-09-11) — One espeak library, not four copies per sentence
+
+Noticed while diagnosing the freeze, fixed on the owner's "do it". `phonemizer` copies
+the **entire espeak-ng DLL** into a fresh temp directory every time a backend is
+constructed, and then loads the copy:
+
+```python
+self._tempdir = tempfile.mkdtemp()
+shutil.copy(espeak, self._tempdir / f'{espeak.stem}_{uuid4()}{espeak.suffix}')
+```
+
+It has a reason — espeak-ng keeps its state in globals, so two live wrappers would
+tread on each other. But `EspeakBackend.__init__` builds **two** wrappers (one inside
+`is_available()`), `phonemizer.phonemize()` builds a backend per call, and Kokoro
+phonemizes every chunk. Measured: **13 copies for four spoken sentences**, each
+419 KB, every one left behind.
+
+On this machine that had accumulated **1,172 directories, 468.7 MB**.
+
+| | before | after |
+|---|---|---|
+| temp directories per 4 chunks | +13 | **+0** |
+| wrappers built per process | one per call | **1** |
+| leftovers in `%TEMP%` | 1,172 (468.7 MB) | **0** |
+| time per chunk | 0.40–0.53 s | 0.37–0.53 s |
+
+The time is honestly unchanged — the copy is fast once Windows has the file cached.
+What goes away is three file copies per spoken sentence and half a gigabyte of litter,
+on the exact code path where a frozen Dexter's synthesis thread was found sitting.
+
+`backend/espeak_cache.py` does three things: shares one wrapper for the life of the
+process (patching **all three** phonemizer modules that build one — patching only
+`base` left `espeak.available_voices` still copying, four per chunk down to one rather
+than none), holds a `synthesis_lock` that `voice_engine` takes around Kokoro, since
+sharing is only sound if calls do not overlap, and sweeps the backlog.
+
+**The sweep is deliberately strict**, because it runs over the whole temp folder: a
+`tempfile.mkdtemp()`-shaped name, containing **exactly one** file, whose name is the
+copied library, untouched for ten minutes. The owner's `%TEMP%` also held 211
+single-file directories containing a `ports.json`; none of them matched. Ran it: 1,172
+removed, 0 failed, **468.7 MB freed**. Dexter now sweeps once at startup, in the
+thread that warms the voice, so this cannot build up again.
+
+If the patch ever fails to apply — a new phonemizer layout, say — it says so and
+everything works exactly as before.
+
+Evidence: `backend/test_espeak_cache.py` (16 cases — one wrapper however many
+backends, every module patched, and five cases pinning what the sweep must *not*
+delete). Suite: **1495 passing**, same 2 pre-existing drift failures.
+
+## v13.7c (2026-09-11) — Found it: one line of mine froze the interpreter
+
+The owner left the third freeze running instead of killing it, and that changed
+everything. The watchdog's heartbeat **stopped mid-turn** and `stacks.log` was
+**empty** — which is itself the answer: the watchdog could not run either. No Python
+thread could. That means the GIL was held and never given back, so `faulthandler`
+was never going to work; the right tool was `py-spy`, which reads another process's
+memory without needing the interpreter's cooperation.
+
+```
+Thread 34820 "Thread-14 (_call)":
+    NtUserSetWindowPos (win32u.dll)                  <- holds the GIL
+    System.Windows.Forms.ni.dll
+    set_on_top (webview/platforms/winforms.py:1006)
+    on_top (webview/window.py:267)
+    _raise (desktop_app.py:443)                      <- mine, v13.2
+    show_popup (desktop_app.py:400)
+
+Thread 21688 "Dummy-9" (the GUI thread):
+    PyGILState_Ensure (python314.dll)                <- waits for the GIL
+
+every other thread:
+    PyEval_RestoreThread (python314.dll)             <- waits for the GIL
+```
+
+Windows agreed: `IsHungAppWindow` was **true** for both Dexter windows, on that
+thread, with no modal dialog anywhere.
+
+### The deadlock, in one line
+
+```python
+window.on_top = True      # v13.2, to raise the full window above the on-top pop-up
+```
+
+pywebview turns that into .NET's `TopMost`, .NET turns *that* into a **synchronous**
+`SetWindowPos`, and `SetWindowPos` on a window owned by another thread **sends** it
+messages and waits. pythonnet does not release the GIL across a .NET call, and the
+GUI thread needs the GIL to run the Python handlers wired to its window events. Two
+threads in a circle — and because one of them was holding the GIL, **every** other
+thread stopped with them. No logging, no heartbeat, no scheduler, no voice, no UI.
+A process using 0% CPU, doing absolutely nothing, with 2 GB resident.
+
+It explains every symptom of all three freezes, including the ones that sent me
+chasing ghosts: the log ending mid-sentence (the next `print` needed the GIL), the
+"wedged" disk I/O (those threads were waiting for the GIL, not the disk), and a
+`tr.exe` misfire that was real but unrelated.
+
+**And it was always right after a reply.** `show_popup` is what Dexter calls when it
+has something to say, which is why every freeze followed a voice turn, and why it
+looked like the *question* was to blame.
+
+### The fix
+
+Everything after `show()` in the raise path now goes through Win32 by hand:
+
+| | |
+|---|---|
+| `_nudge_to_front` | `SetWindowPos` via **ctypes** (which does release the GIL) with **`SWP_ASYNCWINDOWPOS`**, which *posts* the request instead of waiting for it. Neither half of the deadlock is possible. |
+| `_restore` | `ShowWindow(SW_RESTORE)` instead of `window.restore()` — another marshalled property that moves the window. |
+| `_place` | the same for the off-screen rescue, which used `window.move()` / `window.resize()`. |
+| `_handle` | finds the HWND once and remembers it, so a raise never goes back through .NET. |
+
+The regression test asserts the **absence** of those calls: a window object that
+records every marshalled property, and `_raise` must leave it empty.
+
+### About the voice
+
+"There is no voice any more" is the same bug. Two clips *were* synthesised at 23:26
+and are still on disk — but the thread that delivers audio events to the page was
+starved of the GIL, so nothing ever arrived. Synthesis itself measures 1.6 s for the
+first chunk and 0.5 s after.
+
+Two things came out of checking it anyway:
+
+* **Mute is now visible in the full window.** Dexter's speaker can be muted
+  separately from the microphone (v13.2), and that state had an indicator only in the
+  pop-up — so "no voice" had a plausible cause with no way to see it. The header now
+  shows a **Muted** button when it is on, and clicking it unmutes.
+* **A silent turn says why in the log.** `[Stream] No audio for this turn: the page
+  sent voiceEnabled=false`. Four different things can suppress speech and none of
+  them were visible from the backend.
+
+Noted, not fixed: phonemizer copies the whole espeak DLL to a fresh temp directory on
+**every** synthesis — there are 1,172 of those copies in `%TEMP%` on this machine.
+Wasteful, and it is what the frozen thread happened to be sitting in, but it is not
+the bug.
+
+Evidence: 5 new cases in `backend/test_desktop_window.py` (the absence of `on_top`
+and `restore`, the cached handle, Win32 placement, and the no-handle fallback). Suite:
+**1479 passing**, same 2 pre-existing drift failures; 38 frontend; bundle rebuilt.
+
+**The lesson worth keeping:** when a process goes completely silent, the GIL is the
+suspect, and in-process instrumentation cannot help by definition. `py-spy dump --pid
+<pid> --native` is the first move, not the last.
+
+## v13.7b (2026-09-11) — It hung again, so now it keeps its own evidence
+
+"I had to close dexter because it hanged again." Second freeze, same shape: the log
+ends mid-turn and that is **all** there is.
+
+```
+2026-09-11 23:06:34  faster_whisper: Processing audio with duration 00:04.400
+[Voice] Heard (4.4s, conf 0.72): 'can I set up my hand tracking?'
+Batches: 100%|####| 1/1     <- the semantic match
+Batches: 100%|####| 1/1     <- the memory recall
+(nothing, ever again)
+```
+
+Reproduced on its own, that turn is fine: Tier 1 → `hand_mouse_setup` at 0.90
+confidence, 8.6 s, no camera. The reply's text-to-speech is fine too (the path in it
+is stripped before speaking). So the hang is not in the turn's *content*, and after
+two evenings of plausible-but-unconfirmable theories the honest conclusion was that
+**the instrumentation was the missing feature, not the next hypothesis.**
+
+### One real defect found, on exactly that path
+
+```python
+finally:
+    tts_queue.put(None)
+    await run_in_threadpool(tts_thread.join)     # no timeout
+    emit("done", {})
+```
+
+The streaming turn joins its speech thread **without a deadline**, and that join sits
+between a turn and the `done` event the page waits for. If synthesis ever sticks —
+Kokoro, onnxruntime, anywhere — the stream never ends; and since the page's
+`isThinking` never clears, and **the microphone lives in that page**, Dexter stops
+listening as well. Total silence, process alive, nothing logged. That is the exact
+symptom, twice.
+
+Both halves are now bounded: the join waits `DEXTER_TTS_JOIN_TIMEOUT` (25 s) and then
+answers anyway, saying so and dumping stacks; and the page gives up on a stream that
+has sent nothing for 150 s rather than waiting forever, with a message instead of
+silence. Losing the tail of a spoken sentence is a small cost. Losing the assistant is
+not.
+
+### And the watchdog, so the next one is not a guessing game
+
+`backend/watchdog.py`, started before anything else can get stuck:
+
+| | |
+|---|---|
+| `data/heartbeat.txt` | every 10 s: thread count, turns completed, **the age of the turn in flight**, and when the last HTTP request arrived. Written with `os.write` to a raw descriptor — deliberately *not* through `logging`, because a jammed logging handler silences every thread and is itself a suspect. |
+| `data/stacks.log` | **every thread's stack** the moment a turn passes 25 s, naming the blocked thread and the frame it is in. Also on a hard native crash, which under `pythonw` otherwise leaves nothing at all. |
+| `POST /api/dexter/debug/stacks` | the same dump on demand, for when Dexter has gone quiet but HTTP still answers. |
+
+That last row is the fork this investigation never resolved: **if requests stop while
+heartbeats continue, the front end froze; if heartbeats stop too, the process did.**
+One line in a file will now settle it.
+
+Building it found a bug in itself, caught by its own test: two overlapping turns (the
+pop-up and the full window both route) shared a token, so finishing one hid the other.
+Turns in flight are a dict now, and the **oldest** is the suspect.
+
+Evidence: `backend/test_watchdog.py` (13 cases — that the heartbeat survives a broken
+`logging`, that a stuck turn yields the blocked thread's frames, that it dumps once
+rather than per tick, and that a crashed turn never looks stuck forever), verified
+end-to-end against a thread that really does block. Suite: **1474 passing**, the same
+2 pre-existing drift failures; 38 frontend; bundle rebuilt.
+
+**Still open:** the cause of the two freezes is not confirmed. What is fixed is the
+unbounded wait that matches the symptom precisely, and what is new is that the next
+occurrence will name the thread.
+
+## v13.7 (2026-09-11) — "Open the hand tracking" launched GNU `tr`
+
+Reported as "dexter is hanging now". The log says what happened in two lines:
+
+```
+[Voice] Heard (3.9s, conf 0.72): 'can you open the hand tracking?'
+[Smart Launcher] Attempt 1: 'C:\Program Files\Git\usr\bin\tr.exe'
+```
+
+and then nothing, ever again.
+
+**Two bugs met.** The first is one line in `app_index.lookup`, which matched a spoken
+name against the installed-app index by plain substring, in both directions,
+preferring the **shortest** key:
+
+```python
+candidates = [(len(key), key) for key in apps if target in key or key in target]
+return apps[min(candidates)[1]]
+```
+
+`"tr" in "hand tracking"` is true, and `tr` is two characters, so it won. The same
+line had already sent **"open Person to Profile" → `pr.exe`** and **"open the key" →
+`keytool.exe`** earlier the same day; all three are in today's log. The index held
+1,602 "applications", among them `rm`, `dd`, `sh`, `ls` and `bash` — every one of them
+a phrase away from being launched.
+
+The second is why it *stuck*: `tr` with no operands **waits on stdin forever**. Two of
+them were still sitting on the machine hours later, and the console window Windows
+allocates for them had come to the foreground and stayed. An assistant that appears to
+have done nothing, with a dead black window in front of everything, is
+indistinguishable from a hang.
+
+### Three fixes, at three depths
+
+| | |
+|---|---|
+| **Matching** | A name shorter than four characters now only ever matches **exactly** (so `vlc` still works and `tr` never does); longer ones match on **whole words** — `tr` is no longer "inside" `tracking`. Query-inside-name still prefers the shortest key ("code" → Code, not Code Insiders); name-inside-query now prefers the **longest**, i.e. the most specific app actually named. |
+| **What counts as an app** | An application is the thing with a window. The scan reads each candidate's PE header and skips console programs, and skips `Git\usr\bin`, bundled `jre\bin` and their like outright. **1,602 entries → 692**, and the 614 dropped are `adb`, `bash`, `7za`, `aerender`, the Docker CLIs… Start Menu shortcuts are exempt, because somebody made those on purpose — so "git bash", "command prompt", "powershell" and "python" all still resolve, through the shortcut that carries the right arguments. |
+| **Launching** | Nothing Dexter starts keeps an open stdin. A console program goes through `Popen(..., stdin=DEVNULL)`, so a misresolved name can never again leave a process waiting for somebody to type into it. Dexter is not a terminal; it has `run_command` for that, and that one asks first. |
+
+### And the hand mouse is not a program on the disk
+
+The deeper mistake: "open the hand tracking" asks for one of **Dexter's own features**,
+and it was being searched for out in Program Files. Five Tier-0 rules now sit *above*
+the app and site rules — start, stop, status, list the gestures, change one — so the
+sentence the owner actually said is instant and never reaches the launcher:
+
+* "can you open the hand tracking?", "show me the hand tracking", "use the gesture
+  control" → **start**
+* "turn off the hand mouse", "close the hand tracker" → **stop**
+* "is hand tracking on", "what gesture do you see" → **status**
+* "what do the hand gestures do" → **the map**
+* "make a fist the right click", "set the open palm to scroll" → **rebind**, and that
+  builder yields unless *both* halves name a real pose and a real action, so "make the
+  window bigger" is left alone.
+
+### One theory, tested and wrong
+
+The first explanation was that reading the foreground window's title — which happens on
+**every** chat turn, to tell the model what is on screen — had blocked on the wedged
+console, `GetWindowTextW` being a `SendMessage` with no timeout. It is not: Windows
+reads another process's caption directly, by design, *precisely* so this cannot hang.
+Proven here against a window with no message loop at all (returned in 0.0 s), so the
+module written on that premise was deleted rather than kept. The per-turn context build
+was then measured with a wedged console in the foreground: unaffected.
+
+So the hang itself is **not reproduced in the backend** — that turn routes in 0.0 s,
+the v13.6 status polling costs 0.3 ms, and nothing on the chat path blocks. What is
+proven is the misfire, and that it leaves a stuck console window owning the foreground.
+If it recurs after a restart, the next place to look is the shell and its WebView2
+windows, not the router.
+
+Evidence: `backend/test_app_index.py` (14 cases — the three sentences that went wrong,
+the near-misses that must still resolve, what gets indexed, and that nothing is
+launched with an open stdin) and 21 new routing cases in `backend/test_router_v13.py`.
+Suite: **1461 passing**, the same 2 pre-existing `test_buzzcaf_ports.py` drift failures.
+
+## v13.6 (2026-09-11) — The hand mouse, on the dashboard, with the gestures you choose
+
+Asked as "where do I see the hand tracking on the dashboard" — and the honest
+answer was **nowhere**. It had shipped in v13.1 with two surfaces: a floating
+OpenCV window, and a tool you had to ask by name. Nothing in the app, and nothing
+in `/api/dexter/status`, so nothing in the UI *could* have shown it.
+
+That is a bad gap for this feature in particular. A gesture mouse is the one thing
+you cannot debug by looking at what it controls: your hand is busy, and the pointer
+is the symptom rather than the evidence. The two failures look identical from the
+outside —
+
+* the camera cannot see your hand, and
+* it can see it perfectly, in a pose that is bound to do nothing
+
+— and they have opposite fixes. So the panel's job is to tell them apart.
+
+### What is on the dashboard now
+
+`HandMousePanel`, in the right-hand column of the full view:
+
+| | |
+|---|---|
+| the live line | "Open palm → moving the pointer", or "Looking — best 0.31 of 0.50 needed" |
+| hand confidence | the palm score against the threshold, with the threshold marked, so "close" and "nowhere near" look different |
+| how it is doing | fps, camera index, what share of frames had a hand in them, whether the tracking window is open, and the hotkey that stops it |
+| **Start** / **Rehearse** | a rehearsal recognises every pose and moves nothing, which is how you try a changed gesture safely |
+| **Gestures** | the map, editable inline |
+
+And because tracking is something you turn on and then walk away from, there is a
+**Hand chip in the header** (both views) and one in the **pop-up**, shown only while
+it is running, green when it can see your hand and amber when it cannot — click
+either to stop. That is the part that matters when the pointer starts moving and you
+want to know whether Dexter is doing it.
+
+### Gestures are a setting now, not a line of code
+
+v13 picked the poses and wired each to a fixed job. Whether a fist should park or
+right-click is a question about a person's hand, so a **pose** (the shape) and an
+**action** (what it does) are now separate things with a map between them:
+
+| pose | default | |
+|---|---|---|
+| open palm | move the pointer | v13.2: making this do nothing was the whole of "I can't move the cursor" |
+| index finger | move the pointer | for precision |
+| two fingers | scroll | |
+| three fingers | move the pointer | |
+| fist | nothing | the one pose nobody makes by accident |
+| pinch (thumb-index) | left button, held | so a tap is a click and a hold-and-move is a drag |
+| middle pinch (thumb-middle) | right button, held | |
+| any other shape | move the pointer | bindable rather than hidden: hands make shapes nobody planned for |
+
+Seven actions to bind to, two of them new: **middle button** and **double click**
+(which fires once per pose, not forty times a second). The defaults are exactly
+v13.5's behaviour, so nobody's hand mouse changes by upgrading.
+
+Three ways to change one, all the same channel — the tool writes the setting the
+panel edits, so they cannot disagree:
+
+* the panel's Gestures list;
+* Settings → **Hand mouse** (one choice per pose, plus steadiness, pinch closeness
+  and the preview window);
+* out loud: **"make a fist the right click"**, "set the open palm to scroll",
+  "what do the hand gestures do".
+
+**It applies while tracking is running**, which is the only sensible answer: you
+change a gesture *because* the current one is not working, and "restart hand
+tracking to pick this up" would mean stopping the thing you are trying to fix.
+Whatever button was held under the old map is released as part of the swap — a
+button left down by a binding that no longer exists would be unkillable without the
+mouse this is replacing.
+
+### Three things found while building it
+
+1. **A hardcoded sentence had been wrong for two releases.** The start reply said
+   "open palm to park" ever since v13.2 made an open palm steer. It is generated
+   from the live map now (`gesture_sentence()`), which is also the only way it can
+   stay true for somebody who has changed a binding.
+2. **Hysteresis could not let go of a pinch.** Moving from a thumb-index pinch to a
+   thumb-middle one left the index gap inside the *open* threshold, so the old pose
+   held and the swap was impossible without opening the hand in between. Now the
+   held pinch yields when the other one is plainly nearer.
+3. **A test-isolation bug this created.** `settings_store.update` writes
+   `os.environ` directly — that is how a setting takes effect without a restart —
+   so monkeypatch cannot undo it, and one test saving "a fist is the right click"
+   changed what a fist meant for every test that ran after it, in another file.
+   `conftest.py` now restores the whole `DEXTER_HAND_*` block after each test. Same
+   class of bug as the CDP one in v13.4, found the same way.
+
+Evidence: `backend/test_hand_gestures.py` (65 cases — the shapes, that the defaults
+are unchanged, rebinding, the two new actions, nonsense bindings, the spoken
+phrasings, the settings round-trip, and that a running tracker is told) and
+`src/test/HandMouse.test.tsx` (9 — chiefly that "can't see you" and "bound to do
+nothing" read differently). Suite: **1421 backend passing** (the same 2 pre-existing
+`test_buzzcaf_ports.py` drift failures) and **38 frontend**.
+
+## v13.5 (2026-09-11) — The window was opening. 32,000 pixels off the desktop.
+
+Reported as "the maximised version of this app is not opening". v13.2 had already
+fixed a real version of this (the full window came up *behind* the always-on-top
+pop-up, so the button looked dead), and the running process had that fix — started
+21:24, after the change. So this was something else, and it was not in the shell code
+at all. It was in `data/window.json`:
+
+```json
+{ "width": 380, "height": 520, "x": -32000, "y": -32000 }
+```
+
+**(-32000, -32000) is the position Windows reports for a *minimized* window.** Close
+Dexter while it is minimized and `_save_window` wrote that down as "where the window
+was"; every launch afterwards faithfully created the full window there. It opened
+every time, instantly, exactly as asked — at a coordinate on no monitor. From the
+owner's chair that is identical to a button that does nothing, which is why two
+releases looked at `show()` instead. The saved size was the giveaway: 380×520 is the
+`min_size`, not a size anyone chose.
+
+Three places now have to agree before a position is believed:
+
+| | |
+|---|---|
+| `on_screen(x, y, w, h)` | rejects the `<= -30000` sentinel and any rectangle that leaves less than 120px of title bar inside the virtual desktop (`GetSystemMetrics` 76–79, so a second monitor counts — and an *unplugged* one does not) |
+| `_load_window()` | clamps the size to the screen and **drops** an unbelievable position, because pywebview centres a window when `x`/`y` are absent |
+| `_save_window()` | always keeps the size; writes a position only if it passes, else reuses the last good one and says why |
+
+And because a poisoned file may already have been obeyed at creation time,
+`open_full()` checks at show time: a window that is off-screen is resized to fit and
+moved back (centred, a third of the way down) *before* `maximize()`, and the pop-up is
+only hidden once the big window is confirmed visible — hiding the one window that works
+and showing nothing is the worst of the available outcomes.
+
+The live `data/window.json` was repaired too, so the install in front of the owner is
+usable without waiting for a clean close.
+
+Evidence: `backend/test_desktop_window.py` (18 cases — the sentinel, an unplugged
+second monitor, a sliver still counting as visible, the size surviving a position that
+does not, the walk-back at show time, and that a full window which refuses to show
+never costs you the pop-up). Suite: **1356 passing**, the same 2 pre-existing
+`test_buzzcaf_ports.py` drift failures.
+
+## v13.4 (2026-09-11) — Playwright where it helps, on the browser you actually use
+
+Asked as: "can Playwright be implemented to make Dexter's actions more precise?"
+The answer turned out to be yes, no and yes — worth writing down in that order.
+
+**Yes, it was already here.** `browser.py` (v6) is a full Playwright driver and has
+always been able to attach over CDP (`DEXTER_BROWSER_CDP`). **No, it was demoted on
+purpose**: in v11 it launched a *second* Chrome on its own profile, so "open YouTube"
+opened a browser that knew none of the owner's logins and "close this tab" acted in a
+window they were not looking at. That is why everything since drives the real browser
+through Windows accessibility — which sees only *names*.
+
+**And yes, there is a third option that is strictly better than both**, which is what
+this release adds: Playwright attached over CDP **to a Chrome that is the owner's**.
+`backend/browser_cdp.py` starts Chrome with `--remote-debugging-port` on a persistent
+profile (`data/chrome_debug_profile`; Chrome 136+ refuses remote debugging on the
+*default* profile, so a separate `--user-data-dir` is not a preference, it is the only
+way it works at all). Sign in there once and it stays signed in.
+
+What becomes exact:
+
+| before (accessibility) | now (CDP), when it is on |
+|---|---|
+| "the third result" = the third accessibility name that looked like a title | the third `<a href>` in document order, with its URL |
+| a click, a `sleep`, then a hopeful look at the window title | `goto` / `click` that **waits** for the navigation, and reports the URL it reached |
+| "copy that paragraph" = Ctrl+C and hope | `window.getSelection().toString()` — the real string |
+| typing into whatever has focus | the field found by its label, placeholder or role |
+| the window must be in the **foreground** | no focus stealing: Dexter can act while the owner works elsewhere |
+
+`page_control` prefers it and falls back to the accessibility route whenever it is
+not up, so this is an upgrade that never becomes a dependency:
+`precise_browser` (start / status / stop) is the switch, and every reply says which
+route it took.
+
+**The extraction needed real work, and the live test is why.** The first cut was a
+plain `a[href]` scan; on a Google results page it returned *Accessibility help,
+Google apps, AI Mode, Shopping, Short videos* — the site's own furniture, which comes
+first in document order. It is now three tiers: a per-site selector for the places
+where "open the third result" is actually said (Google, YouTube, Bing, DuckDuckGo,
+GitHub, Reddit, Stack Overflow), else links inside the main content region with
+nav/header/footer/aside excluded and headings preferred, else the loose scan so an
+unknown page still answers. A leading timestamp is stripped, because a YouTube
+thumbnail's own text is "1:01:14 Now playing" rather than a title.
+
+Verified live, against the real browser:
+
+```
+launched: Chrome/153.0.8010.36 on http://127.0.0.1:9222
+search_here -> route cdp, "best usb microphone 2026 - Google Search"
+google   1. Best USB microphones 2026: Plug-and-play mics ... MusicRadar
+         2. Best Microphone to Buy in 2026? (Price, Sound Quality ...) Reddit
+         3. Best USB Microphones 2026 - Tested & Compared  sound&gear
+youtube  1. lofi hip hop radio - beats to relax/study to
+         2. 1 A.M Study Session [lofi hip hop]
+         3. Coffee Shop Radio - 24/7 Chill Lo-Fi & Jazzy Beats
+open_result(2) -> reddit.com/r/microphone/comments/1rtej2a/best_mi…  changed: True
+selection -> 'Helpful products, built with you in mind'
+```
+
+Evidence: `backend/test_browser_cdp.py` (18 cases — both routes, and that the
+fallback is intact when the port is absent). The in-page extraction is JavaScript and
+is verified by the live run above rather than by a unit test.
+
+**And a test-isolation bug this created, worth recording.** The debuggable Chrome left
+running after the live check made nineteen `test_page_control.py` cases take the exact
+route: `available()` asks a real port whether a real browser is there, so the suite's
+behaviour depended on what the owner happened to have open. `conftest.py` now forces
+the CDP route off for every test (and makes `launch` raise), exactly as it already does
+for Sentinel, LM Studio, keystrokes and the process table; the tests that are *about*
+launching opt back in explicitly. This is the same class of bug the conftest guards
+were written for, and it is the second time a "real machine" dependency has crept in
+through a new integration.
+
+### Also answered: notes, reminders, schedules
+
+Asked in the same breath, so for the record — all of this is live on the running
+instance right now (`/api/dexter/status` → scheduler: running, 13 jobs,
+1 pending reminder, toasts via winotify):
+
+* **Notes** — "note that the mic arrives Friday" writes a Markdown file into the
+  notes folder and indexes it immediately; "take notes" (v13.1) turns dictation on
+  until you say stop, into notes, Notepad, Sticky Notes, Notion or any window.
+* **Reminders** — "remind me to call the editor at 6" fires on three channels at
+  once (Windows toast, in-app banner, spoken), so it lands whether or not the window
+  is open. "What are my reminders", "cancel the studio reminder".
+* **Commitments** — "I'm committing to scripting episode three by Friday" goes into
+  the workbook, with rolling counted.
+* **Schedules** — "every morning at 8 review my missions" is a *recurring job* that
+  runs the goal through the same tiers a typed message would, so anything Dexter can
+  do it can do on a schedule. Cron or one-shot; "what's scheduled" lists them.
+* **Mission blocks** — the Mission Reminder bridge (v13.1) saves and reviews blocks
+  in that app.
+
+## v13.3 (2026-09-11) — Picking what is on the screen
+
+Seven reports from using it, and the common thread is worth naming: in every case
+the thing the owner meant was *visible on screen*, and Dexter had no way to point
+at it. "It says it's doing it but it does nothing" is what that looks like from the
+outside, because a sentence that reaches the model gets answered rather than done.
+
+### 1. "Okay, open Chrome for me" -> "there is no app called okay open chrome" — **done**
+
+`_clean` stripped leading politeness, but not when Whisper put a **comma** after it,
+and not a trailing "please". So that exact spoken sentence fell past the whole fast
+path and reached the model, which passed the raw utterance to the launcher as an app
+name. Both layers now strip it: the router's filler patterns allow the comma and a
+dozen more words, and `AppLauncherTool.clean_name` strips the politeness *and* the
+verb, so even a sentence that arrives at the last layer resolves to "chrome".
+
+### 2. "Select the first profile / the first video / the first link" — **done**
+
+Three different things, and v13.1 had one rule that sent all of them to the video
+player (and "select" was not even in its verb list, so the owner's actual words
+matched nothing):
+
+| what they said | what it means | tool |
+|---|---|---|
+| the first **video** / one / thumbnail | the video list | `youtube_play` |
+| the first **result** / link | the page's results | `open_result` |
+| the first **profile** / option / row / item | anything on screen | `select_nth` |
+
+`select_nth` is what makes Chrome's profile picker work: its cards are list items
+with a person's name on them, so there is nothing to type and no fixed label -
+only "the first one". It reports what it clicked, and on a miss it names what it
+could see.
+
+### 3. "Search a video by its name in the current tab" — **done**
+
+There was no implementation at all: every browser tool opens a **new** tab, because
+`chrome.exe <url>` is the only command line Chrome offers and it has no
+replace-this-tab form. The address bar does: `chrome_control.open_in_current_tab`
+does Ctrl+L, types the URL, Enter - what a person does - and `search_here` uses it,
+staying on the site you are already on unless you name another.
+
+### 4. Comments, like, subscribe — **done**
+
+`youtube_control.page_action`: like, unlike, dislike, subscribe, unsubscribe,
+comments, share, save, description, notifications, join. Found by the accessible
+names YouTube gives them (its like button has carried a count in its label for
+years, so the match is a contains on the stable prefix). "Open the comments" is a
+*scroll* before it is a click, because YouTube only builds that section when it
+comes into view.
+
+### 5. "Search anything on YouTube or Google and click the links" — **done**
+
+`search_and_open` does both halves in one turn ("google best mic and open the first
+link" used to search for the whole sentence including "and open the first link"),
+and `page_results` lists what a page is offering so one can be chosen by number.
+
+### 6. "Copy a section of text and paste it in any other tab at any field" — **done**
+
+`copy_text` takes the selection, everything, or a named field's contents (read
+through UIA, without moving the caret). `paste_text` switches tab, clicks the named
+field, pastes, and optionally presses Enter - in that order, and **refusing** rather
+than guessing: a field that is not there, a tab that will not switch, or an empty
+clipboard all stop the turn instead of typing into the wrong place.
+
+### 7. "In YouTube, select the first video" — **done**
+
+A site prefix is a *tab*, not a window. "In chrome, …" focuses a window (as before);
+"in youtube, …" now switches to that tab first and then runs the rest of the
+sentence there. Before, the loose comma form tried to focus a window called youtube
+and failed.
+
+### And a claim that can be checked
+
+`open_result` records the tab title before the click and compares it after: the
+reply says "clicked the second result" *and* whether the page actually moved. That
+is the direct answer to "it says it is doing it but it does nothing" - when nothing
+happened, the reply now says nothing happened.
+
+### A hazard worth recording
+
+One line of `router.py` was written through a shell heredoc and a `\b` in it became
+a **literal backspace byte** in the file, which silently broke the regex that strips
+a site name out of a search query. `data/`-wide scan for control characters found
+exactly that one. Third time this hazard has bitten in this repo (see
+`MEMORY.md` / bash-heredoc-backslashes): regex-heavy edits go through the editor,
+not the shell.
+
+Evidence: `backend/test_page_control.py` (36 cases), `backend/test_router_v13.py`
+(139), 1318 backend tests pass.
+
+## v13.2 (2026-09-11) — One model at a time, a hand that actually moves the pointer
+
+Four things the owner found by using v13.1 on the live machine, all fixed the same
+evening. Each one is recorded with what was actually wrong, because in three of
+the four the cause was not what the symptom suggested.
+
+### 1. "If Dexter switches model, or I switch it, the previous one gets offloaded" — **done**
+
+Until now a model left memory **only when its keep-alive expired**: 30 minutes for
+a smart rung, two hours for the pinned fast one. So switching *added* a model
+instead of replacing one:
+
+* a turn that stepped down the ladder left **both** rungs resident for half an
+  hour (gemma-4-12b at 7.6 GB *and* qwen2.5:7b at 4.5 GB);
+* changing a tier in Settings left the old tag holding its gigabytes for the rest
+  of its keep-alive — two hours, for the fast one;
+* picking a model by hand in the UI bypasses the tiers entirely, and the tiers
+  stayed loaded anyway.
+
+`model_steward.retire()` is the new primitive — unload everything *we* loaded
+except what is named — and it is wired into the three places a model changes:
+after an escalated turn (superseded rungs go, the fast tier stays), when a turn
+runs on an explicitly chosen model (the tiers go, since they are not in use), and
+when the owner changes `fastModel` / `smartModel` / `smartModelFallback` in
+Settings (`settings_store.update` now reports what it offloaded). A rung also goes
+**immediately** rather than on its keep-alive when Sentinel says memory is not
+green.
+
+Three rules it will not break: nothing another app loaded is ever touched (only
+`_ours`), a tag that is still a tier is left alone (changing the fallback to the
+model that is already the smart rung must not unload it), and
+`DEXTER_OFFLOAD_PREVIOUS=off` restores v13 exactly. `always` is the strictest
+setting — only the model that just answered stays resident, at the cost of a
+reload on the next switch.
+
+Evidence: `backend/test_model_offload.py` (17 cases, including the order trap:
+`replaced()` is called *after* the setting is applied, and refuses if it is called
+before).
+
+### 2. "I am not able to move the cursor with my hand mouse" — **done**
+
+Not a tracking failure. The session log settles it: **538 of 7936 frames had a
+hand in them**, so the camera saw the hand fine — and then did nothing with it,
+because v13.1 mapped an **open palm to "park"**. The first thing anyone does is
+hold a flat hand up to the camera and move it; Dexter deliberately ignored exactly
+that. An open hand now steers, pointing with the index finger still steers, and
+the **fist** is the park — the one pose nobody makes by accident.
+
+Which exposed the second bug, on the first fist: in a closed hand the thumb tip
+lies against the middle fingertip at 0.35 hand-widths, well inside the pinch
+threshold, so a fist was read as a **right click**. Measured on photographs of
+both poses: an open hand's fingertips reach 2.0-2.4× past their own knuckles, a
+fist's sit at 0.87-0.96. A pinch now requires the pinching finger to be reaching
+out (≥1.25), which separates them with room to spare.
+
+Also: `DEXTER_HAND_PALM_SCORE` 0.6 → **0.5**, the reference implementation's own
+default. On this webcam a palm scores 0.65-0.74 even on an empty scene (the
+detector proposes, the landmark model verifies and rejects), and a real hand
+scores 0.87; 0.6 was a guess that cost real detections.
+
+Verified end to end on the live machine: a photograph of an open hand →
+`find()` → `step()` → landmark 0.993, gesture `point`, `move_to` recorded; a
+photograph of a fist → `park`, nothing pressed; and with a hand in front of the
+real camera, 48 of 133 frames tracked (≈100% of the last three seconds) at palm
+0.87 with gesture `point`.
+
+### 3. "A small window shall open to show my hand mouse tracking" — **done**
+
+`backend/hand_preview.py`: a 360 px always-on-top window drawn from the tracking
+thread, showing the 21-point skeleton, the pose it decided, the control rectangle
+your hand has to stay inside to reach every corner of the screen, the pointer
+anchor, the frame rate, and — when it sees nothing — the **palm score against the
+bar it needs to clear**. That last line is the difference between "it doesn't
+work" and "the room is too dark".
+
+On by default (`DEXTER_HAND_PREVIEW=0` to turn it off, or `"start hand mouse
+without the preview"`). Esc or Q in the window stops tracking, which makes it a
+visible kill switch as well as a diagnostic. A preview that throws disables itself
+rather than taking tracking down with it. `hand_mouse_status` now also reports
+`palmScore` / `bestScore` / `palmNeeded`, so the same diagnosis is available
+without looking at the window.
+
+Verified live: the window opened from the tracking thread (`preview.open: True`,
+no error) and tracked a hand through it at 17 fps.
+
+### 4. "The pop-up window is not maximising" — **done**
+
+`DexterShell.open_full()` was `show()` + `restore()`. Neither raises a window:
+Windows does not hand the foreground to a process that merely showed something,
+and the pop-up is `on_top=True`, so the main window came up *behind* it — which
+looks exactly like a button that does nothing. It now goes through `_raise()`:
+show, restore, flip `on_top` (which raises it within the process), then
+`SetForegroundWindow` on the window's real handle. And because the gesture means
+"make this the big window", opening the full window now **hides the pop-up**.
+`show_popup` uses the same path, and `maximize_full()` exists for a window that
+should fill the screen. If the shell still cannot bring it forward, the pop-up
+says so and points at the tray icon instead of staying silent.
+
+### Also
+
+* The UI bundle was rebuilt (`dist/assets/index-af642f45.js`); `DEXTER_AUTOBUILD=1`
+  makes the shell do that by itself when `src/` is newer.
+* Said out loud, **"mute yourself"** and **"you can speak again"** are now voice
+  commands classified in the voice layer, so they never reach the chat — distinct
+  from "stop", which cuts the reply that is playing.
+
+## v13.1 (2026-09-11) — Reach: the whole disk, any app, a video, a hand, and notes
+
+Requested as: "dexter is working but it's not able to open c drive or any such
+drive or list folders or open a specific folder, or open a specific video from
+opened youtube, or close buzzanimate or in general any app apart from the ones
+mentioned to it... also can we have hand tracking to work as a mouse using the
+webcam for click right click scroll etc? also its listening to some random
+stuff", then "also i want it to take notes from me continuously if i say so, for
+it it can use notion or notepad or sticky notes or any tool i say. its shall also
+be able to control BuzzcafAI and select tabs and texts from it, i want to use my
+computer while sitting away from it and dexter doing it for me. i also want it to
+have capacity to schedule anything i want and use the missionreminder app
+automatically to save and review my missions", then "also add option to mute
+dexter from pop up window".
+
+Seven complaints, and each one turned out to have a specific cause rather than a
+vague one. The causes are what is worth recording.
+
+### 1. Drives and folders — **done**
+
+Two separate things were missing, and only fixing both makes "open the C drive"
+work:
+
+* **Permission.** `pathguard` allowed six user folders and the project directory,
+  so every drive, and most of the machine, answered "that's outside the folders
+  Dexter is allowed to touch". It now has a **scope**: `machine` (the default -
+  look anywhere the owner can look) or `user` (the old behaviour, selected
+  automatically when `DEXTER_FS_ROOTS` is set, so an install that pinned its roots
+  keeps exactly the reach it had). Reading and writing are now *different
+  questions*: `resolve()` vs `resolve_write()`. Writing, moving or deleting inside
+  Windows itself (`C:\Windows`, Program Files, ProgramData, a drive root) is
+  refused in both scopes — a misheard "delete that" there is not recoverable.
+  `DEXTER_FS_DENY` is the opposite valve: folders Dexter must not even read.
+* **Vocabulary.** Nothing turned "the C drive", "my downloads", "the BuzzAnimate
+  folder" or `d:\films` into a path, and **there was no tool that listed a folder
+  at all** — `search_files` could find a file by name; nobody could ask what was
+  *in* a directory. New `backend/folders.py` (`spoken_path`, `drives`,
+  `list_folder`, `find_folder`) and four tools: `list_folder`, `list_drives`,
+  `open_folder`, `find_folder`.
+
+Tier 0 rules were added for all of it, each gated so it only fires when the words
+really are about a folder — a drive letter, a path separator, the word
+folder/drive/directory, or one of the user's own folders by name. That is what
+keeps "open buzzedit" an app and "open the buzzanimate folder" a folder.
+
+Evidence: `backend/test_folders.py` (29 cases), `backend/test_router_v13.py`.
+Live: `folders.describe_drives()` → `B: New Volume 63 of 932 GB free; C: 57 of
+930 GB free; D: ... H: 232 of 699 GB free`; `list_folder("C:\\")` → `24 folder(s),
+3 file(s)`; `resolve_write(r"C:\Windows\x.txt")` → `None`.
+
+### 2. "Close BuzzAnimate" (and any app) — **done**
+
+This failed twice over, and the first half was a plain wrong fact in the
+registry: `data/apps.default.json` said BuzzAnimate's process is `buzz-app.exe`.
+The binary is `buzzanimate.exe` (`BuzzAnimate/target/release/`). So "is
+BuzzAnimate running" answered *no* while it was on screen, and "close it"
+answered "it is not running". Record corrected.
+
+A corrected record is not a fix, though — the next renamed binary would do the
+same. So both layers now have a generic fallback:
+
+* `apps_registry.probe()` ends with **"anything running out of this app's own
+  folder"**, and `stop()` falls back to stopping that. Editors and terminals are
+  excluded by image name, so VS Code with the project open is never mistaken for
+  the app.
+* `desktop_control.find_processes()` matches a spoken name against everything
+  Windows knows about a process: image name, executable path, the folder it runs
+  from, its command line, and the **FileDescription the vendor compiled in** (how
+  "open broadcaster software" finds `obs64.exe`). `find_windows` falls back to it,
+  so "close Teams" finds `ms-teams.exe`.
+* A running-but-windowless app used to be reported as "it doesn't have a window
+  open", which reads as "it isn't running". It now says what it is, offers a
+  force-stop, and for one of the owner's own projects goes through the registry's
+  proper shutdown instead.
+
+Evidence: `backend/test_desktop_apps.py` (16 cases, including "an editor with the
+folder open is not the app running" and "a record that says do not stop is still
+never stopped").
+
+### 3. A specific video on an open YouTube — **done**
+
+`browser_click` could not do it: `click_text` walked the UIA tree type by type
+with **one shared budget**, and a YouTube page has hundreds of Buttons — the five
+seconds were gone before the walk reached Hyperlink, where the video links are. So
+every "play the second video" died on a timeout. The budget is now per control
+type with a global deadline and an early exit on an exact match, and matches are
+ranked (exact → starts-with → contains) instead of first-found.
+
+New `backend/youtube_control.py` has two routes and says which one it took:
+click the link the owner can *see* (page_videos reads the accessibility tree and
+filters out navigation and durations), or resolve the title through YouTube's own
+results page over HTTP and open `watch?v=…` in their Chrome. `youtube_play`,
+`youtube_results` and `youtube_control` (pause, next, captions, full screen, skip
+an ad) are the tools; playback prefers the player's own named buttons over
+keystrokes, because `k` typed into the search box is the letter k.
+
+`play_on_youtube` also stopped lying: it used to open a *results page* in whatever
+Windows calls the default browser and report "Playing 'X' on YouTube".
+
+Evidence: `backend/test_youtube_control.py` (24 cases). Live: the search parser
+against the real results page returned `rFZHOHl-L8A lofi hip hop radio / Lofi
+Girl`.
+
+### 4. "It's listening to some random stuff" — **done**
+
+The cause was in `data/settings.json`, and it was two stored settings plus a hole
+in the rule:
+
+* `followUpWindow: 15.0` — for fifteen seconds after *every* reply, any speech
+  onset in the room became a command.
+* `bargeIn: true` — which re-opens the v10 echo loop: through speakers the mic
+  hears Dexter's own voice.
+* And inside that window a **borderline speaker verdict counted as "addressed to
+  me"** purely because the window was open (v11.1's grey-zone rule).
+
+So: one gate, `voice_pipeline.accept_utterance()`, applied to every way in. A
+sentence that was not addressed by name, by the wake word or by the mic button now
+has to look like something said *to* an assistant — more than one word and a
+transcript the recogniser stands behind — with answers ("yes", "go ahead") always
+allowed and "stop" always obeyed. A grey verdict in the window needs a fuller
+sentence. After two windows that caught nothing meant for Dexter, it stops
+re-opening them until its name is said. Defaults changed: window 9 → 6 s, echo
+guard 800 → 1200 ms, and the stored 15 s / barge-in-on were reset to the safe
+values (both still one click away in Settings, for headphones).
+
+Evidence: `backend/test_voice_gate.py` (21 cases, both directions: the television
+is ignored, a real follow-up and a one-word "yes" still land).
+
+### 5. Continuous note-taking, into any tool — **done**
+
+`backend/dictation.py` makes dictation a *mode*: while it is on, what the mic
+hears is written down rather than answered — no model in the loop, no turn in the
+chat, and in `name` mode the name gate is skipped (nobody says "Dexter" before
+every sentence of a note). Sinks: a Markdown note in the notes folder (indexed),
+a named file, **Notepad, Sticky Notes, Notion** or any open window (typed into,
+which is the honest way to support "any tool I say" — Dexter has no Notion API key
+and no business having one), or the clipboard. Spoken punctuation, "new
+paragraph", "scratch that", "pause notes" and six ways of saying stop.
+
+Evidence: `backend/test_dictation.py` (35 cases, including "while dictating
+nothing reaches the chat" and "a file outside the allowed folders is refused
+before a word is said").
+
+### 6. Driving BuzzcafAI (and any app's UI) from across the room — **done**
+
+`list_controls`, `click_in_app` and `copy_text_from` in `tools_desktop.py`: list
+an app's tabs and buttons by name, press one in a named window, and copy its
+selection (or everything) back out through the clipboard. The Studio is a web view
+in a desktop window, like most of the owner's apps, so Windows already exposes its
+tabs and buttons — no screenshot and no vision model.
+
+### 7. Mission Reminder, and scheduling anything — **done**
+
+Mission Reminder deliberately has no inbound API: its state is its own and the
+bridge to the rest of the machine is one-way (`GUARDIAN_PLAN.md` §6/MR1). Rather
+than reach into another app's storage — which corrupts it the moment both sides
+write — `backend/mission_bridge.py` uses the app the way a person does: its own
+`Ctrl+1..7` tabs, its named fields ("Name", "Starts at") and its named buttons
+("New block", "Save block"). Reading stays the runtime mirror it publishes.
+
+Two promises: every write is recorded in `data/mission_outbox.json` *before* it is
+attempted, so a failure is never silent; and the labels are data
+(`data/mission_ui.json`), so a redesigned app is a one-line fix. Tools:
+`mission_review`, `mission_save_block`, `mission_save_goal`,
+`mission_save_statement`, `mission_start_block`, `mission_outbox`.
+
+Scheduling already existed (`schedule_task` → `tasks.schedule_goal`, cron or
+one-shot) but nothing *routed* to it: "every morning at 8 review my missions" went
+to the model, which promised and scheduled nothing. Four Tier 0 shapes now cover
+how it is said, and each refuses unless the time actually parses — so "in the
+downloads folder find the invoice" is not mistaken for a schedule, and "every time
+I open chrome" is not scheduled for 9am.
+
+Evidence: `backend/test_mission_bridge.py` (20 cases), `backend/test_router_v13.py`.
+
+### 8. Hand tracking as a mouse — **done**
+
+MediaPipe has no wheels for this machine's Python (3.14; they stop at 3.12), so
+its two models are driven directly through onnxruntime:
+`backend/hand_tracker.py` (palm detection 192×192 → 2016 anchored boxes, hand
+landmarks 224×224 → 21 points, detection only when tracking has lost the hand),
+`backend/mouse_input.py` (SendInput, so a drag started by a pinch behaves like one
+started by a hand), `backend/handmouse.py` (the poses). A `mediapipe` backend is
+kept and preferred when importable, so a 3.12 venv gets the faster pipeline for
+free.
+
+The poses are each a distinct *shape* rather than a threshold on the same shape:
+point = move, pinch = left button held (so a tap is a click and a hold-and-move is
+a drag), thumb-to-middle = right button, two fingers = scroll, open palm or fist =
+park. Hysteresis on both pinches, an absolute mapping from a rectangle in the
+camera image to the screen (so your hand has a *place*), a click rate limit, every
+button released when a hand leaves the frame, Ctrl+Alt+H as a kill switch, and a
+`dry_run` that drives a recorder so the poses can be rehearsed with the pointer
+untouched.
+
+Verification, because a tracker that "runs" and sees nothing is the failure mode
+here: the generated anchor table was compared against the reference implementation
+in the OpenCV Zoo (2016 rows, max difference 7e-9), the decode matches theirs, and
+the whole pipeline was run on a real photograph of a hand — palm score 0.879 from
+the reference, landmark confidence 0.986 from ours, and `fingers_out` correctly
+read it as a fist with the thumb out. The webcam opens and delivers 77 frames in
+3 s through the tracker (`hand_mouse_check`). **Not yet verified: the owner's own
+hand in front of their own camera** — say "can you see my hand" and it reports
+frames, share and confidence.
+
+Tools: `hand_mouse_setup` (downloads the two models, 7.6 MB, once),
+`hand_mouse_check`, `start_hand_mouse`, `stop_hand_mouse`, `hand_mouse_status`.
+
+Evidence: `backend/test_handmouse.py` (21 cases on synthetic landmarks and a
+recording mouse).
+
+### 9. Mute from the pop-up — **done**
+
+The pop-up's mic button muted *everything*; there was no way to say "stop talking,
+keep listening", which is the common wish (a call, a recording, someone else in
+the room). `useVoice` now has a separate `silent` state, shared with the full
+window through `localStorage`, gating both the TTS request and playback; the
+pop-up bar has a speaker toggle and the quick-settings panel spells out both kinds
+of quiet. *"Mute yourself"* and *"you can speak again"* are the same switch said
+out loud — classified in the voice layer, so they never reach the chat, and
+distinct from "stop", which cuts the reply that is playing. Anything already
+queued stops at once: a mute that finishes its sentence is not a mute.
+
+### Where this leaves the suite
+
+1200 backend tests pass. Two failures are pre-existing and unrelated to this work
+(`test_buzzcaf_ports.py`: the copies of `buzzcaf_ports.py` and the ecosystem
+contract inside `BuzzcafAI/` have drifted from this repo's canonical ones — a sync
+the owner should make deliberately). `npx tsc --noEmit` is clean.
+
+## v13 (2026-09-11) — The right model for the moment, on the GPU or off it
+
+Requested as: "use a quicker but smart enough model like gemma 4 or you decide
+the best model, small for quick answers and has tooling, then move to another
+model for complex tasks. We can also offload some of the models from GPU if
+Dexter does not have this — implement it. Find the best models and create a
+plan." Built by an Opus implementation agent from `PLAN.md` v13, Phases 1-3, the
+same day.
+
+**What was measured first** (`backend/bench_models.py`, kept): cold load, VRAM as
+Ollama reports it, chat speed, and tool choice on 30 cases — the 15 from
+`test_agent_eval.py` plus 15 hard ones (two acts in one sentence, arguments that
+must be composed, a window that must be named, three questions that must *not*
+become a tool call). Same 8 candidate tools Dexter would hand the model; only the
+first call judged; nothing executed; `think:false`.
+
+| model | VRAM MiB | chat tok/s | tool choice | tool call latency | verdict |
+|---|---|---|---|---|---|
+| qwen2.5:3b (v12's fast tier) | 2059 | 175 | 20/30 | 0.45 s | calls tools for chat, wrong tool a third of the time |
+| granite4.1:3b | 2385 | 155 | 25/30 | 0.42 s | fast, but twice took a joke for a tool |
+| **qwen3.5:4b** | **2983** | **111** | **27/30** | 0.88 s | best of all seven; never called a tool on a question in the re-run |
+| gemma4:e2b-it-qat | 1573 | 170 | 26/30 | 0.62 s | smallest VRAM; once made a haiku a note |
+| qwen2.5:7b (v12's smart tier) | 4528 | 93 | 25/30 | 0.68 s | |
+| qwen3.5:9b | 5235 | 71 | 23/30 | 1.22 s | worse than its 4b sibling; dropped |
+| gemma-4-12b (v12 top rung) | 7630 | 52 | 26/30 | 1.51 s | best on the composed-argument cases; kept for real reasoning |
+
+Two measured facts shaped the build, and both are now load-bearing:
+
+1. **Thinking models returned nothing through Dexter's old path.** qwen3.5
+   through `/v1/chat/completions` spent all 200 tokens on reasoning and returned
+   empty content; `think:false` is ignored there. Through Ollama's native
+   `/api/chat` the same question answers in 0.6 s. So the Ollama provider now
+   speaks the native API.
+2. **Ollama keeps a model where you put it.** `options.num_gpu: 0` loads a model
+   on the CPU (3B: 24 tok/s, 0 MiB VRAM) and a later request *without* the option
+   keeps using that instance; `num_gpu: N` gives a partial split. So a model can
+   live in RAM while a render owns the card, and come back on its next load.
+
+Suite: whole backend **940 passed**, 1 skipped, ~100 s (the 2
+`test_buzzcaf_ports.py` failures are the known sibling-repo line-ending drift,
+unchanged by this work) · **46 new backend tests** · vitest **29 passed** (4 new)
+· `npx tsc --noEmit` and `npm run build` clean. Fakes only: no test loads,
+unloads, moves, pulls or starts anything on this machine — and the suite now
+*enforces* that rather than relying on each test remembering (see the conftest
+row).
+
+| Item | Status | Evidence |
+|---|---|---|
+| **Fast model decided by measurement (owner's session):** `gemma4:e4b-it-qat` pulled and benchmarked after the build - 27/30 tool choice (ties qwen3.5:4b), 2943 MiB VRAM, 106 tok/s, 0.70 s per tool call, never took a question for a command; `--fast-act`: settles **10/12** instructions without the big model (qwen3.5:4b 9/12) with one wrong action instead of two. Set in `.env` (`DEXTER_FAST_MODEL=gemma4:e4b-it-qat`); qwen3.5:4b stays the code default and the documented alternative. Gemma 3 ruled out: no tools capability on Ollama | ✅ | `bench_models.py` runs 16:0x-16:2x IST; `ollama show gemma4:e4b-it-qat` lists no `tools` badge yet every call parsed |
+| Fast-act gate widened (found live): "what track is playing right now" matched neither `looks_like_action` nor `needs_live_data`, the fast chat pass declined it, and it went to the 12B (7.8 s). Now any non-chain sentence that reaches escalation gets the fast model's one tool round | ✅ (bug fixed) | after the fix: 1.8 s `fast_act` with `get_now_playing`; "weather in Jaipur … umbrella" 2.2 s `fast_act` with `get_weather`; `test_router.py` 195 passed (+1, two older fakes taught about the acting round) |
+| CPU placement verified live: `ensure(place="cpu")` booked 6740 MiB RAM with Sentinel, `/api/ps` showed the e4b at 0 MiB VRAM, Dexter's own fast turn answered on it (7.6 s - degraded, but answering), `ensure(place="gpu")` brought it back in 4.5 s. Under real pressure the move asked for RAM and was **refused** (5739 MiB available while LM Studio was loading) and fell back to a plain unload, as designed | ✅ | `[Steward] live-cpu-check … resident in RAM`; `[Steward] fast-model-to-cpu: refused … not enough RAM`; `DEXTER_CPU_RUNG_MAX_MIB=6600` in `.env` because the e4b file is 5861 MiB |
+| Known: the VRAM estimate for a rung is its file size, and the e4b's file (5.9 GB, per-layer embeddings) is twice what it uses on the card (2.9 GB), so its startup booking over-asks by ~4 GB; `Decision.message()` words a *granted* CPU decision as a refusal (cosmetic) | open | `[Steward] startup: … 6885 MiB VRAM booked` vs `/api/ps` 2943 MiB |
+| **P1.1 Ollama's own `/api/chat`.** `hybrid_llm._chat_ollama_native()`: `messages`, `tools`, `stream`, `think`, `keep_alive`, `options`; content deltas to `on_token` exactly as the OpenAI path does; `message.tool_calls` parsed into the same `LLMResponse.tool_calls` shape; `eval_count` / `eval_duration` / `load_duration` kept in the new `LLMResponse.usage` | ✅ | `test_hybrid_native.py` (16 tests, fake server): content + usage, tool calls, NDJSON streaming, cancellation mid-stream (partial text, `cancelled`, no error), an error frame, a dead Ollama, a server that rejects `tools`, and a model that cannot think being asked again without the key |
+| P1.2 `chat(…, think=False, options=None, keep_alive=None)`; the Ollama provider takes the native path, every other provider ignores the extras | ✅ | `think:false` asserted on every native request by default; `options`/`keep_alive` pass-through pinned, including an explicit option winning over the default; LM Studio gets none of the three and still answers. `test_model_residency.py` and all 181 pre-v13 router tests unchanged and green. `DEXTER_OLLAMA_NATIVE=0` is the way back |
+| P1.3 A reply that is **only** reasoning is an error (`"model only thought"`), so the router escalates instead of showing nothing | ✅ | `hybrid_llm.ONLY_THOUGHT`; non-streaming and streaming both covered; reasoning *alongside* an answer is left alone, and a tool call after thinking counts as an answer. The inner monologue is never streamed to the UI |
+| **P2.1 Fast tier = `qwen3.5:4b`.** Router default, `settings_store` default, `.env`, `.env.example`. Blank still means "no fast tier" | ✅ | `test_settings_store.py`: the Settings row's default and effective value are `qwen3.5:4b` and agree with the router's own default |
+| Preflight warns when a tier's model is not pulled, and says the `ollama pull` line | ✅ | `preflight.check_llm` now checks `FAST_MODEL`, `SMART_MODEL` and `SMART_MODEL_FALLBACK` against what the servers list; WARN names the tag and the fix |
+| **P2.2 The fast model acts** (D1). `router._fast_act()` between Tier 1 and the escalation: one tool round on the small model with the same candidate set the big one would get, `think:false`, `max_tokens 300`, no `on_token`. A valid call runs and the reply is the tool's summary voiced in one line | ✅ | `test_router.py`: the tool runs, `action="fast_act"`, `agent_loop` is never reached, `data.fastAct` is set. 9 tests around the boundary |
+| …and escalates exactly as before on: no call, invalid arguments, a tool that was not on offer, a chain sentence, or a tool that failed. Confirm tools still ask. Never more than one round | ✅ | one test each; the hallucinated-tool and invalid-argument cases assert that **nothing ran**; `is_desktop_chain` sentences never reach the fast model at all; `DEXTER_FAST_ACT=0` restores v12 behaviour (the pre-existing "instructions skip the fast model" cases now run with the switch off, and still pass) |
+| The voiced line is a courtesy, never a risk: empty, padded, or sentinel-leaking output falls back to the tool's own summary | ✅ | `_voice_tool_result` + `test_the_voiced_line_falls_back_to_the_tools_own_summary` (4 bad shapes) |
+| P2.3 `bench_models.py --fast-act`: how many of the 30 cases the configured fast model would settle without escalation, by the router's own rules | ✅ code, ⏳ numbers | `bench_models.fast_act()`; it counts settled / escalated / **would have acted wrongly**, and skips the cases that are not instructions. Not run here — it needs a real model, and this build was not allowed to touch one. The owner's run fills in the number |
+| **P3.1 A third place to run** (D4). `model_steward.ensure(…, place="gpu"\|"cpu"\|"split", free_mib=…)`: `place="cpu"` books **RAM only** (`vram_mib=0`, file size + 15 %) and loads with `options={"num_gpu": 0}`; the place is remembered (`place_of`) and `loaded_models()` reports it | ✅ | `test_model_steward.py`: the load carries `num_gpu: 0`, the booking is 0 MiB of VRAM and `size × 1.15` of RAM, and a refusal of that RAM loads nothing and books nothing |
+| Moving is an unload and a fresh load, and only ever after the memory for the new place is granted. A model Ollama split by itself counts as "on the card" | ✅ | `_needs_move` is deliberately asymmetric — without it the keep-warm loop would reload the fast model every two minutes for ever; 5 cases pinned |
+| **P3.2 Ladder rung 3.** After every GPU rung is refused, the **fallback** rung is tried in RAM — only if its file is ≤ `DEXTER_CPU_RUNG_MAX_MIB` (5200). `data["ladder"]["place"] = "cpu"` | ✅ | `test_router.py`: both rungs refused → `ensure(place="cpu")` for `qwen2.5:7b` only, it answers, the ladder data says `cpu`; a 12B is never put there; RAM refused too → the existing `gpu_busy` path, unchanged |
+| The chat line reads "on qwen2.5:7b (CPU) — VrDeep holds 10.0 GB", and appears even when there was only one rung to begin with | ✅ | `ChatFeed.ladderLine` / `ladderWorthSaying`; 2 new vitest cases |
+| **P3.3 Shed rung 2: move, don't drop.** On `VramTight` red / `Preempt` the fast model is unloaded (the VRAM goes back first, always) and then reloaded into RAM when Sentinel grants it — "moved qwen3.5:4b to CPU" | ✅ | `test_model_steward.py`: red → unload then `num_gpu:0` load, step reads "moved …"; **RAM refused → the plain unload it always was**; a model too big for RAM is simply dropped |
+| `VramRelief` still loads nothing (D5). The fast model returns to the card on the next turn that used it — `_keep_fast_model_warm` → `ensure(place="gpu")` — and only if Sentinel grants the VRAM | ✅ | the relief handler is unchanged (`test_relief_ends_the_wait_early` still passes); `_warm_quietly` asks for the card back only when the model is wholly in RAM, and a refusal leaves it answering from RAM rather than costing us the copy we have |
+| `make_room` (v12, P2.2) does **not** move the fast model: the owner asked for an app, and loading 3 GB back into RAM in the same breath is the opposite of making room | ✅ | `shed(move_fast=False)`; `test_making_room_for_an_app_never_moves_the_fast_model`, and `test_tools_apps.py` pins the flag on the call |
+| **P3.4 Partial split.** `place="split"` puts `(free − headroom) / (file size / layer count)` layers on the card, layer count from Ollama's `/api/show`; used for the fast model only, only after a full GPU load is refused | ✅ | `split_layers` arithmetic pinned (9 layers of 36 from 2000 MiB free with 1024 of headroom; 0 when a single layer will not fit; capped at the model's own layer count; 0 when Ollama cannot say); a split load books both halves and names `num_gpu: 9`; `_warm_quietly` tries `gpu → split → cpu`, each with its own reservation |
+| **P3.5** The Resources panel names each resident model's place and size | ✅ | `ResourcePanel.modelLine` → "qwen3.5:4b 2.9 GB (CPU)", "qwen2.5:7b 4.9 GB (GPU)", "gemma-4-12b 2.0 GB (split)"; the rung line adds "in system memory"; 2 new vitest cases |
+| **The suite can no longer reach a real model.** `conftest.py` now stubs `llm_router.warm_model` / `release_model` / `set_keep_alive` (loud failure), `loaded_models` (empty) and `chat` (a "no provider" response) for every test | ✅ | found the hard way while building P2.2: a ladder test that never mentions a model asked the owner's live Ollama and it **listed the owner's open windows**. Ollama is running on this machine, so an unstubbed `chat()` does not fail — it succeeds, and then the tool it picked runs for real |
+
+**Two deliberate readings of the plan.**
+
+- P2.2 says the fast model escalates "after one tool round the task is not
+  done". A tool that returned `ok=False` is read as exactly that: the turn goes
+  to the big model rather than letting the small one repair its own mistake.
+- P3.3 says the shed rung moves the fast model on a `Preempt`. `make_room` also
+  raises a `Preempt`-level shed, and there the move is switched off on purpose
+  (row above) — the two callers want opposite things from the same rung.
+
+**Not verified live, and not committed.** Nothing here was run against the
+Dexter on port 8098, no model was loaded, moved or pulled, and `ollama` / `lms`
+were never invoked — the owner's session verifies live (`PLAN.md` v13 § Owner
+steps). `.env` now names `qwen3.5:4b` / `gemma-4-12b` / `qwen2.5:7b`; if a tag
+is missing on the machine the ladder skips that rung with a log line, as it has
+since v12.
+
+## v12 (2026-09-11) — Grow into the free card, step aside when it is needed
+
+Requested as: "buzzcode does not run every time, neither does buzzedit, how can
+sentinel handle this situation?" → a smart-model ladder, Dexter making room for
+an app the owner asked for, and a visible reason when it stepped down. Built by
+an Opus implementation agent from `PLAN.md` v12, Phases 1-3, the same day.
+
+**Why it happened.** Nothing here was a Sentinel bug. `router.smart_backend()`
+named exactly one model, so a free card bought nothing and a busy one cost the
+whole turn; and `tools_apps.open_app` read out the refusal even when the only
+thing standing in BuzzEdit's way was **Dexter's own resident model**. Sentinel
+was arbitrating correctly between claimants — one of the claimants just never
+offered to move.
+
+Suite: whole backend **894 passed**, 1 skipped, ~96 s (the 2 `test_buzzcaf_ports.py`
+failures are the known sibling-repo line-ending drift, unchanged by this work) ·
+**22 new backend tests** · vitest **25 passed** (4 new) · `npx tsc --noEmit` and
+`npm run build` clean. Fakes only: no test loads, unloads, starts or stops
+anything on this machine.
+
+| Item | Status | Evidence |
+|---|---|---|
+| **Verified live (owner's session, 15:20-15:25 IST):** top rung `gemma-4-12b` imported into Ollama from the LM Studio GGUF (7.4 GB, tools capability) and set via Settings; free card → Sentinel granted 6144 MiB, the 12B answered with the weather tool (43 s cold, 13 s warm); with ~9.6 GB held by LM Studio + an inflated-context 3B → log `smart ladder: gemma-4-12b refused, trying qwen2.5:7b`, 7B granted, `/api/dexter/resources` → `ladder.steppedDownFrom = gemma-4-12b`; both refused → the existing `gpu_busy_degraded` reply on the resident 3B | ✅ | `data/dexter.log` 15:19:56 (granted 6144), 15:24:59 (both DENIED, 5479 available), 15:25:26 (fallback granted); backend 894 passed re-run |
+| **The ladder.** `DEXTER_SMART_MODEL` (top) then `DEXTER_SMART_MODEL_FALLBACK` (default `qwen2.5:7b`); `router.smart_ladder()` resolves each rung with `llm_router.provider_for_model`, deduplicates, and skips a rung nobody serves with one log line | ✅ | `router.SMART_MODEL_FALLBACK`, `smart_ladder`, `_rung_backend`; tests: skipped rung, same tag on both rungs = one rung, no top rung = no ladder (the backend's own default, exactly as before v12) |
+| Every escalation walks it: `sentinel_reserve_for_smart` per rung, first grant wins, `_release_smart_model_soon` for the rung **actually used**. All refused → the existing `gpu_busy` / resident-fallback path, untouched | ✅ | `test_router.py`: top granted → only the top is asked for; top refused → `["gemma-4-12b", "qwen2.5:7b"]` asked, `qwen2.5:7b` run, the refused rung never loaded; every rung refused → `gpu_busy`, nothing loaded. The four pre-v12 Sentinel tests still pass unchanged |
+| **Sentinel stays the judge** (D2): the ladder changes what is asked for, never whether a refusal is honoured | ✅ | no new load path; `model_steward` is still the only door (the monopoly grep test still passes) |
+| `shed()` gives back **every** resident smart rung, not just the top one; `resident_fallback` prefers the fast model, then any rung | ✅ | `test_model_steward.py`: 12B + 7B both resident → both unloaded, neither mistaken for "not ours"; fallback picks a resident rung when the 3B is gone |
+| Settings → Model → *Smart model (fallback)*, live-reloading `router.SMART_MODEL_FALLBACK`, options read from the servers; `.env.example` documents both rungs | ✅ | `settings_store.SETTINGS` row `smartModelFallback`; `test_settings_store.py` live-patches the attribute and asserts `liveReload`; blank = one rung |
+| **Make room** (D3): `model_steward.blockers_are_ours` is true only when *every* blocker Sentinel named is Dexter's own runner ("Ollama runner (Dexter)", `ollama.exe`, or a `llama-server.exe` whose parent is `ollama.exe`) | ✅ | unit-tested on the blocker shapes `sentinel_client` returns: our runner ✓, VrDeep ✗, buzzcode's llama-server ✗, mixed list ✗, empty list ✗, stray llama-server only when Ollama is its parent |
+| `open_app`: refused + the blocker is ours → `shed("preempt", "making room for <app>")`, `release("making room")`, wait for `VramRelief` or up to `DEXTER_RELEASE_GRACE_SECS` (10 s), **re-query**, then launch. The summary says what was given back | ✅ | `test_tools_apps.py`: "Gave back qwen2.5:7b (4.9 GB) so Batchy could start. Batchy is up." · refused with **VrDeep** as the blocker → no shed at all, the existing "Not enough room" reply · a refusal that survives the shed launches nothing |
+| Same step behind `start_local_model` (buzzcode's engine, 12.5 GB) | ✅ | `tools_code._make_room_for_engine`; `test_code_agent.py`: ours → shed then start, "Gave back … so the coding engine could start."; VrDeep → no shed, the engine's own refusal is reported |
+| **Say so** (D4): a stepped-down turn carries `data["ladder"] = {model, provider, steppedDownFrom, blockers}`; a turn that got its first choice carries nothing | ✅ | `test_router.py` pins the exact dict, and `"ladder" not in res.data` on a top-rung turn. No apology text in the reply itself |
+| The chat shows one quiet line under such a reply | ✅ | `ChatFeed.ladderLine` → "on qwen2.5:7b — BuzzEdit holds 9.0 GB"; 2 vitest cases (rendered when stepped down, absent otherwise) |
+| `ResourcePanel` shows the current rung and why, from the last turn over the events bus | ✅ | `model_steward.note_ladder` / `last_ladder` → `snapshot()["ladder"]`, published as `resources`; "Thinking on **qwen2.5:7b** — stepped down from gemma-4-12b (BuzzEdit has the card)"; 2 vitest cases, including "absent → no line, no crash" |
+| **No eager warming** (D5): `VramRelief` still loads nothing — it only unblocks a `make_room` that is waiting for exactly that news | ✅ | `_dispatch` sets `_relief` and publishes; `test_relief_ends_the_wait_early` |
+| P1.5 `vram_estimate` logs which number it used (Ollama's real file size vs the configured budget); no behaviour change for Ollama tags | ✅ | `model_steward.vram_estimate` debug line; the existing estimate tests are unchanged |
+
+**One deliberate reading of the plan.** P3.1's item text says `data["ladder"]`
+goes on *every* agent turn; its acceptance column says "present on stepped-down
+turns, absent otherwise". The acceptance wins — a good turn should not carry an
+explanation — and the panel's need for the current rung is served by the
+steward's `last_ladder()` instead, which is set on every escalation.
+
+**Not done, because it is not code.** The top rung is still `qwen2.5:7b` on this
+machine: importing a better model is the owner's step (`PLAN.md` v12 § Owner
+steps — `ollama create gemma-4-12b` from the GGUF already in LM Studio's folder,
+then Settings → Model). Until then the ladder has one rung and behaves exactly
+as v11.1 did. Nothing here was verified against the running Dexter on 8098; it
+was not restarted, and no commit was made.
+
 ## v11.1 (2026-09-11) — it hears you, and it can do the rest
 
 Requested as: "check what was done in last session, and why dexter is not able

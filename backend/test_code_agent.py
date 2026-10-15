@@ -216,3 +216,59 @@ def test_finished_job_releases_the_engine_dexter_started(monkeypatch, tmp_path):
     agent._finish(job)
     assert job.status == "done" and stopped == [True]
     assert any("stopped the local model server" in w for w in job.warnings)
+
+
+# ── v12, P2.3: the engine needs 12.5 GB, so Dexter steps aside for it too ──
+
+
+def test_starting_the_engine_gives_dexters_own_model_back_first(monkeypatch):
+    """Same rule as an app the owner asked for: our own models, nobody else's."""
+    import model_steward
+
+    blocker = {"label": "Ollama runner (Dexter)", "pid": 4711, "vram_mib": 5000}
+    shed = []
+    monkeypatch.setattr(model_steward, "query", lambda purpose, vram, ram=None: (
+        model_steward.Decision(granted=False, purpose=purpose, vram_mib=vram,
+                               ram_mib=ram or 0, reason="not enough VRAM",
+                               blockers=[blocker], details={"free_mib": 1200,
+                                                            "blockers": [blocker]})
+    ))
+    monkeypatch.setattr(model_steward, "shed", lambda level="orange", reason="", want_mib=0, move_fast=True: (
+        shed.append((level, reason))
+        or {"level": level, "steps": ["unloaded qwen2.5:7b"], "freedMib": 5017}
+    ))
+    monkeypatch.setattr(model_steward, "release", lambda why="": None)
+    monkeypatch.setattr(model_steward, "_resident_mib", lambda: 0)
+    # The second query is the one that decides; make_room asks it itself.
+    monkeypatch.setattr(model_steward, "make_room", model_steward.make_room)
+    monkeypatch.setattr(code_agent.code_agent, "start_engine", lambda: {
+        "online": True, "started": True, "model": "qwen3.8-27b",
+        "url": "http://127.0.0.1:8089/v1",
+    })
+
+    result = tools_code.start_local_model()
+
+    assert shed == [("preempt", "making room for the coding engine")]
+    assert result.ok
+    assert result.summary.startswith("Gave back qwen2.5:7b (4.9 GB) so the coding engine could start.")
+
+
+def test_the_engine_does_not_shed_for_somebody_elses_render(monkeypatch):
+    import model_steward
+
+    vrdeep = {"process": "VrDeep", "pid": 33228, "vram_mib": 10240, "class": "batch"}
+    shed = []
+    monkeypatch.setattr(model_steward, "query", lambda purpose, vram, ram=None: (
+        model_steward.Decision(granted=False, purpose=purpose, vram_mib=vram,
+                               ram_mib=ram or 0, reason="not enough VRAM",
+                               blockers=[vrdeep], details={"free_mib": 1200})
+    ))
+    monkeypatch.setattr(model_steward, "shed", lambda *a, **k: shed.append(a) or {})
+    monkeypatch.setattr(code_agent.code_agent, "start_engine", lambda: (_ for _ in ()).throw(
+        RuntimeError("Sentinel won't give me 12.2 GB of video memory right now.")
+    ))
+
+    result = tools_code.start_local_model()
+
+    assert shed == []
+    assert result.ok is False and "12.2 GB" in result.summary

@@ -10,15 +10,43 @@ is up.
 
 from typing import Optional
 
+import model_steward
 from code_agent import code_agent, known_projects, project_from_text, resolve_project
 from tool_registry import ToolResult, tool
+
+
+def _make_room_for_engine() -> str:
+    """Step aside for buzzcode's 12.5 GB, when *we* are what is in the way.
+
+    The engine is the most demanding thing on this machine after a render, and
+    "buzzcode does not run every time" was usually Dexter's own smart model
+    holding the last few gigabytes. Same rule as `open_app` (v12, P2.3): only
+    our own models, never anyone else's work.
+    """
+    try:
+        decision = model_steward.query(
+            "buzzcode-engine", model_steward.ENGINE_VRAM_MIB, model_steward.ENGINE_RAM_MIB,
+        )
+        if decision.granted:
+            return ""
+        room = model_steward.make_room(
+            "buzzcode-engine", "the coding engine",
+            model_steward.ENGINE_VRAM_MIB, model_steward.ENGINE_RAM_MIB,
+            blockers=decision.blockers,
+        )
+        return (room["note"] + " ") if room.get("note") else ""
+    except Exception:
+        # Making room is an optimisation; `start_engine` still asks Sentinel
+        # properly and reports the holder if the answer is still no.
+        return ""
 
 
 @tool(
     name="code_task",
     description=(
         "Delegate a coding task to buzzcode, the local coding agent, inside one of the user's repositories "
-        "(dexter, BuzzcafAI, BuzzBrain, codeBuzz, ...). It opens in its own terminal window; returns immediately and "
+        "(dexter, BuzzcafAI, BuzzBrain, BuzzCode, ...) - including dexter's own code. It opens in its own "
+        "terminal window; returns immediately and "
         "the result arrives when the job ends. "
         "mode 'edits' lets it change files only; 'yolo' also lets it run commands and needs the user to ask for it."
     ),
@@ -137,14 +165,23 @@ def list_code_projects() -> ToolResult:
     category="code",
 )
 def start_local_model() -> ToolResult:
+    gave_back = _make_room_for_engine()
     try:
         info = code_agent.start_engine()
     except RuntimeError as exc:
-        return ToolResult.fail(str(exc))
+        return ToolResult.fail(f"{gave_back}{exc}".strip())
     if info.get("online"):
         verb = "started" if info.get("started") else "was already running"
-        return ToolResult(ok=True, summary=f"The local model {verb}: {info.get('model')} on {info['url']}.", data=info)
-    return ToolResult(ok=True, summary="The engine is starting; the model is still loading (check again in a minute).", data=info)
+        return ToolResult(
+            ok=True,
+            summary=f"{gave_back}The local model {verb}: {info.get('model')} on {info['url']}.",
+            data={**info, "gaveBack": gave_back.strip()},
+        )
+    return ToolResult(
+        ok=True,
+        summary=f"{gave_back}The engine is starting; the model is still loading (check again in a minute).",
+        data={**info, "gaveBack": gave_back.strip()},
+    )
 
 
 @tool(
@@ -170,3 +207,41 @@ def stop_local_model() -> ToolResult:
     if code_agent.stop_engine():
         return ToolResult(ok=True, summary="Stopped the local model server.", data={})
     return ToolResult(ok=True, summary="Dexter did not start that server, so it was left alone.", data={})
+
+
+@tool(
+    name="reinstall_dexter",
+    description=(
+        "Rebuild and reinstall Dexter itself after its code has changed: reinstall the Python "
+        "dependencies (requirements.txt) and rebuild the front end (npm run build), in a visible "
+        "terminal window. Use this after buzzcode has edited the dexter repo (code_task with "
+        "project 'dexter'), so the changes take effect. Set restart=true to relaunch Dexter when "
+        "the build succeeds. Runs in its own console and returns immediately."
+    ),
+    params={
+        "restart": {"type": "boolean", "description": "Relaunch Dexter after a clean build", "required": False},
+        "deps_only": {"type": "boolean", "description": "Only reinstall Python deps, skip the front-end build", "required": False},
+    },
+    examples=[
+        "reinstall dexter",
+        "rebuild dexter and restart it",
+        "reinstall dexter after the changes",
+        "update dexter's install",
+        "reinstall dexter dependencies only",
+    ],
+    category="code",
+)
+def reinstall_dexter(restart: Optional[bool] = False, deps_only: Optional[bool] = False) -> ToolResult:
+    import self_update
+
+    result = self_update.reinstall_dexter(restart=bool(restart), frontend=not bool(deps_only))
+    if not result.get("ok"):
+        return ToolResult.fail(result.get("error", "Couldn't start the reinstall."))
+    steps = " and ".join(result.get("steps") or ["build"])
+    tail = " I'll relaunch Dexter when it finishes cleanly." if result.get("restart") else \
+        " Restart Dexter yourself once it's done, or say 'reinstall dexter and restart'."
+    return ToolResult(
+        ok=True,
+        summary=f"Reinstalling Dexter in a terminal window ({steps}). Watch it there.{tail}",
+        data=result,
+    )

@@ -10,7 +10,7 @@ acted on, it refuses rather than guesses when focus cannot be confirmed, and onl
 `kill_app` is destructive - which is why it is the one tool here that asks first.
 """
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import desktop_control as dc
 from tool_registry import ToolResult, tool
@@ -28,6 +28,25 @@ def _guard(fn: Callable[[], ToolResult]) -> ToolResult:
 def _in(info: Dict[str, Any]) -> str:
     window = info.get("window") or ""
     return f" in {window}" if window else ""
+
+
+def _stop_via_registry(name: str) -> Optional[ToolResult]:
+    """Stop one of the owner's own projects its own way, or None if it isn't one.
+
+    "Close BuzzAnimate" is a window command for Notepad and a *shutdown* for a
+    project with a stop route; going through the registry means the Studio gets
+    its /shutdown POST and a render is asked about before it is ended.
+    """
+    try:
+        import apps_registry
+        import tools_apps
+
+        record = apps_registry.resolve(name)
+        if not record or (record.get("stop") or {}).get("strategy", "none") == "none":
+            return None
+        return tools_apps.stop_app(record.get("id") or name)
+    except Exception:
+        return None
 
 
 @tool(
@@ -63,10 +82,11 @@ def press_keys(keys: str, window: Optional[str] = None) -> ToolResult:
     name="type_text",
     description=(
         "Type a sentence into the window the user is working in, as if typed on the keyboard. "
-        "Set submit to press Enter afterwards."
+        "Optionally set into to click or focus a specific field or box first. Set submit to press Enter afterwards."
     ),
     params={
         "text": {"type": "string", "description": "The text to type"},
+        "into": {"type": "string", "description": "Optional field or box to click before typing", "required": False},
         "submit": {"type": "boolean", "description": "Press Enter after typing", "required": False},
         "window": {"type": "string", "description": "Optional app or window title to type into", "required": False},
         "allow_secret": {"type": "boolean", "description": "Only when the user insists: type something that looks like a password", "required": False},
@@ -74,22 +94,24 @@ def press_keys(keys: str, window: Optional[str] = None) -> ToolResult:
     examples=[
         "type hello world",
         "type out 'thanks for watching' for me",
-        "write my email address here",
+        "write my email address in the email field",
         "type this into the document: the render finished at 2am",
-        "type lo-fi beats and press enter",
+        "type lo-fi beats into the search bar in spotify and press enter",
     ],
     category="desktop",
 )
 def type_text(
     text: str,
+    into: Optional[str] = None,
     submit: bool = False,
     window: Optional[str] = None,
     allow_secret: bool = False,
 ) -> ToolResult:
     def _do():
-        info = dc.type_text(text, submit=bool(submit), window=window, allow_secret=bool(allow_secret))
+        info = dc.type_text(text, submit=bool(submit), window=window, allow_secret=bool(allow_secret), into=into)
         tail = " and pressed Enter" if info.get("submitted") else ""
-        return ToolResult(ok=True, summary=f"Typed it{tail}{_in(info)}.", data=info)
+        target = f" into {info['into']}" if info.get("into") else ""
+        return ToolResult(ok=True, summary=f"Typed it{target}{tail}{_in(info)}.", data=info)
 
     return _guard(_do)
 
@@ -268,6 +290,22 @@ def arrange_window(action: str, window: Optional[str] = None) -> ToolResult:
 def close_app(name: str) -> ToolResult:
     def _do():
         info = dc.close_app(name)
+        if info.get("windowless"):
+            # Running, but nothing to click an X on. If it is one of the owner's
+            # own projects the registry knows how it is meant to be stopped; that
+            # is a proper shutdown, not a kill.
+            handled = _stop_via_registry(name)
+            if handled is not None:
+                return handled
+            pids = ", ".join(str(p) for p in info.get("pids", [])[:4])
+            return ToolResult(
+                ok=False,
+                summary=(
+                    f"{info['app']} is running ({info.get('how') or 'matched'}, pid {pids}) but has "
+                    "no window I can close politely. Say \"force stop it\" and I'll end the process."
+                ),
+                data=info,
+            )
         if info["remaining"]:
             return ToolResult(
                 ok=True,
@@ -395,3 +433,151 @@ def desktop_status() -> ToolResult:
         + ("Everything's available." if not missing else f"Missing: {', '.join(missing)}.")
     )
     return ToolResult(ok=True, summary=summary, data={"desktop": state, "chrome": chrome})
+
+
+# ───────────────────────── reading and driving another app's UI (v13) ─────────────────────────
+#
+# "Control BuzzcafAI, select tabs and text from it, while I'm sitting away from
+# the machine." The Studio is a web view in a desktop window, like most of the
+# owner's apps; Windows exposes its controls by name through UI Automation, so
+# the tabs and buttons in it can be listed and pressed without a screenshot or a
+# vision model - and its text can be copied out the way a person would.
+
+
+@tool(
+    name="list_controls",
+    description=(
+        "List the things that can be clicked in an app's window - tabs, buttons, "
+        "links, list items - by name. Use before clicking when the exact label "
+        "isn't known, or to answer 'what tabs does it have'."
+    ),
+    params={
+        "window": {"type": "string", "description": "App or window title, e.g. 'buzzcafai', 'chrome'",
+                   "required": False},
+        "kind": {"type": "string", "description": "Only one kind: tab, button, link, listitem, menuitem",
+                 "required": False},
+        "contains": {"type": "string", "description": "Only names containing this", "required": False},
+    },
+    examples=[
+        "what tabs does buzzcafai have",
+        "what can I click in the studio",
+        "list the buttons in this window",
+        "what controls are in buzzedit",
+        "show me the tabs in the studio",
+    ],
+    category="desktop",
+)
+def list_controls(window: Optional[str] = None, kind: Optional[str] = None,
+                  contains: Optional[str] = None) -> ToolResult:
+    _KINDS = {
+        "tab": ("TabItem",), "tabs": ("TabItem",),
+        "button": ("Button",), "buttons": ("Button",),
+        "link": ("Hyperlink",), "links": ("Hyperlink",),
+        "listitem": ("ListItem",), "list": ("ListItem",),
+        "menuitem": ("MenuItem",), "menu": ("MenuItem",),
+        "edit": ("Edit",), "field": ("Edit",), "fields": ("Edit",),
+    }
+
+    def _do():
+        types = _KINDS.get((kind or "").strip().lower())
+        rows = dc.find_clickables(contains or "", window=window, types=types)
+        named = [r for r in rows if r.get("element") is not None]
+        if not named:
+            seen = (rows[0].get("seen") if rows else []) or []
+            if seen:
+                return ToolResult(
+                    ok=True,
+                    summary=f"Nothing matching that; I can see: {', '.join(dict.fromkeys(seen))[:400]}",
+                    data={"names": seen},
+                )
+            return ToolResult.fail(
+                "That window exposes nothing I can read. Some apps (games, custom "
+                "renderers) don't publish their controls to Windows at all."
+            )
+        labels: List[str] = []
+        for row in named:
+            label = f"{row['label']} [{row['kind']}]"
+            if label not in labels:
+                labels.append(label)
+        return ToolResult(
+            ok=True,
+            summary=f"{len(labels)} control(s): " + "; ".join(labels[:40]),
+            data={"controls": [{"label": r["label"], "kind": r["kind"]} for r in named]},
+        )
+
+    return _guard(_do)
+
+
+@tool(
+    name="click_in_app",
+    description=(
+        "Click a named tab, button or link inside another app's window - the app is "
+        "brought forward first. Use for 'open the projects tab in buzzcafai'."
+    ),
+    params={
+        "text": {"type": "string", "description": "The visible label, e.g. 'Projects'"},
+        "app": {"type": "string", "description": "App or window title, e.g. 'buzzcafai'"},
+        "nth": {"type": "integer", "description": "Which match, when several share the label",
+                "required": False},
+    },
+    examples=[
+        "open the projects tab in buzzcafai",
+        "click the assets tab in the studio",
+        "press run in buzzedit",
+        "click the second result in the studio",
+        "switch to the settings tab in buzzcafai",
+    ],
+    category="desktop",
+)
+def click_in_app(text: str, app: str, nth: int = 1) -> ToolResult:
+    def _do():
+        clean_app = (app or "").strip().lower()
+        if clean_app in ("mission reminder", "missionreminder", "mission_reminder", "machine reminder", "missing reminder", "messenger minder"):
+            try:
+                import mission_bridge
+                canonical = mission_bridge.normalize_tab(text)
+                if canonical in mission_bridge.ui()["tabs"]:
+                    info = mission_bridge.go_to(canonical)
+                    tab_name = str(info.get("tab", text)).capitalize()
+                    return ToolResult(ok=True, summary=f"Switched to the {tab_name} tab in Mission Reminder.", data=info)
+            except Exception:
+                pass
+        info = dc.click_text(text, window=app, nth=int(nth or 1))
+        more = f" ({info['matches']} matched)" if info.get("matches", 1) > 1 else ""
+        return ToolResult(ok=True, summary=f"Clicked '{info['clicked']}'{_in(info)}{more}.", data=info)
+
+    return _guard(_do)
+
+
+@tool(
+    name="copy_text_from",
+    description=(
+        "Copy text out of another app and read it back: the current selection, or "
+        "everything with select_all. Works in web views and editors alike."
+    ),
+    params={
+        "window": {"type": "string", "description": "App or window title", "required": False},
+        "select_all": {"type": "boolean", "description": "Select everything first (Ctrl+A)",
+                       "required": False},
+    },
+    examples=[
+        "copy the text from buzzcafai",
+        "what's selected in the studio",
+        "grab the text out of this window",
+        "select everything in notepad and copy it",
+        "read me what's selected",
+    ],
+    category="desktop",
+)
+def copy_text_from(window: Optional[str] = None, select_all: bool = False) -> ToolResult:
+    def _do():
+        info = dc.copy_from(window=window, select_all=bool(select_all))
+        text = info["text"]
+        preview = text[:600].strip() + ("..." if len(text) > 600 else "")
+        return ToolResult(
+            ok=True,
+            summary=f"{info['window']} ({info['length']} chars): {preview}",
+            data=info,
+        )
+
+    return _guard(_do)

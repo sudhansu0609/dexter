@@ -21,7 +21,7 @@ import threading
 import time
 import traceback
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(BACKEND_DIR)
@@ -32,16 +32,76 @@ import env_boot  # noqa: E402,F401  - loads .env for every entry point
 
 try:
     import logging_setup  # noqa: E402,F401  - route prints into data/dexter.log
+    logging_setup.setup()
 except Exception:  # pragma: no cover - logging is a convenience, not a gate
     pass
 
 import buzzcaf_ports  # noqa: E402  - the shared port ledger (GUARDIAN_PLAN section 11)
 
 HOST = "127.0.0.1"
-#: The port Dexter would *like*. It is a wish: if something already holds it,
-#: Dexter steps forward rather than killing whatever is there, and publishes
-#: where it landed so the Studio, BuzzBrain and the suite can still find it.
+#: The address uvicorn binds to. Loopback identity stays `HOST`; `DEXTER_BIND`
+#: opens the socket up (0.0.0.0) so the phone can reach Dexter over Tailscale.
+BIND_HOST = os.getenv("DEXTER_BIND", HOST).strip() or HOST
+#: The port Dexter would *like*.
 PREFERRED_PORT = int(os.getenv("DEXTER_PORT") or 8098)
+
+MUTEX_NAME = "Local\\DexterDesktopAppSingleInstanceMutex"
+_instance_mutex = None
+
+
+def _is_already_running() -> bool:
+    """Return True if another instance of Dexter Desktop is already running."""
+    global _instance_mutex
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+        mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        last_error = kernel32.GetLastError()
+        if last_error == ERROR_ALREADY_EXISTS:
+            return True
+        _instance_mutex = mutex
+        return False
+    except Exception as exc:
+        print(f"[Desktop] Single-instance mutex check: {exc}")
+        return False
+
+
+def _activate_existing_instance() -> None:
+    """Signal an existing instance of Dexter to unhide and focus its window."""
+    # 1. First notify the active Dexter backend via POST /api/dexter/show
+    for port in (PREFERRED_PORT, 8098, 8099):
+        try:
+            req = urllib.request.Request(
+                f"http://{HOST}:{port}/api/dexter/show",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                if resp.status in (200, 204):
+                    print(f"[Desktop] Existing instance on port {port} signaled to show.")
+                    break
+        except Exception:
+            pass
+
+    # 2. Also bring the native window forward via Win32 FindWindow
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            SW_RESTORE = 9
+            hwnd = user32.FindWindowW(None, "Dexter")
+            if hwnd:
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                user32.SetForegroundWindow(hwnd)
+                print(f"[Desktop] Brought existing Dexter window (HWND {hwnd}) to front.")
+        except Exception as exc:
+            print(f"[Desktop] FindWindow activation warning: {exc}")
+
+
 PORT = buzzcaf_ports.pick_port(PREFERRED_PORT, host=HOST)
 # Hand the decision to main.py before it is imported: its CORS list, its
 # /health body and this window all have to name the same number.
@@ -60,7 +120,82 @@ DEFAULT_WINDOW = {"width": 520, "height": 760}
 MIN_WIDTH, MIN_HEIGHT = 380, 520
 POPUP_SIZE = (380, 250)
 POPUP_MARGIN = (16, 72)   # from the right edge, and above the taskbar
-START_MODE = os.getenv("DEXTER_START_MODE", "popup").strip().lower()
+
+RUN_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_NAME = "DexterTray"
+
+
+def is_autostart_enabled() -> bool:
+    """Check if Dexter is registered to auto-start in Windows CurrentVersion\\Run."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REG_KEY, 0, winreg.KEY_READ) as key:
+            try:
+                val, _ = winreg.QueryValueEx(key, AUTOSTART_NAME)
+                return bool(val)
+            except FileNotFoundError:
+                return False
+    except Exception as exc:
+        print(f"[Desktop] Could not check autostart: {exc}")
+        return False
+
+
+def set_autostart(enabled: bool) -> bool:
+    """Register or unregister Dexter in Windows CurrentVersion\\Run."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            if enabled:
+                exe_path = os.path.join(ROOT_DIR, "Dexter.exe")
+                if os.path.exists(exe_path):
+                    cmd = f'"{exe_path}" --tray'
+                else:
+                    vbs_path = os.path.join(ROOT_DIR, "Dexter.vbs")
+                    wscript_path = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "wscript.exe")
+                    cmd = f'"{wscript_path}" "{vbs_path}" --tray'
+                winreg.SetValueEx(key, AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)
+                print(f"[Desktop] Autostart enabled: {cmd}")
+            else:
+                try:
+                    winreg.DeleteValue(key, AUTOSTART_NAME)
+                    print("[Desktop] Autostart disabled.")
+                except FileNotFoundError:
+                    pass
+        return True
+    except Exception as exc:
+        print(f"[Desktop] Could not set autostart: {exc}")
+        return False
+
+
+def get_start_mode() -> str:
+    """
+    Resolve startup mode: 'tray' | 'popup' | 'full'.
+    Supports CLI arguments (--tray, --hidden, --minimized, --full, --popup)
+    and environment variable DEXTER_START_MODE.
+    """
+    args = [a.lower() for a in sys.argv[1:]]
+    if any(a in args for a in ("--tray", "--hidden", "--minimized")):
+        return "tray"
+    if "--full" in args:
+        return "full"
+    if "--popup" in args:
+        return "popup"
+
+    mode = os.getenv("DEXTER_START_MODE", "popup").strip().lower()
+    if mode in ("tray", "hidden", "minimized"):
+        return "tray"
+    if mode == "full":
+        return "full"
+    return "popup"
+
+
+START_MODE = get_start_mode()
 
 MB_ERROR, MB_WARNING = 0x10, 0x30
 
@@ -69,6 +204,7 @@ MB_ERROR, MB_WARNING = 0x10, 0x30
 # hides the window and everything keeps running; Quit lives in the tray menu.
 TRAY_ENABLED = os.getenv("DEXTER_TRAY", "1") != "0"
 HOTKEY = os.getenv("DEXTER_HOTKEY", "ctrl+alt+d")
+
 
 
 def _message_box(title: str, text: str, icon: int = MB_ERROR) -> None:
@@ -189,6 +325,114 @@ def _resolve_target_url() -> str:
 # ───────────────────────── window geometry ─────────────────────────
 
 
+# ── raising a window without deadlocking the interpreter (v13.7c) ──
+#
+# See `DexterShell._raise` for the whole story. In short: pywebview's `on_top`
+# becomes a synchronous SetWindowPos inside .NET, pythonnet holds the GIL across
+# it, and the GUI thread needs the GIL to answer - so the process stops dead.
+# These do the same job through ctypes, which releases the GIL, and ask Windows to
+# *post* the change rather than wait for it.
+HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+SWP_NOSIZE, SWP_NOMOVE = 0x0001, 0x0002
+SWP_NOACTIVATE, SWP_ASYNCWINDOWPOS = 0x0010, 0x4000
+SW_RESTORE = 9
+
+
+def _nudge_to_front(handle: int) -> None:
+    """Lift a window above the others in this process, without waiting for it."""
+    if not handle or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+        user32 = ctypes.windll.user32
+        # Topmost, then back: the pop-up is permanently on top, so a full window
+        # that merely rises to the front of the normal band still ends up behind
+        # it. Asking twice is what puts it above everything for the moment it
+        # needs, without making it sticky.
+        user32.SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, flags)
+        user32.SetWindowPos(handle, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
+    except Exception as exc:
+        print(f"[Desktop] Could not raise the window: {exc}")
+
+
+def _place(handle: int, x: int, y: int, width: int, height: int) -> bool:
+    """Move and size a window, posted rather than sent.
+
+    `window.move()` and `window.resize()` are the same hazard as `on_top`: .NET
+    property sets that end in a synchronous SetWindowPos while pythonnet holds the
+    GIL. This is called to rescue a window that opened off-screen, which is not a
+    moment to risk freezing the process.
+    """
+    if not handle or sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+
+        flags = SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+        return bool(ctypes.windll.user32.SetWindowPos(
+            handle, 0, int(x), int(y), int(width), int(height), flags))
+    except Exception as exc:
+        print(f"[Desktop] Could not place the window: {exc}")
+        return False
+
+
+def _restore(handle: int) -> None:
+    """Un-minimize, through Win32 rather than pywebview's `restore()`.
+
+    Same reasoning: `WindowState = Normal` is another marshalled .NET property
+    that moves the window, and this path has to be safe to call from any thread.
+    """
+    if not handle or sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if user32.IsIconic(handle):
+            user32.ShowWindow(handle, SW_RESTORE)
+    except Exception:
+        pass
+
+
+def virtual_screen() -> Dict[str, int]:
+    """The rectangle every monitor together covers, for judging a saved position."""
+    try:
+        import ctypes
+
+        metrics = ctypes.windll.user32.GetSystemMetrics
+        return {"left": int(metrics(76)), "top": int(metrics(77)),
+                "width": int(metrics(78)) or 1920, "height": int(metrics(79)) or 1080}
+    except Exception:
+        return {"left": 0, "top": 0, "width": 1920, "height": 1080}
+
+
+def on_screen(x: Any, y: Any, width: int, height: int) -> bool:
+    """Would a window at this position actually be visible to somebody?
+
+    This is the check whose absence hid the main window (v13.4). Windows reports a
+    **minimized** window's position as (-32000, -32000); `_save_window` stored that
+    on a close-while-minimized, and every launch afterwards created the window
+    32000 pixels off-screen. It opened perfectly, where nobody could see it - which
+    from the outside is exactly "the maximised version of this app is not opening".
+    """
+    if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+        return False
+    x, y = int(x), int(y)
+    if x <= -30000 or y <= -30000:
+        return False  # the minimized sentinel, or nonsense
+    screen = virtual_screen()
+    # At least this much of the title bar has to be inside the desktop for the
+    # window to be reachable with a mouse.
+    margin = 120
+    if x + width < screen["left"] + margin or x > screen["left"] + screen["width"] - margin:
+        return False
+    if y + height < screen["top"] + margin or y > screen["top"] + screen["height"] - margin:
+        return False
+    return True
+
+
 def _load_window() -> Dict[str, Any]:
     try:
         from jsonstore import load_json
@@ -201,19 +445,52 @@ def _load_window() -> Dict[str, Any]:
         value = saved.get(key)
         if isinstance(value, (int, float)):
             geometry[key] = int(value)
-    geometry["width"] = max(MIN_WIDTH, geometry["width"])
-    geometry["height"] = max(MIN_HEIGHT, geometry["height"])
+    screen = virtual_screen()
+    geometry["width"] = max(MIN_WIDTH, min(int(geometry["width"]), screen["width"]))
+    geometry["height"] = max(MIN_HEIGHT, min(int(geometry["height"]), screen["height"]))
+    # A remembered position that is off every monitor (an unplugged second screen,
+    # or the minimized sentinel) is dropped rather than honoured: pywebview centres
+    # the window when x and y are absent.
+    if not on_screen(geometry.get("x"), geometry.get("y"),
+                     geometry["width"], geometry["height"]):
+        if geometry.get("x") is not None or geometry.get("y") is not None:
+            print(f"[Desktop] Ignoring a remembered window position that is off-screen "
+                  f"({geometry.get('x')},{geometry.get('y')}); centring instead.")
+        geometry.pop("x", None)
+        geometry.pop("y", None)
     return geometry
 
 
 def _save_window(window: Any) -> None:
-    try:
-        from jsonstore import save_json
+    """Remember the size and position - unless the window is minimized.
 
-        save_json(WINDOW_FILE, {
-            "width": int(window.width), "height": int(window.height),
-            "x": int(window.x), "y": int(window.y),
-        })
+    A minimized window reports (-32000, -32000), and saving that is what made the
+    main window invisible on every subsequent launch. The size is kept either way;
+    only a believable position is written.
+    """
+    try:
+        from jsonstore import load_json, save_json
+
+        width, height = int(window.width), int(window.height)
+        geometry: Dict[str, Any] = {"width": max(MIN_WIDTH, width),
+                                    "height": max(MIN_HEIGHT, height)}
+        try:
+            x, y = int(window.x), int(window.y)
+        except Exception:
+            x = y = None
+        if on_screen(x, y, width, height):
+            geometry["x"], geometry["y"] = x, y
+        else:
+            previous = load_json(WINDOW_FILE, {}) or {}
+            for key in ("x", "y"):
+                value = previous.get(key)
+                if isinstance(value, (int, float)) and on_screen(
+                    previous.get("x"), previous.get("y"), width, height
+                ):
+                    geometry[key] = int(value)
+            print("[Desktop] The window was minimized or off-screen; keeping the last "
+                  "good position instead of remembering this one.")
+        save_json(WINDOW_FILE, geometry)
     except Exception as exc:
         print(f"[Desktop] Could not remember window size: {exc}")
 
@@ -222,6 +499,18 @@ def _save_window(window: Any) -> None:
 
 
 def _tray_icon_image():
+    for name in ("icon.png", "icon.ico"):
+        candidate = os.path.join(ROOT_DIR, "assets", name)
+        if os.path.exists(candidate):
+            try:
+                from PIL import Image
+
+                img = Image.open(candidate)
+                img.load()
+                return img
+            except Exception as exc:
+                print(f"[Desktop] Could not load icon from {candidate}: {exc}")
+
     from PIL import Image, ImageDraw
 
     image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -245,6 +534,7 @@ class DexterShell:
         self._full = None
         self._popup = None
         self._popup_visible = False
+        self._quitting = False
 
     @property
     def _windows(self):
@@ -254,17 +544,11 @@ class DexterShell:
     def show_popup(self) -> bool:
         if self._popup is None:
             return False
-        try:
-            self._popup.show()
-            try:
-                self._popup.restore()
-            except Exception:
-                pass
-            self._popup_visible = True
-            return True
-        except Exception as exc:
-            print(f"[Desktop] Could not show the pop-up: {exc}")
+        # Same treatment as the full window: shown is not the same as in front.
+        if not self._raise(self._popup):
             return False
+        self._popup_visible = True
+        return True
 
     def hide_popup(self) -> bool:
         if self._popup is None:
@@ -281,19 +565,120 @@ class DexterShell:
         return self.hide_popup() if self._popup_visible else self.show_popup()
 
     # ── full window ──
-    def open_full(self) -> bool:
-        if self._full is None:
-            return False
+    def _raise(self, window) -> bool:
+        """Show a window *and* put it in front."""
         try:
-            self._full.show()
-            try:
-                self._full.restore()
-            except Exception:
-                pass
-            return True
+            window.show()
         except Exception as exc:
             print(f"[Desktop] Could not show the window: {exc}")
             return False
+        handle = self._handle(window)
+        if handle:
+            _restore(handle)
+            _nudge_to_front(handle)
+            self._foreground(window)
+        return True
+
+    @staticmethod
+    def _handle(window) -> int:
+        """The window's own HWND, so Win32 can be used directly."""
+        cached = getattr(window, "_dexter_hwnd", 0)
+        if cached:
+            return int(cached)
+        native = getattr(window, "native", None)
+        if native is None:
+            return 0
+        for attribute in ("Handle", "handle", "winId"):
+            try:
+                value = getattr(native, attribute, None)
+                if value is None:
+                    continue
+                handle = int(value.ToInt64()) if hasattr(value, "ToInt64") else int(value)
+                if handle:
+                    try:
+                        window._dexter_hwnd = handle
+                    except Exception:
+                        pass
+                    return handle
+            except Exception:
+                continue
+        return 0
+
+    @staticmethod
+    def _foreground(window) -> None:
+        """SetForegroundWindow on the window's own handle, when we can find it."""
+        handle = DexterShell._handle(window)
+        if not handle:
+            return
+        try:
+            import win32con  # type: ignore
+            import win32gui  # type: ignore
+
+            if win32gui.IsIconic(handle):
+                win32gui.ShowWindow(handle, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(handle)
+        except Exception as exc:
+            print(f"[Desktop] Could not bring the window forward: {exc}")
+
+    def open_full(self, maximize: bool = False) -> bool:
+        """Bring the main window up. The pop-up's maximise button calls this, so
+        it also tucks the pop-up away: one window at a time is the gesture."""
+        if self._full is None:
+            return False
+        if not self._raise(self._full):
+            return False
+        # It may have been *created* off-screen from a stale saved position (the
+        # window.json (-32000, -32000) bug), in which case it is now shown where
+        # nobody can see it. Put it back on the desktop before claiming success.
+        self._bring_on_screen(self._full)
+        if maximize:
+            try:
+                self._full.maximize()
+            except Exception as exc:
+                print(f"[Desktop] Could not maximize the window: {exc}")
+        # The small window has been replaced by the big one; leaving it floating
+        # on top of what the owner just asked for is the wrong answer. Only once
+        # the big one is genuinely up, though - hiding the pop-up and showing
+        # nothing is the worst outcome of the two.
+        if self._popup is not None and self._popup_visible and self._visible(self._full):
+            self.hide_popup()
+        return True
+
+    @staticmethod
+    def _visible(window) -> bool:
+        """Is this window actually somewhere a person could see it?"""
+        try:
+            return on_screen(window.x, window.y, int(window.width), int(window.height))
+        except Exception:
+            # No geometry available: assume the show worked rather than refusing.
+            return True
+
+    @staticmethod
+    def _bring_on_screen(window) -> None:
+        if DexterShell._visible(window):
+            return
+        screen = virtual_screen()
+        try:
+            width = max(MIN_WIDTH, min(int(window.width), screen["width"]))
+            height = max(MIN_HEIGHT, min(int(window.height), screen["height"]))
+        except Exception:
+            width, height = DEFAULT_WINDOW["width"], DEFAULT_WINDOW["height"]
+        x = screen["left"] + max(0, (screen["width"] - width) // 2)
+        y = screen["top"] + max(0, (screen["height"] - height) // 3)
+        if _place(DexterShell._handle(window), x, y, width, height):
+            print(f"[Desktop] The window was off-screen; moved it to {x},{y}.")
+        else:
+            # No handle (not yet created): pywebview's own setters are the only
+            # option left, and at that point nothing is marshalled cross-thread.
+            try:
+                window.resize(width, height)
+                window.move(x, y)
+            except Exception as exc:
+                print(f"[Desktop] Could not move the window back on-screen: {exc}")
+
+    def maximize_full(self) -> bool:
+        """"Maximise Dexter": the full window, filling the screen."""
+        return self.open_full(maximize=True)
 
     def hide_full(self) -> bool:
         if self._full is None:
@@ -382,10 +767,8 @@ def _install_tray(window, shell: Optional["DexterShell"] = None) -> Optional[Dic
             return
         try:
             window.show()
-            try:
-                window.restore()
-            except Exception:
-                pass
+            # Win32, not `window.restore()` - the tray runs on its own thread too.
+            _restore(DexterShell._handle(window))
         except Exception as exc:
             print(f"[Desktop] Could not show the window: {exc}")
 
@@ -409,9 +792,16 @@ def _install_tray(window, shell: Optional["DexterShell"] = None) -> Optional[Dic
 
     def quit_dexter(icon=None, item=None) -> None:
         state["quit"] = True
+        if shell is not None:
+            shell._quitting = True
         try:
             if state["icon"] is not None:
                 state["icon"].stop()
+        except Exception:
+            pass
+        try:
+            if shell is not None and shell._popup is not None:
+                shell._popup.destroy()
         except Exception:
             pass
         try:
@@ -419,20 +809,53 @@ def _install_tray(window, shell: Optional["DexterShell"] = None) -> Optional[Dic
         except Exception:
             os._exit(0)
 
+    def open_logs(icon=None, item=None) -> None:
+        log_file = os.path.join(ROOT_DIR, "data", "dexter.log")
+        if not os.path.exists(log_file):
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            with open(log_file, "a", encoding="utf-8"):
+                pass
+        try:
+            if sys.platform == "win32":
+                os.startfile(log_file)
+        except Exception as exc:
+            print(f"[Desktop] Could not open log file: {exc}")
+
+    def toggle_autostart(icon=None, item=None) -> None:
+        new_state = not is_autostart_enabled()
+        set_autostart(new_state)
+
     menu = pystray.Menu(
         pystray.MenuItem("Ask Dexter", ask, default=True),
         pystray.MenuItem("Open Dexter", show),
         pystray.MenuItem("Reindex knowledge", reindex),
+        pystray.MenuItem("Open logs", open_logs),
+        pystray.MenuItem("Autostart with Windows", toggle_autostart, checked=lambda item: is_autostart_enabled()),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit Dexter", quit_dexter),
     )
     try:
-        icon = pystray.Icon("dexter", _tray_icon_image(), "Dexter", menu)
+        icon_title = f"Dexter AI Assistant (Port {PORT})"
+        icon = pystray.Icon("dexter", _tray_icon_image(), icon_title, menu)
     except Exception as exc:
         print(f"[Desktop] Tray icon failed ({exc}); close will quit.")
         return None
     state["icon"] = icon
     threading.Thread(target=icon.run, name="dexter-tray", daemon=True).start()
+
+    # Inform the user via tray notification where Dexter is located
+    def _notify_ready():
+        time.sleep(1.0)
+        try:
+            if getattr(icon, "HAS_NOTIFICATION", False):
+                icon.notify(
+                    "Dexter is running in the system tray. Click ^ in taskbar if hidden.",
+                    "Dexter AI Assistant",
+                )
+        except Exception:
+            pass
+
+    threading.Thread(target=_notify_ready, daemon=True).start()
 
     try:
         import keyboard
@@ -451,7 +874,7 @@ def start_backend() -> None:
     import uvicorn
     from main import app
 
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    uvicorn.run(app, host=BIND_HOST, port=PORT, log_level="warning")
 
 
 def _publish_port() -> None:
@@ -473,9 +896,21 @@ def _withdraw_port() -> None:
         print(f"[Ports] Could not withdraw: {exc}")
 
 
-def wait_for_server(url: str, timeout: float = 20.0) -> bool:
+#: How long the window waits for /health. It was 20 s, which a warm machine
+#: meets (~5 s) but a Windows logon does not: with the disk cold and Docker,
+#: LM Studio and Chrome starting alongside, importing torch/speechbrain took
+#: longer, the "did not start" dialog fired, and OK on it killed a backend that
+#: was a few seconds from ready. A backend that really fails is caught sooner
+#: by its thread dying (see `alive`), so this can afford to be generous.
+STARTUP_TIMEOUT = float(os.getenv("DEXTER_STARTUP_TIMEOUT", "180") or 180)
+
+
+def wait_for_server(url: str, timeout: float = STARTUP_TIMEOUT,
+                    alive: Optional[Callable[[], bool]] = None) -> bool:
     start = time.time()
     while time.time() - start < timeout:
+        if alive is not None and not alive():
+            return False  # import error, port bind failure: no point waiting
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Dexter/desktop"})
             with urllib.request.urlopen(req, timeout=2) as res:
@@ -500,18 +935,23 @@ def launch_desktop() -> None:
     if os.getenv("DEXTER_VOICE", "1").strip().lower() not in ("0", "false", "no", "off"):
         _enable_webview2_mic()
 
-    threading.Thread(target=start_backend, name="dexter-uvicorn", daemon=True).start()
+    backend = threading.Thread(target=start_backend, name="dexter-uvicorn", daemon=True)
+    backend.start()
 
     target_url = _resolve_target_url()
     # Wait for the backend even when the window points at the Vite dev server:
     # the API it talks to is this one, and nothing may be published before the
     # socket really answers.
-    backend_up = wait_for_server(HEALTH_URL)
+    backend_up = wait_for_server(HEALTH_URL, alive=backend.is_alive)
     if not backend_up and target_url.startswith(f"http://{HOST}:{PORT}"):
+        reason = (
+            "The backend stopped during startup."
+            if not backend.is_alive()
+            else f"Nothing answered at {HEALTH_URL} within {STARTUP_TIMEOUT:.0f} seconds."
+        )
         _message_box(
             "Dexter backend did not start",
-            f"Nothing answered at {HEALTH_URL} within 20 seconds.\n\n"
-            "See data\\dexter.log for the error.",
+            f"{reason}\n\nSee data\\dexter.log for the error.",
         )
         sys.exit(1)
     if backend_up:
@@ -519,7 +959,8 @@ def launch_desktop() -> None:
 
     geometry = _load_window()
     shell = DexterShell()
-    popup_first = START_MODE != "full"
+    full_hidden = START_MODE != "full"
+    popup_hidden = START_MODE != "popup"
     window = webview.create_window(
         title="Dexter",
         url=target_url,
@@ -532,7 +973,7 @@ def launch_desktop() -> None:
         frameless=False,
         easy_drag=True,
         on_top=False,
-        hidden=popup_first,
+        hidden=full_hidden,
         background_color="#f4f5f7",
         js_api=shell,
     )
@@ -556,16 +997,16 @@ def launch_desktop() -> None:
             frameless=True,
             easy_drag=True,
             on_top=True,
-            hidden=not popup_first,
+            hidden=popup_hidden,
             background_color="#ffffff",
             js_api=shell,
         )
         shell._popup = popup
-        shell._popup_visible = popup_first
+        shell._popup_visible = not popup_hidden
 
         def popup_closing():
             shell._popup_visible = False
-            if tray_state.get("state") and not tray_state["state"]["quit"]:
+            if not getattr(shell, "_quitting", False):
                 popup.hide()
                 return False
             return True
@@ -574,7 +1015,7 @@ def launch_desktop() -> None:
 
     def on_closing():
         _save_window(window)
-        if tray_state.get("state") and not tray_state["state"]["quit"]:
+        if not getattr(shell, "_quitting", False):
             # Hide instead of closing: reminders, the scheduler and the Studio
             # event bridge keep running; the tray icon brings the window back.
             window.hide()
@@ -582,6 +1023,13 @@ def launch_desktop() -> None:
         return True
 
     window.events.closing += on_closing
+
+    # Connect remote activation from duplicate launches directly to shell
+    try:
+        import main as engine
+        engine.register_show_window_callback(shell.open_full)
+    except Exception as exc:
+        print(f"[Desktop] Could not register show callback: {exc}")
 
     def after_start() -> None:
         tray_state["state"] = _install_tray(window, shell if popup is not None else None)
@@ -594,6 +1042,25 @@ def launch_desktop() -> None:
 
 
 def main() -> int:
+    args = [a.lower() for a in sys.argv[1:]]
+    if "--register-autostart" in args or "--install-autostart" in args:
+        ok = set_autostart(True)
+        print("Dexter registered for autostart." if ok else "Failed to register autostart.")
+        return 0 if ok else 1
+    if "--unregister-autostart" in args or "--uninstall-autostart" in args:
+        ok = set_autostart(False)
+        print("Dexter unregistered from autostart." if ok else "Failed to unregister autostart.")
+        return 0 if ok else 1
+    if "--status-autostart" in args:
+        enabled = is_autostart_enabled()
+        print(f"Dexter autostart enabled: {enabled}")
+        return 0
+
+    if _is_already_running():
+        print("[Desktop] Dexter is already running. Bringing existing window to front.")
+        _activate_existing_instance()
+        return 0
+
     try:
         launch_desktop()
         return 0

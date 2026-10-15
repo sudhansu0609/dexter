@@ -27,6 +27,8 @@ vi.mock('../api', () => ({
   cancelTask: vi.fn(async () => {}),
   addReminder: vi.fn(async () => {}),
   getModels: vi.fn(async () => ({ providers: {} })),
+  getTokenUsage: vi.fn(async () => mockUsage),
+  resetTokenUsage: vi.fn(async () => mockUsage),
   getProfile: vi.fn(async () => ({ profile: {}, summary: '' })),
   updateProfile: vi.fn(async () => ({ profile: {}, summary: '' })),
   reindexKnowledge: vi.fn(async () => ({})),
@@ -37,6 +39,9 @@ vi.mock('../api', () => ({
   generateTts: vi.fn(async () => new Blob()),
   audioUrl: vi.fn((u: string) => u),
   voiceInterrupt: vi.fn(async () => ({ ok: true })),
+  voiceMic: vi.fn(async () => ({ ok: true })),
+  postVoiceBus: vi.fn(async () => undefined),
+  cancelChat: vi.fn(async () => ({ ok: true })),
   getVoiceProfile: vi.fn(async () => ({ available: false, enrolled: false, strict: true, threshold: 0.75 })),
   forgetVoiceProfile: vi.fn(async () => ({ available: false, enrolled: false, strict: true, threshold: 0.75 })),
   previewVoice: vi.fn(async () => new Blob()),
@@ -61,6 +66,17 @@ vi.mock('../api', () => ({
 
 let mockRuntime: any = null;
 let mockTurns: { role: string; content: string }[] = [];
+const emptyBucket = { calls: 0, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+const mockUsage = {
+  since: '2026-09-26T00:00:00+00:00',
+  sessionSince: '2026-09-26T00:00:00+00:00',
+  allTime: emptyBucket,
+  session: emptyBucket,
+  providers: [],
+  models: [],
+  sessionProviders: [],
+  sessionModels: [],
+};
 
 const emptyWorkbook = {
   today: { date: '2026-08-23', due: [], overdue: [], done: [], goals: [] },

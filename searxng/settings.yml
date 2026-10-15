@@ -1,0 +1,42 @@
+# SearXNG configuration for Dexter local privacy-first web search.
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "Dexter Private SearXNG"
+
+server:
+  secret_key: "dexter_local_privacy_searxng_secret_key"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  image_proxy: true
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  # 'json' must be present so Dexter's web_search can read results.
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google
+    engine: google
+    shortcut: go
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+  - name: bing
+    engine: bing
+    shortcut: bi
+  - name: brave
+    engine: brave
+    shortcut: br

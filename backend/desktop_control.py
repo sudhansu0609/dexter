@@ -112,7 +112,32 @@ APP_ALIASES: Dict[str, str] = {
     "adobe photoshop": "photoshop",
     "terminal": "terminal",
     "powershell": "powershell",
+    "cmd": "cmd",
     "obs": "obs",
+    "calc": "calc",
+    "calculator": "calc",
+    "task manager": "taskmgr",
+    "taskmanager": "taskmgr",
+    "taskmgr": "taskmgr",
+    "slack": "slack",
+    "word": "word",
+    "winword": "word",
+    "ms word": "word",
+    "microsoft word": "word",
+    "excel": "excel",
+    "ms excel": "excel",
+    "microsoft excel": "excel",
+    "powerpoint": "powerpoint",
+    "ppt": "powerpoint",
+    "steam": "steam",
+    "studio": "studio",
+    "buzzcaf studio": "studio",
+    "buzzcafai": "studio",
+    "buzzcaf": "studio",
+    "buzzedit": "buzzedit",
+    "vrdeep": "vrdeep",
+    "mission reminder": "mission_reminder",
+    "missionreminder": "mission_reminder",
 }
 
 #: Which image name each alias lives in. Several apps answer to more than one.
@@ -129,7 +154,19 @@ APP_PROCESSES: Dict[str, Tuple[str, ...]] = {
     "photoshop": ("photoshop.exe",),
     "terminal": ("windowsterminal.exe", "wt.exe"),
     "powershell": ("powershell.exe", "pwsh.exe"),
+    "cmd": ("cmd.exe",),
     "obs": ("obs64.exe", "obs.exe"),
+    "calc": ("calculatorapp.exe", "calc.exe"),
+    "taskmgr": ("taskmgr.exe",),
+    "slack": ("slack.exe",),
+    "word": ("winword.exe",),
+    "excel": ("excel.exe",),
+    "powerpoint": ("powerpnt.exe",),
+    "steam": ("steam.exe",),
+    "studio": ("buzzcaf studio.exe", "buzzcafai.exe", "electron.exe"),
+    "buzzedit": ("buzzedit.exe",),
+    "vrdeep": ("vrdeep.exe",),
+    "mission_reminder": ("mission reminder.exe", "missionreminder.exe"),
 }
 
 #: How an app should be *called* in a reply, keyed by image name.
@@ -145,6 +182,16 @@ PRETTY_PROCESS: Dict[str, str] = {
     "adobe premiere pro.exe": "Premiere Pro",
     "photoshop.exe": "Photoshop",
     "windowsterminal.exe": "Terminal",
+    "powershell.exe": "PowerShell",
+    "cmd.exe": "Command Prompt",
+    "calculatorapp.exe": "Calculator",
+    "calc.exe": "Calculator",
+    "taskmgr.exe": "Task Manager",
+    "slack.exe": "Slack",
+    "winword.exe": "Word",
+    "excel.exe": "Excel",
+    "powerpnt.exe": "PowerPoint",
+    "steam.exe": "Steam",
     "pythonw.exe": "Dexter",
 }
 
@@ -272,12 +319,29 @@ def _terminate(pid: int) -> bool:
         return False
 
 
+#: Key names the `keyboard` package spells with a space in them. The space is
+#: part of the *name*, not a sequence separator, so they must be collapsed to the
+#: no-space alias (which `keyboard` accepts identically) before the split below -
+#: otherwise "page down" is sent as the two presses "page" and "down", and
+#: `keyboard.send("page")` raises ValueError, which is exactly why scrolling a
+#: page threw every time instead of scrolling.
+_MULTIWORD_KEYS = {
+    "page down": "pagedown", "page up": "pageup",
+    "page+down": "pagedown", "page+up": "pageup",
+}
+
+
 def _send_keys(combo: str) -> None:
     """Send one hotkey to whatever has focus. Sequences are space-separated, so
-    VS Code's "ctrl+k s" is two presses and not an impossible single chord."""
+    VS Code's "ctrl+k s" is two presses and not an impossible single chord - but a
+    multi-word key name ("page down") is one press, collapsed here so the split
+    does not turn it into two."""
     if not _keyboard:
         raise DesktopError("Keyboard control needs the keyboard package. Run: pip install keyboard")
-    for part in str(combo).split():
+    text = str(combo).lower()
+    for spaced, joined in _MULTIWORD_KEYS.items():
+        text = text.replace(spaced, joined)
+    for part in text.split():
         _keyboard.send(part)
 
 
@@ -378,8 +442,172 @@ def find_windows(name: str) -> List[Win]:
     # the word". "close notepad" with only Notepad++ open closed Notepad++
     # (v11.1, live) - the same lesson close_window learned in v8.
     if images:
-        return by_process or exact_title
-    return by_process or exact_title or loose_title
+        found = by_process or exact_title
+        return found or _windows_of_processes(wanted)
+    return by_process or exact_title or loose_title or _windows_of_processes(wanted)
+
+
+def _windows_of_processes(name: str) -> List[Win]:
+    """Windows belonging to a process identified by `find_processes`.
+
+    The fallback that makes "close BuzzAnimate" work: its window is titled
+    "BuzzAnimate" only sometimes, its image is `buzzanimate.exe`, and neither
+    the alias table nor the title search knew about it.
+    """
+    matches = find_processes(name)
+    if not matches:
+        return []
+    pids = {int(p["pid"]) for p in matches if p.get("pid")}
+    if not pids:
+        return []
+    return [w for w in windows() if w.pid in pids]
+
+
+# ───────── an app by any of the names it answers to (v13) ─────────
+#
+# `close buzzanimate` used to fail twice over: the registry record named the
+# wrong executable, and this module only knew an app by an alias table of
+# twenty hand-written names plus an exact `name.exe` guess. Anything the owner
+# actually has installed - BuzzAnimate (`buzzanimate.exe` under
+# `BuzzAnimate\target\release`), Teams (`ms-teams.exe`), Word (`winword.exe`) -
+# was simply not findable, and the reply was "it doesn't have a window open".
+#
+# So a name is now matched against everything Windows knows about a running
+# process: its image name, its executable path, the folder it runs out of, its
+# command line, and the description the vendor compiled into the binary.
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+#: Processes that are *looking at* something rather than being it. An editor with
+#: the BuzzAnimate folder open matched "buzzanimate" on its command line, which
+#: would have made "close BuzzAnimate" close VS Code.
+BYSTANDER_IMAGES = {
+    "code.exe", "devenv.exe", "notepad.exe", "notepad++.exe", "sublime_text.exe",
+    "windowsterminal.exe", "wt.exe", "powershell.exe", "pwsh.exe", "cmd.exe",
+    "conhost.exe", "explorer.exe", "git.exe", "ssh.exe", "msbuild.exe", "cargo.exe",
+    "rustc.exe", "node.exe", "searchprotocolhost.exe", "searchfilterhost.exe",
+}
+
+
+def _norm_path(text: str) -> str:
+    return (text or "").replace("/", "\\").lower()
+
+
+_descriptions: Dict[str, str] = {}
+
+
+def _file_description(exe: str) -> str:
+    """The name the vendor compiled in ("Microsoft Teams" for ms-teams.exe)."""
+    if not exe:
+        return ""
+    key = _norm_path(exe)
+    if key in _descriptions:
+        return _descriptions[key]
+    value = ""
+    try:
+        import win32api  # type: ignore
+
+        info = win32api.GetFileVersionInfo(exe, "\\VarFileInfo\\Translation")
+        if info:
+            lang, codepage = info[0]
+            value = str(win32api.GetFileVersionInfo(
+                exe, f"\\StringFileInfo\\{lang:04x}{codepage:04x}\\FileDescription") or "")
+    except Exception:
+        value = ""
+    _descriptions[key] = value.strip()
+    return _descriptions[key]
+
+
+def _process_table() -> List[Dict[str, Any]]:
+    """Every running process as {pid, name, exe, cmdline}. Tests replace this."""
+    try:
+        import procs
+
+        return procs.find()
+    except Exception:
+        return []
+
+
+def _registry_record(name: str) -> Optional[Dict[str, Any]]:
+    """The owner's own project of that name, if it is one."""
+    try:
+        import apps_registry
+
+        return apps_registry.resolve(name)
+    except Exception:
+        return None
+
+
+def find_processes(name: str) -> List[Dict[str, Any]]:
+    """Running processes that are plausibly the app called `name`, best first.
+
+    Each row carries `why` so a reply can say *how* it was identified rather
+    than claiming certainty it does not have.
+    """
+    wanted = (name or "").strip().lower().strip(" .!?,'\"")
+    wanted = re.sub(r"^(?:the|my)\s+", "", wanted)
+    squashed = _squash(wanted)
+    if not squashed:
+        return []
+
+    alias = _alias_of(wanted)
+    images = {img.lower() for img in APP_PROCESSES.get(alias or "", ())}
+    images.add(f"{squashed}.exe")
+    root_needle = ""
+    record = _registry_record(wanted)
+    if record:
+        try:
+            import apps_registry
+
+            root = apps_registry.root_of(record)
+            if root:
+                root_needle = _norm_path(root).rstrip("\\") + "\\"
+        except Exception:
+            pass
+        for spec in [record.get("stop") or {}] + list(record.get("probes") or []):
+            if spec.get("process"):
+                images.add(str(spec["process"]).lower())
+
+    long_enough = len(squashed) >= 4
+    rows: List[Dict[str, Any]] = []
+    for proc in _process_table():
+        image = (proc.get("name") or "").lower()
+        if not image or image in ("system", "registry", "idle"):
+            continue
+        # An editor with the project open, or the terminal it was launched from,
+        # is *looking at* the app and is not it. Only an exact name match ("close
+        # code") ever selects one of these.
+        if image in BYSTANDER_IMAGES and image not in images and _squash(
+            os.path.splitext(image)[0]
+        ) != squashed:
+            continue
+        stem = _squash(os.path.splitext(image)[0])
+        exe = _norm_path(proc.get("exe") or "")
+        haystack = _squash(exe + " " + (proc.get("cmdline") or ""))
+        score, why = 0, ""
+        if image in images:
+            score, why = 100, "image name"
+        elif stem == squashed:
+            score, why = 95, "image name"
+        elif root_needle and root_needle in _norm_path(exe + " " + (proc.get("cmdline") or "")):
+            score, why = 85, "runs from the project folder"
+        elif long_enough and squashed in _squash(exe):
+            score, why = 75, "executable path"
+        elif long_enough and squashed in _squash(_file_description(proc.get("exe") or "")):
+            score, why = 70, "file description"
+        elif long_enough and squashed in stem:
+            score, why = 60, "image name"
+        elif long_enough and squashed in haystack:
+            score, why = 50, "command line"
+        if score:
+            rows.append({**proc, "score": score, "why": why})
+
+    rows.sort(key=lambda r: (-r["score"], r.get("name") or ""))
+    mine = os.getpid()
+    return [r for r in rows if int(r.get("pid") or 0) != mine]
 
 
 def resolve_window(name: Optional[str]) -> Win:
@@ -534,11 +762,38 @@ def looks_like_a_secret(text: str) -> bool:
     return classes >= 3
 
 
+def _focus_input_control(win: Win, into: str) -> bool:
+    """Focus an input control (Edit/ComboBox/SearchBox) by name inside a window.
+    Returns True if focused, False otherwise."""
+    try:
+        from pywinauto import Desktop  # local import to avoid heavy import at module level
+        desktop = Desktop(backend="uia")
+        spec = desktop.window(handle=win.hwnd)
+        # Search for Edit, ComboBox, SearchBox controls
+        for ctrl_type in ("Edit", "ComboBox", "SearchBox"):
+            for elem in spec.descendants(control_type=ctrl_type):
+                try:
+                    name = getattr(elem, "window_text")()
+                    if not name:
+                        name = getattr(elem, "name")()
+                    if name and into.lower() in name.lower().strip():
+                        # Click to focus
+                        elem.click_input()
+                        time.sleep(0.1)
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
 def type_text(
     text: str,
     submit: bool = False,
     window: Optional[str] = None,
     allow_secret: bool = False,
+    into: Optional[str] = None,
 ) -> Dict[str, Any]:
     if text is None or not str(text):
         raise DesktopError("What should I type?")
@@ -553,11 +808,19 @@ def type_text(
             "remembers everything typed into it. Click the field you mean and "
             "say 'type it anyway' if you want me to."
         )
+    if into:
+        focused = _focus_input_control(win, into)
+        if not focused:
+            try:
+                click_text(into, window=win)
+                time.sleep(0.1)
+            except Exception:
+                pass
     _write_text(str(text))
     if submit:
         _send_keys("enter")
     return {"typed": str(text), "submitted": bool(submit),
-            "window": win.describe(), "app": win.app}
+            "window": win.describe(), "app": win.app, "into": into or ""}
 
 
 _SCROLL_KEYS = {
@@ -591,7 +854,8 @@ def scroll(direction: str = "down", amount: int = 1, window: Optional[str] = Non
 
 UIA_BUDGET_SECONDS = float(os.environ.get("DEXTER_UIA_BUDGET", "5") or 5)
 CLICKABLE_TYPES = ("Button", "Hyperlink", "MenuItem", "ListItem", "TabItem", "CheckBox",
-                   "RadioButton", "TreeItem", "Text")
+                   "RadioButton", "TreeItem", "Text", "Edit", "ComboBox", "SearchBox",
+                   "Pane", "Custom")
 
 
 def _element_name(element) -> str:
@@ -615,57 +879,163 @@ def _descendants(spec, control_type: Optional[str] = None) -> List[Any]:
         return []
 
 
-def click_text(name: str, window: Optional[str] = None) -> Dict[str, Any]:
-    """Click the thing called `name` in a window, by UI Automation name.
+def _match_rank(label: str, needle: str) -> int:
+    """3 exact, 2 starts-with, 1 contains, 0 no match. Case- and space-insensitive."""
+    low, want = label.strip().lower(), needle.strip().lower()
+    if not low or not want:
+        return 0
+    if low == want:
+        return 3
+    if low.startswith(want):
+        return 2
+    return 1 if want in low else 0
 
-    No screen coordinates and no vision model: Windows already knows the name
-    of every control, and `invoke()` presses it without moving the pointer.
-    """
+
+def find_clickables(
+    name: str,
+    window: Optional[Any] = None,
+    types: Optional[Tuple[str, ...]] = None,
+    budget: Optional[float] = None,
+    total: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Every control in a window whose name matches, best match first."""
     needle = (name or "").strip().strip("\"'")
-    if not needle:
-        raise DesktopError("What should I click?")
-    win = _focused_target(window)
+    win = window if isinstance(window, Win) else resolve_window(window)
     spec = _uia_window(win.hwnd)
     if spec is None:
-        raise DesktopError(
-            "Clicking by name needs pywinauto. Run: pip install pywinauto"
-        )
-    pattern = re.compile(re.escape(needle), re.I)
-    started = time.time()
-    seen: List[str] = []
-    best = None
-    for control_type in CLICKABLE_TYPES:
+        raise DesktopError("Reading a window's controls needs pywinauto. Run: pip install pywinauto")
+    per_type = float(budget if budget is not None else UIA_BUDGET_SECONDS)
+    deadline = time.time() + max(per_type, float(total if total is not None else per_type * 2))
+    found: List[Dict[str, Any]] = []
+    seen_names: List[str] = []
+    for control_type in (types or CLICKABLE_TYPES):
+        if time.time() > deadline:
+            break
+        started = time.time()
         for element in _descendants(spec, control_type):
-            if time.time() - started > UIA_BUDGET_SECONDS:
+            now = time.time()
+            if now - started > per_type or now > deadline:
                 break
             label = _element_name(element)
             if not label:
                 continue
-            if len(seen) < 40:
-                seen.append(label)
-            if pattern.search(label):
-                best = (element, label, control_type)
-                break
-        if best:
+            if len(seen_names) < 60:
+                seen_names.append(label)
+            rank = _match_rank(label, needle) if needle else 1
+            if rank:
+                found.append({"element": element, "label": label,
+                              "kind": control_type.lower(), "rank": rank,
+                              "order": len(found)})
+        # An exact hit is the answer; no point walking the rest of the tree.
+        if any(row["rank"] == 3 for row in found):
             break
-    if not best:
+    found.sort(key=lambda row: (-row["rank"], row["order"]))
+    for row in found:
+        row["seen"] = seen_names
+    if not found and seen_names:
+        # Carry the context even on a miss: the caller turns it into "I can see:".
+        return [{"element": None, "label": "", "kind": "", "rank": 0, "seen": seen_names}]
+    return found
+
+
+def click_text(name: str, window: Optional[Any] = None, nth: int = 1) -> Dict[str, Any]:
+    """Click the thing called `name` in a window, by UI Automation name.
+
+    No screen coordinates and no vision model: Windows already knows the name
+    of every control, and `invoke()` presses it without moving the pointer.
+    `nth` picks among equally good matches ("the third video").
+    """
+    needle = (name or "").strip().strip("\"'")
+    if not needle:
+        raise DesktopError("What should I click?")
+    win = window if isinstance(window, Win) else _focused_target(window)
+    matches = [m for m in find_clickables(needle, window=win) if m.get("element") is not None]
+    if not matches:
+        seen = []
+        try:
+            seen = find_clickables("", window=win)[0].get("seen") or []
+        except Exception:
+            seen = []
         options = ", ".join(dict.fromkeys(s for s in seen if len(s) < 40))
         raise DesktopError(
             f"Nothing called '{needle}' in {win.describe()}."
             + (f" I can see: {options[:300]}" if options else "")
         )
-    element, label, control_type = best
-    for attempt in ("invoke", "select", "click_input"):
+    index = max(1, int(nth or 1))
+    chosen = matches[min(index, len(matches)) - 1]
+    element, label, control_type = chosen["element"], chosen["label"], chosen["kind"]
+    for attempt in ("invoke", "select", "set_focus", "click_input"):
         action = getattr(element, attempt, None)
         if not callable(action):
             continue
         try:
             action()
-            return {"clicked": label, "kind": control_type.lower(), "how": attempt,
-                    "window": win.describe(), "app": win.app}
+            return {"clicked": label, "kind": control_type, "how": attempt,
+                    "window": win.describe(), "app": win.app,
+                    "matches": len(matches), "nth": index}
         except Exception:
             continue
     raise DesktopError(f"I found '{label}' in {win.describe()} but it would not take a click.")
+
+
+# ───────────────────────── selecting and copying text (v13) ─────────────────────────
+#
+# "Select tabs and text from BuzzcafAI and hand it to me" needs two things UIA
+# cannot do: put a selection where the user wants one, and get the selected text
+# out. Both go through the app itself - Ctrl+A / Ctrl+C and the clipboard - which
+# works in every app that has ever supported copy, web views included.
+
+
+def _clipboard_text() -> str:
+    try:
+        import pyperclip  # type: ignore
+
+        return pyperclip.paste() or ""
+    except Exception:
+        return ""
+
+
+def _set_clipboard(text: str) -> bool:
+    try:
+        import pyperclip  # type: ignore
+
+        pyperclip.copy(text)
+        return True
+    except Exception:
+        return False
+
+
+def copy_from(window: Optional[str] = None, select_all: bool = False,
+              timeout: float = 1.5) -> Dict[str, Any]:
+    """Copy the selection (or everything) out of a window and return the text.
+
+    The clipboard is restored when nothing new arrived, so a failed copy does not
+    silently leave the user's clipboard holding the last thing Dexter grabbed.
+    """
+    win = _focused_target(window)
+    before = _clipboard_text()
+    marker = f"__dexter_copy_{int(time.time() * 1000)}__"
+    _set_clipboard(marker)
+    if select_all:
+        _send_keys("ctrl+a")
+        time.sleep(0.1)
+    _send_keys("ctrl+c")
+    deadline = time.time() + max(0.2, timeout)
+    text = ""
+    while time.time() < deadline:
+        current = _clipboard_text()
+        if current and current != marker:
+            text = current
+            break
+        time.sleep(0.05)
+    if not text:
+        _set_clipboard(before)
+        raise DesktopError(
+            f"{win.describe()} didn't put anything on the clipboard. "
+            "Click into the text you mean (or say 'select all' first) and ask again."
+        )
+    return {"text": text, "window": win.describe(), "app": win.app,
+            "selectedAll": bool(select_all), "length": len(text)}
 
 
 def read_window_text(max_chars: int = 4000, window: Optional[str] = None) -> Dict[str, Any]:
@@ -764,6 +1134,16 @@ def close_app(name: str, wait: float = CLOSE_WAIT_SECONDS) -> Dict[str, Any]:
     targets = find_windows(name)
     targets = [w for w in targets if not is_self(w)]
     if not targets:
+        # Running but windowless (a tray app, a server, a game that hid its
+        # window)? Say that, with the pids, so the caller can offer to stop it
+        # properly instead of "it doesn't have a window open" - which reads as
+        # "it isn't running" and is how "close BuzzAnimate" became a dead end.
+        running = find_processes(name)
+        if running:
+            return {"app": running[0].get("name") or name, "closed": 0, "asked": 0,
+                    "remaining": len(running), "titles": [],
+                    "windowless": True, "pids": [int(p["pid"]) for p in running if p.get("pid")],
+                    "how": running[0].get("why", "")}
         raise DesktopError(f"{name} doesn't have a window open.")
     label = targets[0].app
     for win in targets:
@@ -790,19 +1170,17 @@ def kill_app(name: str) -> Dict[str, Any]:
     """Terminate an app. Only ever reached through a confirmed `kill`."""
     targets = find_windows(name)
     pids = {w.pid for w in targets if w.pid and not is_self(w)}
-    if not pids and _psutil:
-        alias = _alias_of(name) or (name or "").strip().lower()
-        images = APP_PROCESSES.get(alias, (f"{alias}.exe",))
-        try:
-            for proc in _psutil.process_iter(["pid", "name"]):
-                if (proc.info.get("name") or "").lower() in images:
-                    pids.add(proc.info["pid"])
-        except Exception:
-            pass
+    matches: List[Dict[str, Any]] = []
+    if not pids:
+        matches = find_processes(name)
+        pids = {int(p["pid"]) for p in matches if p.get("pid")}
     if not pids:
         raise DesktopError(f"I can't find a running {name} to stop.")
+    label = targets[0].app if targets else (
+        _file_description(matches[0].get("exe", "")) or matches[0].get("name") or name
+    )
     killed = sum(1 for pid in pids if _terminate(pid))
-    return {"app": targets[0].app if targets else name, "killed": killed, "found": len(pids)}
+    return {"app": label, "killed": killed, "found": len(pids)}
 
 
 def grouped_windows() -> List[Dict[str, Any]]:
@@ -889,7 +1267,8 @@ GENERIC_RECIPE: Dict[str, str] = {
     "save": "ctrl+s", "copy": "ctrl+c", "paste": "ctrl+v", "cut": "ctrl+x",
     "select all": "ctrl+a", "undo": "ctrl+z", "redo": "ctrl+y", "find": "ctrl+f",
     "print": "ctrl+p", "new": "ctrl+n", "new file": "ctrl+n", "new window": "ctrl+n",
-    "close tab": "ctrl+w", "refresh": "f5", "delete": "delete", "rename": "f2",
+    "close tab": "ctrl+w", "new tab": "ctrl+t", "next tab": "ctrl+tab",
+    "previous tab": "ctrl+shift+tab", "refresh": "f5", "delete": "delete", "rename": "f2",
 }
 
 _ACTION_SYNONYMS = {

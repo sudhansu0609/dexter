@@ -40,6 +40,7 @@ const MIC_KEY = 'dexterMicDeviceId';
 // Windows lists virtual and idle endpoints as microphones; when one of these
 // is the system default, the mic opens and delivers digital silence.
 const VIRTUAL_MIC = /virtual|stereo mix|oculus|mixed reality|rtx voice|hands-free|iphone|what u hear|cable/i;
+export const BRIO_MIC = /brio/i;
 
 export function savedMicId(): string {
   try {
@@ -68,9 +69,9 @@ export async function listMics(): Promise<MicDevice[]> {
     .map((d, i) => ({ deviceId: d.deviceId, label: d.label || `Microphone ${i + 1}` }));
 }
 
-// Which mic to open: the one chosen in Settings, else the system default
-// unless that looks like a virtual endpoint, in which case the first real one.
-async function pickMic(): Promise<{ deviceId?: string; label: string }> {
+// Which mic to open: the one chosen in Settings, else Brio if available,
+// else the system default unless that looks like a virtual endpoint, in which case the first real one.
+export async function pickMic(): Promise<{ deviceId?: string; label: string }> {
   const chosen = savedMicId();
   let mics: MicDevice[] = [];
   try {
@@ -81,12 +82,30 @@ async function pickMic(): Promise<{ deviceId?: string; label: string }> {
   if (chosen && mics.some((m) => m.deviceId === chosen)) {
     return { deviceId: chosen, label: mics.find((m) => m.deviceId === chosen)!.label };
   }
+  // Default mic preference: prioritize Logitech Brio microphone if connected
+  const brio = mics.find((m) => BRIO_MIC.test(m.label));
+  if (brio) {
+    return { deviceId: brio.deviceId, label: brio.label };
+  }
   const dflt = mics.find((m) => m.deviceId === 'default') || mics[0];
   if (dflt && VIRTUAL_MIC.test(dflt.label)) {
     const real = mics.find((m) => m.deviceId !== 'default' && m.deviceId !== 'communications' && !VIRTUAL_MIC.test(m.label));
     if (real) return { deviceId: real.deviceId, label: real.label };
   }
   return { deviceId: undefined, label: dflt?.label || 'system default' };
+}
+
+// What the voice layer does with a control phrase rather than passing it on.
+export type VoiceCommand = 'stop' | 'cancel' | 'mute' | 'unmute';
+
+export interface DictationEvent {
+  state: 'written' | 'ended' | 'paused' | 'resumed' | 'scratched' | 'failed';
+  line: string;
+  words: number;
+  lines: number;
+  where: string;
+  path: string;
+  error: string;
 }
 
 export interface LocalPipelineCallbacks {
@@ -98,8 +117,8 @@ export interface LocalPipelineCallbacks {
   // Capture began (the wake word fired, a follow-up started, or the mic was pressed).
   onListening: (reason: ListenReason) => void;
   onTranscript: (text: string, meta: { after: ListenReason; confidence: number; seconds: number }) => void;
-  // "stop" / "cancel" said on its own.
-  onCommand: (name: 'stop' | 'cancel') => void;
+  // "stop" / "cancel" / "mute yourself" / "you can speak again", said on its own.
+  onCommand: (name: VoiceCommand) => void;
   // Capture ended with nothing usable.
   onHeardNothing: (reason: 'silence' | 'unclear', after: ListenReason) => void;
   // The user talked over Dexter (or pressed the mic mid-reply); generation is
@@ -117,10 +136,16 @@ export interface LocalPipelineCallbacks {
   onMicSilent?: (silent: boolean) => void;
   // Someone other than the enrolled owner spoke to Dexter.
   onNotYou?: (score: number) => void;
+  // v13: dictation is running and a line was written (or it ended, paused, or
+  // could not be written). Never a chat turn - the words went into the note.
+  onDictation?: (event: DictationEvent) => void;
   // Enrolment ("Learn my voice") progress and result.
   onEnroll?: (evt: { type: 'started' | 'progress' | 'done'; seconds?: number; target?: number; ok?: boolean; reason?: string }) => void;
   // Which mic was opened.
   onMic?: (label: string) => void;
+  // The session's mic was turned off/on (from this window or the other one).
+  // Both windows are told, so each can release the mic device and show it.
+  onMicMuted?: (muted: boolean) => void;
 }
 
 const TARGET_SAMPLE_RATE = 16000;
@@ -209,6 +234,9 @@ export class LocalVoicePipeline {
   private peakSince = 0;
   private peakMax = 0;
   private silentReported: boolean | null = null;
+  // The mic-off state this window wants the session in, re-asserted on every
+  // (re)connect so a backend restart cannot silently un-mute the mic.
+  private desiredMuted = false;
 
   constructor(callbacks: LocalPipelineCallbacks, windowName = 'full', session = 'default') {
     this.callbacks = callbacks;
@@ -274,6 +302,14 @@ export class LocalVoicePipeline {
   setSpeaking(on: boolean): void {
     this.speaking = on;
     this.sendControl({ type: 'speaking', on });
+  }
+
+  // Mic off/on for the whole session (the "Mic off" switch). Goes over the
+  // socket to the session, so it holds even when the mic is handed to the other
+  // window; remembered so it is re-asserted after a reconnect.
+  setMuted(on: boolean): void {
+    this.desiredMuted = on;
+    this.sendControl({ type: 'mute', on });
   }
 
   // Push-to-talk: capture now, no wake word. Interrupts a reply in progress.
@@ -345,8 +381,35 @@ export class LocalVoicePipeline {
       saveMicId('');
       this.stream = await navigator.mediaDevices.getUserMedia({ audio: { ...audio, deviceId: undefined } });
     }
-    const track = this.stream.getAudioTracks()[0];
-    this.callbacks.onMic?.(track?.label || mic.label);
+    let track = this.stream.getAudioTracks()[0];
+    let label = track?.label || mic.label;
+
+    // If no specific mic was saved and we didn't catch Brio on the first pass
+    // (e.g. device labels were not yet exposed prior to getUserMedia permission),
+    // re-enumerate now that permission is granted and switch to Brio if available:
+    if (!savedMicId() && !BRIO_MIC.test(label)) {
+      try {
+        const freshMics = await listMics();
+        const brio = freshMics.find((m) => BRIO_MIC.test(m.label));
+        if (brio && brio.deviceId) {
+          try {
+            const brioStream = await navigator.mediaDevices.getUserMedia({
+              audio: { ...audio, deviceId: { exact: brio.deviceId } },
+            });
+            this.stream.getTracks().forEach((t) => t.stop());
+            this.stream = brioStream;
+            track = this.stream.getAudioTracks()[0];
+            label = track?.label || brio.label;
+          } catch {
+            // Keep current stream if Brio switch fails
+          }
+        }
+      } catch {
+        // enumeration can fail silently
+      }
+    }
+
+    this.callbacks.onMic?.(label);
     this.peakSince = Date.now();
     this.peakMax = 0;
     this.silentReported = null;
@@ -457,6 +520,9 @@ export class LocalVoicePipeline {
           // the fresh server session doesn't treat TTS output as a command.
           if (document.visibilityState === 'visible') this.claim();
           if (this.speaking) this.sendControl({ type: 'speaking', on: true });
+          // Re-assert mic-off after a reconnect (never auto-unmute) so a backend
+          // restart cannot bring the mic back on behind the owner's back.
+          if (this.desiredMuted) this.sendControl({ type: 'mute', on: true });
         };
         ws.onclose = () => this.handleDisconnect();
         ws.onerror = () => {
@@ -506,10 +572,18 @@ export class LocalVoicePipeline {
         this.everConnected = true;
         this.setActive(Boolean(msg.active));
         this.callbacks.onReady(caps);
+        if (typeof msg.muted === 'boolean') {
+          this.desiredMuted = msg.muted;
+          this.callbacks.onMicMuted?.(msg.muted);
+        }
         break;
       }
       case 'active':
         this.setActive(true);
+        break;
+      case 'mic_muted':
+        this.desiredMuted = Boolean(msg.muted);
+        this.callbacks.onMicMuted?.(Boolean(msg.muted));
         break;
       case 'standby':
         this.setActive(false);
@@ -527,7 +601,9 @@ export class LocalVoicePipeline {
         }
         break;
       case 'command':
-        if (msg.name === 'stop' || msg.name === 'cancel') this.callbacks.onCommand(msg.name);
+        if (msg.name === 'stop' || msg.name === 'cancel' || msg.name === 'mute' || msg.name === 'unmute') {
+          this.callbacks.onCommand(msg.name as VoiceCommand);
+        }
         break;
       case 'heard_nothing':
         this.callbacks.onHeardNothing(msg.reason === 'unclear' ? 'unclear' : 'silence', (msg.after as ListenReason) || 'wake');
@@ -537,6 +613,17 @@ export class LocalVoicePipeline {
         break;
       case 'not_you':
         this.callbacks.onNotYou?.(Number(msg.score) || 0);
+        break;
+      case 'dictation':
+        this.callbacks.onDictation?.({
+          state: (msg.state as DictationEvent['state']) || 'written',
+          line: typeof msg.line === 'string' ? msg.line : '',
+          words: Number(msg.words) || 0,
+          lines: Number(msg.lines) || 0,
+          where: typeof msg.where === 'string' ? msg.where : '',
+          path: typeof msg.path === 'string' ? msg.path : '',
+          error: typeof msg.error === 'string' ? msg.error : '',
+        });
         break;
       case 'enroll_started':
         this.callbacks.onEnroll?.({ type: 'started', target: Number(msg.seconds) || 10 });

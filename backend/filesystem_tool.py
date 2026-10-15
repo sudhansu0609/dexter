@@ -12,6 +12,15 @@ class FileSystemTool:
             # Default to current project or user home
             search_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         else:
+            # "search my downloads", "look on the D drive": a name, not a path.
+            try:
+                import folders
+
+                spoken = folders.spoken_path(search_path)
+                if spoken:
+                    search_path = spoken
+            except Exception:
+                pass
             allowed = pathguard.resolve(search_path)
             if not allowed:
                 return {"success": False, "query": query,
@@ -81,7 +90,7 @@ class FileSystemTool:
 
     @classmethod
     def write_file(cls, file_path: str, content: str) -> Dict[str, Any]:
-        allowed = pathguard.resolve(file_path)
+        allowed = pathguard.resolve_write(file_path)
         if not allowed:
             return {"success": False, "error": pathguard.denial(file_path)}
         file_path = allowed
@@ -109,9 +118,9 @@ class FileSystemTool:
             else:
                 target_dir = clean_path
 
-            allowed = pathguard.resolve(target_dir)
+            allowed = pathguard.resolve_write(target_dir)
             if not allowed:
-                return {"success": False, "error": pathguard.denial(target_dir)}
+                return {"success": False, "error": pathguard.denial(target_dir, write=True)}
             target_dir = allowed
 
             os.makedirs(target_dir, exist_ok=True)
@@ -131,6 +140,16 @@ class FileSystemTool:
 
     @classmethod
     def open_local_path(cls, target_path: str) -> Dict[str, Any]:
+        # "open the c drive", "open my downloads": a name, not a path. folders
+        # does the vocabulary; pathguard still does the permission.
+        try:
+            import folders
+
+            spoken = folders.spoken_path(target_path)
+            if spoken:
+                target_path = spoken
+        except Exception:
+            pass
         allowed = pathguard.resolve(target_path)
         if not allowed:
             return {"success": False, "error": pathguard.denial(target_path)}

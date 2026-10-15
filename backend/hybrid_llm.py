@@ -26,6 +26,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import requests
 
+import token_ledger
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are Dexter, an intelligent personal AI assistant. "
     "Be concise, direct, and precise. Keep answers to 1-3 sentences "
@@ -92,6 +94,62 @@ def engine_url() -> str:
     return DEFAULT_LLAMACPP_URL
 
 
+#: Ollama's own `/api/chat` instead of its OpenAI-compatible shim (v13, D3).
+#: Measured on this machine: a thinking model asked through `/v1/chat/completions`
+#: spends its whole token budget reasoning and returns empty content, because
+#: `think:false` has nowhere to go in the OpenAI schema. The native endpoint
+#: takes `think`, `keep_alive` and `options` per request, which is also how a
+#: model gets loaded onto the CPU (`options.num_gpu: 0`, v13 D4). Off with
+#: DEXTER_OLLAMA_NATIVE=0 if it ever needs to be.
+OLLAMA_NATIVE = os.getenv("DEXTER_OLLAMA_NATIVE", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
+
+def _ollama_usage(body: Dict[str, Any]) -> Dict[str, Any]:
+    """The generation counters Ollama reports on a finished response."""
+    return {
+        key: body[key]
+        for key in ("eval_count", "eval_duration", "load_duration",
+                    "prompt_eval_count", "total_duration")
+        if body.get(key) is not None
+    }
+
+
+def _openai_usage(body: Dict[str, Any]) -> Dict[str, Any]:
+    """The `usage` block of an OpenAI-compatible reply, plus which backend answered
+    when the server says (claude-local-api reports `backend`)."""
+    usage = body.get("usage") if isinstance(body, dict) else None
+    out: Dict[str, Any] = dict(usage) if isinstance(usage, dict) else {}
+    if isinstance(body, dict) and body.get("backend"):
+        out["backend"] = body["backend"]
+    return out
+
+
+#: A reply that is *only* reasoning (v13, P1.3). Through the OpenAI-compatible
+#: shim `think:false` has nowhere to go, so a reasoning model can burn its whole
+#: budget deliberating and hand back empty content with the thoughts in
+#: `reasoning` / `reasoning_content`. Showing nothing is the worst possible
+#: outcome, so it is reported as an error and the router escalates.
+ONLY_THOUGHT = "model only thought"
+
+_REASONING_KEYS = ("reasoning", "reasoning_content")
+
+
+def _thought_without_an_answer(
+    content: Optional[str], payload: Dict[str, Any], calls: List[Dict[str, Any]],
+) -> int:
+    """Characters of reasoning behind an empty reply, or 0 when there is an answer.
+
+    A tool call *is* an answer, so a model that thought and then called a tool
+    is doing exactly what was asked of it.
+    """
+    if (content or "").strip() or calls:
+        return 0
+    thought = "".join(str(payload.get(key) or "") for key in _REASONING_KEYS)
+    return len(thought.strip())
+
+
 @dataclass
 class LLMResponse:
     content: str = ""
@@ -99,6 +157,9 @@ class LLMResponse:
     provider: str = ""
     model: str = ""
     error: Optional[str] = None
+    #: What the backend reported about the generation itself: `eval_count`,
+    #: `eval_duration`, `load_duration` (Ollama's native path). Empty elsewhere.
+    usage: Dict[str, Any] = field(default_factory=dict)
     # Set when the answering provider is not the one first selected - the
     # request was completed by a fallback after the primary failed mid-flight.
     fallback_from: Optional[str] = None
@@ -126,17 +187,23 @@ class HybridLLMRouter:
         self.ollama_url = local_url(os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/v1"))
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        # claude-local-api (B:\youtubeProjects\Buzzcaf_Media\claudeAPI): an
+        # OpenAI-compatible server over the Claude Code login, with ChatGPT via
+        # Codex as its own fallback. Needs its key; the model is optional (the
+        # server's default is Sonnet with escalation to Opus).
+        self.claude_url = local_url(os.getenv("CLAUDE_API_URL", "http://127.0.0.1:8787/v1")).rstrip("/")
+        self.claude_api_key = os.getenv("CLAUDE_API_KEY", "").strip()
+        self.claude_model = os.getenv("CLAUDE_API_MODEL", "").strip()
 
         # Explicit overrides; when unset the loaded model is auto-detected.
         self.llamacpp_model = os.getenv("LLAMACPP_MODEL", "")
-        self.lm_studio_model = os.getenv("LM_STUDIO_MODEL", "")
+        self.lm_studio_model = os.getenv("LM_STUDIO_MODEL", "gemma-4-12b")
         self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
 
         # Preferred local backend for "auto" requests. Set to "ollama" to run
         # Dexter on Ollama and keep LM Studio free for other work (it stays a
-        # fallback if Ollama is down); "lmstudio" forces the reverse. "auto"
-        # (default) keeps the original local-first order.
-        self.default_provider = (os.getenv("DEXTER_LLM_PROVIDER", "auto").strip().lower() or "auto")
+        # fallback if Ollama is down); "lmstudio" forces the reverse.
+        self.default_provider = (os.getenv("DEXTER_LLM_PROVIDER", "lmstudio").strip().lower() or "lmstudio")
 
         self.session = requests.Session()
         self._health_cache: Optional[Dict[str, Any]] = None
@@ -148,13 +215,37 @@ class HybridLLMRouter:
 
     # ───────────────────────── health ─────────────────────────
 
-    def _check_endpoint(self, url: str) -> bool:
+    def _check_endpoint(self, url: str, headers: Optional[Dict[str, str]] = None) -> bool:
         if not port_open(url):
             return False
         try:
-            return self.session.get(url, timeout=_PROBE_TIMEOUT).status_code == 200
+            return self.session.get(url, timeout=_PROBE_TIMEOUT, headers=headers or {}).status_code == 200
         except Exception:
             return False
+
+    def _claude_online(self) -> bool:
+        """Up *and* the key works: the Claude server answers /models only when authenticated.
+        Kept apart from `_check_endpoint`, which tests replace with a one-argument fake."""
+        if not self.claude_api_key:
+            return False
+        # Reachability goes through the shared probe (its unauthenticated
+        # /health), so a test that fakes `_check_endpoint` decides here too.
+        root = re.sub(r"/v1$", "", self.claude_url)
+        if not self._check_endpoint(f"{root}/health"):
+            return False
+        try:
+            res = self.session.get(f"{self.claude_url}/models", timeout=_PROBE_TIMEOUT,
+                                   headers=self._headers_for("claude"))
+            return res.status_code == 200
+        except Exception:
+            return False
+
+    def _headers_for(self, provider: str) -> Dict[str, str]:
+        if provider == "claude":
+            return {"Authorization": f"Bearer {self.claude_api_key}"} if self.claude_api_key else {}
+        if provider == "openai":
+            return {"Authorization": f"Bearer {self.openai_api_key}"} if self.openai_api_key else {}
+        return {}
 
     def get_available_providers(self, force: bool = False) -> Dict[str, Any]:
         """Cached for HEALTH_TTL_SECONDS. This is on the hot path of every message."""
@@ -187,10 +278,15 @@ class HybridLLMRouter:
             else:
                 lm_online = self._check_endpoint(f"{self.lm_studio_url}/models")
 
+        # The Claude server answers /models only with a valid key, so one probe
+        # checks both that it is up and that the key works.
+        claude_online = self._claude_online()
+
         result = {
             "llamacpp": {"online": llamacpp_online, "url": self.llamacpp_url},
             "lmStudio": {"online": lm_online, "url": self.lm_studio_url},
             "ollama": {"online": ollama_online, "url": self.ollama_url},
+            "claude": {"online": claude_online, "url": self.claude_url, "configured": bool(self.claude_api_key)},
             "gemini": {"configured": bool(self.gemini_api_key)},
             "openai": {"configured": bool(self.openai_api_key)},
         }
@@ -225,10 +321,10 @@ class HybridLLMRouter:
             self._model_cache.pop(self.llamacpp_url, None)
             self._served_cache.clear()
 
-    def _list_models_at(self, base_url: str) -> List[str]:
+    def _list_models_at(self, base_url: str, headers: Optional[Dict[str, str]] = None) -> List[str]:
         """All model ids a local OpenAI-compatible server currently exposes."""
         try:
-            res = self.session.get(f"{base_url}/models", timeout=_PROBE_TIMEOUT)
+            res = self.session.get(f"{base_url}/models", timeout=_PROBE_TIMEOUT, headers=headers or {})
             if res.status_code == 200:
                 data = res.json().get("data") or []
                 return [d.get("id", "") for d in data if d.get("id")]
@@ -254,14 +350,21 @@ class HybridLLMRouter:
                 "url": url,
                 "models": self._list_models_at(url) if online else [],
             }
+        claude_online = bool(health.get("claude", {}).get("online"))
+        providers["claude"] = {
+            "online": claude_online,
+            "url": self.claude_url,
+            "configured": bool(self.claude_api_key),
+            "models": self._list_models_at(self.claude_url, self._headers_for("claude")) if claude_online else [],
+        }
         return {
             "providers": providers,
             "preferred": self.default_provider,
-            # The model each provider defaults to when none is picked explicitly.
             "defaultModel": {
                 "llamacpp": self.llamacpp_model or None,
-                "lmstudio": self.lm_studio_model or None,
+                "lmstudio": self.lm_studio_model or "gemma-4-12b",
                 "ollama": self.ollama_model or None,
+                "claude": self.claude_model or None,
             },
         }
 
@@ -285,19 +388,40 @@ class HybridLLMRouter:
             pass
         return ""
 
+    @staticmethod
+    def _model_matches(candidate: str, requested: str) -> bool:
+        if not candidate or not requested:
+            return False
+        if candidate == requested or candidate.split(":")[0] == requested:
+            return True
+        c_clean = candidate.split("/")[-1].lower().replace(" ", "-").replace("_", "-")
+        r_clean = requested.split("/")[-1].lower().replace(" ", "-").replace("_", "-")
+        if c_clean == r_clean or r_clean in c_clean or c_clean in r_clean:
+            return True
+        c_norm = c_clean.replace("gemma4", "gemma-4")
+        r_norm = r_clean.replace("gemma4", "gemma-4")
+        return c_norm == r_norm or r_norm in c_norm or c_norm in r_norm
+
     def _model_for(self, provider: str, override: Optional[str]) -> str:
         if override:
             return override
         if provider == "llamacpp":
             return self.llamacpp_model or self._discover_model(self.llamacpp_url) or "local-model"
         if provider == "lmstudio":
-            return self.lm_studio_model or self._discover_model(self.lm_studio_url) or "local-model"
+            discovered = self._discover_model(self.lm_studio_url)
+            target = self.lm_studio_model or "gemma-4-12b"
+            if discovered and self._model_matches(discovered, target):
+                return discovered
+            return self.lm_studio_model or discovered or "gemma-4-12b"
         if provider == "ollama":
             return self.ollama_model or self._discover_model(self.ollama_url) or "llama3.2"
         if provider == "gemini":
             return "gemini-1.5-pro"
         if provider == "openai":
             return "gpt-4o"
+        if provider == "claude":
+            # "default" lets the server apply its own tiering (Sonnet, escalating to Opus).
+            return self.claude_model or "default"
         return "local-model"
 
     def _is_available(self, provider: str, providers: Dict[str, Any]) -> bool:
@@ -311,6 +435,8 @@ class HybridLLMRouter:
             return bool(providers["gemini"]["configured"])
         if provider == "openai":
             return bool(providers["openai"]["configured"])
+        if provider == "claude":
+            return bool(providers.get("claude", {}).get("online"))
         return False
 
     def resolve_provider(self, provider: str = "auto") -> str:
@@ -319,7 +445,7 @@ class HybridLLMRouter:
         providers = self.get_available_providers()
         # Configured preference wins when it is actually up; otherwise fall back
         # to the original local-first order.
-        order = ["llamacpp", "lmstudio", "ollama", "gemini", "openai"]
+        order = ["llamacpp", "lmstudio", "ollama", "claude", "gemini", "openai"]
         if self.default_provider != "auto":
             order = [self.default_provider] + [p for p in order if p != self.default_provider]
         for prov in order:
@@ -330,6 +456,8 @@ class HybridLLMRouter:
     def _base_url_for(self, provider: str) -> str:
         if provider == "llamacpp":
             return self.llamacpp_url
+        if provider == "claude":
+            return self.claude_url
         return self.ollama_url if provider == "ollama" else self.lm_studio_url
 
     def _provider_chain(self, provider: str, needs_tools: bool = False) -> List[str]:
@@ -350,6 +478,8 @@ class HybridLLMRouter:
             chain.append("lmstudio")
         if health["ollama"]["online"]:
             chain.append("ollama")
+        if health.get("claude", {}).get("online"):
+            chain.append("claude")
         if health["openai"]["configured"]:
             chain.append("openai")
         if health["gemini"]["configured"] and not needs_tools:
@@ -388,7 +518,7 @@ class HybridLLMRouter:
                     return prov
                 continue
             ids = self._list_models_at(self._base_url_for(prov))
-            served = any(m == model or m.split(":")[0] == model for m in ids)
+            served = any(self._model_matches(m, model) for m in ids)
             with self._lock:
                 self._served_cache[key] = (served, now)
             if served:
@@ -407,13 +537,23 @@ class HybridLLMRouter:
     def _ollama_api(self) -> str:
         return self.ollama_url[:-3] if self.ollama_url.endswith("/v1") else self.ollama_url
 
-    def set_keep_alive(self, provider: str, model: str, keep_alive: str) -> bool:
+    def set_keep_alive(
+        self, provider: str, model: str, keep_alive: str,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         if provider != "ollama" or not model:
             return False
+        body: Dict[str, Any] = {"model": model, "keep_alive": keep_alive, "stream": False}
+        if options:
+            # `options.num_gpu` is how a model is put somewhere other than the
+            # card: 0 loads it entirely into RAM, N splits it (v13, D4). Ollama
+            # keeps a model where it was put, so the placement only changes on
+            # the next *load* — which is exactly the lever the steward wants.
+            body["options"] = dict(options)
         try:
             res = self.session.post(
                 f"{self._ollama_api()}/api/generate",
-                json={"model": model, "keep_alive": keep_alive, "stream": False},
+                json=body,
                 timeout=120,
             )
             return res.status_code == 200
@@ -421,9 +561,38 @@ class HybridLLMRouter:
             print(f"[HybridLLM] keep_alive({model}={keep_alive}) failed: {exc}")
             return False
 
-    def warm_model(self, provider: str, model: str, keep_alive: str = "2h") -> bool:
+    def warm_model(
+        self, provider: str, model: str, keep_alive: str = "2h",
+        options: Optional[Dict[str, Any]] = None,
+    ) -> bool:
         """Load `model` now (if needed) and keep it resident for `keep_alive`."""
-        return self.set_keep_alive(provider, model, keep_alive)
+        return self.set_keep_alive(provider, model, keep_alive, options=options)
+
+    def model_layers(self, model: str) -> int:
+        """How many transformer blocks `model` has, per Ollama's `/api/show`.
+
+        Needed to turn "this much VRAM is free" into a `num_gpu` layer count
+        (v13, P3.4). 0 when Ollama cannot say, which the caller reads as "do not
+        try to split this one".
+        """
+        if not model:
+            return 0
+        try:
+            res = self.session.post(
+                f"{self._ollama_api()}/api/show", json={"model": model}, timeout=10,
+            )
+            if res.status_code != 200:
+                return 0
+            info = res.json().get("model_info") or {}
+        except Exception:
+            return 0
+        for key, value in info.items():
+            if str(key).endswith(".block_count"):
+                try:
+                    return int(value)
+                except Exception:
+                    return 0
+        return 0
 
     def release_model(self, provider: str, model: str, after: str = "0") -> bool:
         """Unload `model` now ("0") or once idle for `after` (e.g. "3m")."""
@@ -443,6 +612,11 @@ class HybridLLMRouter:
                         "sizeMb": size // (1024 * 1024),
                         "vramMb": vram // (1024 * 1024),
                         "onGpu": size > 0 and vram >= size,
+                        # Where it actually is (v13): all of it on the card, all
+                        # of it in RAM, or Ollama's own partial offload. Read off
+                        # the numbers rather than remembered, so a model someone
+                        # else loaded is described just as honestly as ours.
+                        "place": "gpu" if size > 0 and vram >= size else ("cpu" if vram <= 0 else "split"),
                         "expiresAt": m.get("expires_at"),
                     })
                 return out
@@ -464,6 +638,9 @@ class HybridLLMRouter:
         on_token: Optional[Callable[[str], None]] = None,
         on_fallback: Optional[Callable[[str, str], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
+        think: Optional[Any] = False,
+        options: Optional[Dict[str, Any]] = None,
+        keep_alive: Optional[str] = None,
     ) -> LLMResponse:
         """
         Full multi-turn chat with optional native tool calling.
@@ -478,6 +655,13 @@ class HybridLLMRouter:
         `should_cancel()` is polled while a stream is consumed; when it returns
         True generation stops and the response is flagged `cancelled` - returned
         as-is without trying the next provider (a barge-in is not a failure).
+
+        `think` / `options` / `keep_alive` are Ollama's own knobs (v13, D3) and
+        only reach the native `/api/chat` path: `think=False` (the default) stops
+        a reasoning model from spending its whole budget deliberating, `options`
+        carries `num_gpu` and friends, `keep_alive` pins the model for this
+        request. Every other provider ignores them, so a caller never has to ask
+        which backend answered.
         """
         chain = self._provider_chain(provider, needs_tools=bool(tools))
         last: Optional[LLMResponse] = None
@@ -493,13 +677,15 @@ class HybridLLMRouter:
                         pass
             response = self._chat_one(
                 prov, messages, model, temperature, max_tokens, tools, timeout,
-                on_token, should_cancel,
+                on_token, should_cancel, think=think, options=options,
+                keep_alive=keep_alive,
             )
             if response.cancelled:
                 return response
             if response.ok:
                 if idx > 0:
                     response.fallback_from = chain[0]
+                token_ledger.record(response.provider or prov, response.model or model or "", response.usage)
                 return response
             last = response
             # The failed probe result is stale now; let the next request re-probe.
@@ -520,8 +706,18 @@ class HybridLLMRouter:
         timeout: int,
         on_token: Optional[Callable[[str], None]],
         should_cancel: Optional[Callable[[], bool]] = None,
+        think: Optional[Any] = False,
+        options: Optional[Dict[str, Any]] = None,
+        keep_alive: Optional[str] = None,
     ) -> LLMResponse:
         model_name = self._model_for(prov, model)
+
+        if prov == "ollama" and OLLAMA_NATIVE:
+            return self._chat_ollama_native(
+                messages, model_name, temperature, max_tokens, tools, timeout,
+                on_token=on_token, should_cancel=should_cancel, think=think,
+                options=options, keep_alive=keep_alive,
+            )
 
         if prov == "gemini":
             if not self.gemini_api_key:
@@ -540,10 +736,178 @@ class HybridLLMRouter:
                 provider_label="openai", on_token=on_token, should_cancel=should_cancel,
             )
 
+        if prov == "claude":
+            if not self.claude_api_key:
+                return LLMResponse(provider=prov, model=model_name,
+                                   error="CLAUDE_API_KEY not configured (see claudeAPI/README.md)")
+            return self._chat_openai_compat(
+                self.claude_url, messages, model_name, temperature,
+                max_tokens, tools, timeout, headers=self._headers_for("claude"),
+                provider_label="claude", on_token=on_token, should_cancel=should_cancel,
+            )
+
         return self._chat_openai_compat(
             self._base_url_for(prov), messages, model_name, temperature,
             max_tokens, tools, timeout, provider_label=prov, on_token=on_token,
             should_cancel=should_cancel,
+        )
+
+    # ───────────────────────── Ollama's own /api/chat (v13, D3) ─────────────────────────
+
+    def _chat_ollama_native(
+        self,
+        messages: List[Dict[str, Any]],
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        tools: Optional[List[Dict[str, Any]]],
+        timeout: int,
+        on_token: Optional[Callable[[str], None]] = None,
+        should_cancel: Optional[Callable[[], bool]] = None,
+        think: Optional[Any] = False,
+        options: Optional[Dict[str, Any]] = None,
+        keep_alive: Optional[str] = None,
+        _no_think_key: bool = False,
+    ) -> LLMResponse:
+        """Ollama's native chat endpoint — same LLMResponse, three more levers.
+
+        Measured before this existed: qwen3.5 asked through `/v1/chat/completions`
+        spent all 200 tokens reasoning and returned empty content, because the
+        OpenAI schema has no way to say "do not think". The same question through
+        here with `think:false` answers in 0.6 s.
+        """
+        streaming = on_token is not None
+        base = self._ollama_api()
+        opts: Dict[str, Any] = {"temperature": temperature, "num_predict": max_tokens}
+        if options:
+            opts.update(options)
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": streaming,
+            "options": opts,
+        }
+        if not _no_think_key:
+            payload["think"] = think
+        if tools:
+            payload["tools"] = tools
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
+
+        try:
+            res = self.session.post(
+                f"{base}/api/chat", json=payload, timeout=timeout, stream=streaming,
+            )
+        except Exception as exc:
+            return LLMResponse(
+                provider="ollama", model=model,
+                error=f"Could not reach the local model at {base}: {exc}",
+            )
+
+        if res.status_code != 200:
+            body = res.text[:300]
+            # Ollama refuses `think` outright for a model that has no reasoning
+            # mode ("... does not support thinking"). Asking a plain model not to
+            # think must not be the reason a turn fails, so drop the key and ask
+            # again — once.
+            if not _no_think_key and "think" in body.lower():
+                return self._chat_ollama_native(
+                    messages, model, temperature, max_tokens, tools, timeout,
+                    on_token, should_cancel, think, options, keep_alive,
+                    _no_think_key=True,
+                )
+            if tools and res.status_code in (400, 422, 500):
+                print(f"[HybridLLM] Ollama rejected native tools ({res.status_code}); retrying without.")
+                return self._chat_ollama_native(
+                    messages, model, temperature, max_tokens, None, timeout,
+                    on_token, should_cancel, think, options, keep_alive,
+                    _no_think_key=_no_think_key,
+                )
+            return LLMResponse(
+                provider="ollama", model=model,
+                error=f"Model server returned {res.status_code}: {body}",
+            )
+
+        if streaming:
+            return self._consume_ollama_stream(res, model, on_token, should_cancel)
+
+        try:
+            body_json = res.json()
+        except Exception as exc:
+            return LLMResponse(
+                provider="ollama", model=model,
+                error=f"Malformed response from model server: {exc}",
+            )
+        message = body_json.get("message") or {}
+        return LLMResponse(
+            content=message.get("content") or "",
+            tool_calls=self._parse_tool_calls(message.get("tool_calls") or []),
+            provider="ollama", model=model,
+            usage=_ollama_usage(body_json),
+        )
+
+    def _consume_ollama_stream(
+        self,
+        res: requests.Response,
+        model: str,
+        on_token: Callable[[str], None],
+        should_cancel: Optional[Callable[[], bool]] = None,
+    ) -> LLMResponse:
+        """Ollama streams newline-delimited JSON objects, not SSE frames.
+
+        Otherwise identical to `_consume_stream`: content deltas go straight to
+        `on_token`, a cancellation abandons the stream without an error, and a
+        connection that dies mid-reply is an error so the caller can retry it
+        somewhere else rather than showing half an answer.
+        """
+        content_parts: List[str] = []
+        raw_calls: List[Dict[str, Any]] = []
+        usage: Dict[str, Any] = {}
+        res.encoding = "utf-8"
+        try:
+            with res:
+                for line in res.iter_lines(decode_unicode=True):
+                    if should_cancel and should_cancel():
+                        res.close()
+                        return LLMResponse(
+                            content="".join(content_parts),
+                            provider="ollama", model=model, cancelled=True,
+                        )
+                    if not line or not line.strip():
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except Exception:
+                        continue
+                    if chunk.get("error"):
+                        return LLMResponse(
+                            provider="ollama", model=model,
+                            error=f"Ollama: {chunk['error']}",
+                        )
+                    message = chunk.get("message") or {}
+                    piece = message.get("content")
+                    if piece:
+                        content_parts.append(piece)
+                        try:
+                            on_token(piece)
+                        except Exception:
+                            pass
+                    # Native tool calls arrive whole, not as argument fragments.
+                    for call in message.get("tool_calls") or []:
+                        raw_calls.append(call)
+                    if chunk.get("done"):
+                        usage = _ollama_usage(chunk)
+                        break
+        except Exception as exc:
+            return LLMResponse(
+                provider="ollama", model=model,
+                error=f"Stream dropped mid-response: {exc}",
+            )
+
+        return LLMResponse(
+            content="".join(content_parts),
+            tool_calls=self._parse_tool_calls(raw_calls),
+            provider="ollama", model=model, usage=usage,
         )
 
     def _chat_openai_compat(
@@ -559,6 +923,7 @@ class HybridLLMRouter:
         provider_label: str = "lmstudio",
         on_token: Optional[Callable[[str], None]] = None,
         should_cancel: Optional[Callable[[], bool]] = None,
+        usage_ok: bool = True,
     ) -> LLMResponse:
         streaming = on_token is not None
         payload: Dict[str, Any] = {
@@ -572,6 +937,10 @@ class HybridLLMRouter:
             payload["tool_choice"] = "auto"
         if streaming:
             payload["stream"] = True
+            # Ask for the token counts on the last chunk (token_ledger). Servers
+            # that reject the key get one retry without it, below.
+            if usage_ok:
+                payload["stream_options"] = {"include_usage": True}
 
         try:
             res = self.session.post(
@@ -589,12 +958,19 @@ class HybridLLMRouter:
 
         if res.status_code != 200:
             body = res.text[:300]
+            if streaming and usage_ok and res.status_code in (400, 422) and "stream_options" in body:
+                return self._chat_openai_compat(
+                    base_url, messages, model, temperature, max_tokens,
+                    tools, timeout, headers, provider_label, on_token, should_cancel,
+                    usage_ok=False,
+                )
             # Some local servers reject the `tools` key outright; retry plain.
             if tools and res.status_code in (400, 422, 500):
                 print(f"[HybridLLM] Server rejected native tools ({res.status_code}); retrying without.")
                 return self._chat_openai_compat(
                     base_url, messages, model, temperature, max_tokens,
                     None, timeout, headers, provider_label, on_token, should_cancel,
+                    usage_ok=usage_ok,
                 )
             return LLMResponse(
                 provider=provider_label, model=model,
@@ -605,16 +981,24 @@ class HybridLLMRouter:
             return self._consume_stream(res, provider_label, model, on_token, should_cancel)
 
         try:
-            choice = res.json()["choices"][0]["message"]
+            body_json = res.json()
+            choice = body_json["choices"][0]["message"]
         except Exception as exc:
             return LLMResponse(
                 provider=provider_label, model=model,
                 error=f"Malformed response from model server: {exc}",
             )
+        calls = self._parse_tool_calls(choice.get("tool_calls") or [])
+        only_thought = _thought_without_an_answer(choice.get("content"), choice, calls)
+        if only_thought:
+            print(f"[HybridLLM] {model} returned {only_thought} characters of reasoning "
+                  "and no answer; escalating rather than showing nothing.")
+            return LLMResponse(provider=provider_label, model=model, error=ONLY_THOUGHT)
         return LLMResponse(
             content=choice.get("content") or "",
-            tool_calls=self._parse_tool_calls(choice.get("tool_calls") or []),
-            provider=provider_label, model=model,
+            tool_calls=calls,
+            provider=provider_label, model=body_json.get("model") or model,
+            usage=_openai_usage(body_json),
         )
 
     def _consume_stream(
@@ -635,6 +1019,9 @@ class HybridLLMRouter:
         response is returned (barge-in) - not retried on another provider.
         """
         content_parts: List[str] = []
+        reasoning_parts: List[str] = []
+        usage: Dict[str, Any] = {}
+        served_model = model
         # Tool-call fragments arrive keyed by index; the name lands once, the
         # arguments accumulate as string fragments.
         calls_acc: Dict[int, Dict[str, str]] = {}
@@ -657,7 +1044,19 @@ class HybridLLMRouter:
                     if data == "[DONE]":
                         break
                     try:
-                        delta = json.loads(data)["choices"][0].get("delta", {})
+                        chunk = json.loads(data)
+                    except Exception:
+                        continue
+                    if isinstance(chunk, dict):
+                        # The usage chunk (stream_options.include_usage) has no
+                        # choices; claude-local-api also names the backend on it.
+                        found = _openai_usage(chunk)
+                        if found:
+                            usage.update(found)
+                        if chunk.get("model"):
+                            served_model = chunk["model"]
+                    try:
+                        delta = chunk["choices"][0].get("delta", {})
                     except Exception:
                         continue
                     piece = delta.get("content")
@@ -667,6 +1066,11 @@ class HybridLLMRouter:
                             on_token(piece)
                         except Exception:
                             pass
+                    for key in _REASONING_KEYS:
+                        # Never streamed to the UI: the user asked a question,
+                        # not for the model's inner monologue.
+                        if delta.get(key):
+                            reasoning_parts.append(str(delta[key]))
                     for tc in delta.get("tool_calls") or []:
                         acc = calls_acc.setdefault(
                             tc.get("index", 0), {"id": "", "name": "", "args": ""}
@@ -689,10 +1093,19 @@ class HybridLLMRouter:
             for _, acc in sorted(calls_acc.items())
             if acc["name"]
         ]
+        calls = self._parse_tool_calls(raw_calls)
+        only_thought = _thought_without_an_answer(
+            "".join(content_parts), {"reasoning": "".join(reasoning_parts)}, calls,
+        )
+        if only_thought:
+            print(f"[HybridLLM] {model} streamed {only_thought} characters of reasoning "
+                  "and no answer; escalating rather than showing nothing.")
+            return LLMResponse(provider=provider_label, model=model, error=ONLY_THOUGHT)
         return LLMResponse(
             content="".join(content_parts),
-            tool_calls=self._parse_tool_calls(raw_calls),
-            provider=provider_label, model=model,
+            tool_calls=calls,
+            provider=provider_label, model=served_model or model,
+            usage=usage,
         )
 
     @staticmethod

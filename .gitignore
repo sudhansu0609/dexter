@@ -55,3 +55,49 @@ data/browser_profile/
 data/code_jobs/
 data/code_jobs.json
 data/activity.jsonl
+
+# Hand-tracking models (v13.1) - 8 MB of someone else's weights, downloaded by
+# "set up hand tracking" rather than vendored.
+data/models/
+
+# Mission Reminder write queue (v13.1): what Dexter has tried to save into the app
+data/mission_outbox.json
+
+# v13.4: the Chrome profile Dexter starts for the precise (CDP) route. A whole
+# browser profile - cookies, cache, the owner's signed-in session. Never committed.
+data/chrome_debug_profile/
+
+# v13.7: the watchdog's own evidence - a heartbeat outside the logging system and
+# thread stacks from any turn that overran. Local diagnostics, per machine.
+data/heartbeat.txt
+data/heartbeat.txt.1
+data/stacks.log
+
+# Windows Executables & Installer Builds
+Dexter.exe
+Dexter-Setup.exe
+Uninstall-Dexter.exe
+dist-installer/
+dist-electron/
+data/pytest_tmp/
+
+
+# buzzcode's scratch output (test logs, tool dumps) - per-run, not source
+.buzzcode/*.txt
+.buzzcode/tool-out/
+
+# Per-machine runtime state: paired-device token hashes, token ledger,
+# changelog cursor, the visualizer's voice-state bus
+data/devices.json
+data/token_usage.json
+data/changelog_state.json
+data/.voice_state
+data/.voice_waveform
+
+# Downloaded weights (ECAPA speaker model, 85 MB) and third-party reference
+# clones (jaredRepo is AGPL, used for concepts only) - never vendored
+models/
+jaredRepo/
+
+# Claude Code local settings and installed third-party skills
+.claude/

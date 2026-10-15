@@ -42,13 +42,19 @@ import app_index
 import apps_registry
 import buzzcaf_ports
 import cancellation
+import devices  # persistent per-phone tokens + pairing codes (mobile access)
 import google_tools
 import media_tools
 import model_steward
 import router as intent_router
 import runtime_health
 import settings_store
+import token_ledger  # tokens used per model call, all-time and this session
 import tools_assistant  # noqa: F401  - registers reminder/memory tools
+import tools_projects  # noqa: F401  - v13.8: launch any project by name
+import tools_screen  # noqa: F401  - v13.8: click words on the screen
+import tools_verify  # noqa: F401  - v13.8: is it open? is it on the page?
+import watchdog  # v13.7: where did it stop?
 import windows_tools
 from buzzcaf_client import buzzcaf_client
 from events import bus
@@ -63,11 +69,17 @@ import tools_studio  # noqa: F401  - registers the Buzzcaf Studio control tools
 import tools_knowledge  # noqa: F401  - registers knowledge search/reindex and profile tools
 import tools_sentinel  # noqa: F401  - registers the GPU / batch-job tools
 import tools_apps  # noqa: F401  - registers the sibling-app tools (v9)
+import tools_music  # noqa: F401  - registers MastGaane as Dexter's music ("play some ghazals")
 import tools_browser  # noqa: F401  - registers the browser tools (v6, mode-aware in v11)
+import tools_youtube  # noqa: F401  - registers "play the second video" (v13)
+import tools_page  # noqa: F401  - search here, pick the nth thing, copy/paste (v13.2)
+import tools_dictation  # noqa: F401  - registers continuous note-taking (v13)
+import tools_handmouse  # noqa: F401  - registers the webcam hand mouse (v13)
 import tools_desktop  # noqa: F401  - registers keys/typing/windows/clicks (v11)
 import tools_shell  # noqa: F401  - registers the confirmed PowerShell tool (v11.1)
 import tools_code  # noqa: F401  - registers buzzcode + local engine tools (v6)
 import tools_mission  # noqa: F401  - registers the mission tools (v7)
+import tools_mission_app  # noqa: F401  - registers the Mission Reminder bridge (v13)
 import tools_activity  # noqa: F401  - registers what-am-I-doing (v7)
 import tools_claude  # noqa: F401  - registers the Claude Code log readers (v7)
 import voice_pipeline
@@ -104,10 +116,48 @@ voice_engine = DexterVoiceEngine()
 VERSION = "2.0.0"
 APP_ID = "dexter"
 HOST = os.getenv("DEXTER_HOST", "127.0.0.1")
+#: The address uvicorn actually binds to. `HOST` stays the *loopback identity*
+#: used for the port test, /health and the desktop window; `DEXTER_BIND` is the
+#: separate knob that opens the socket up (set it to 0.0.0.0 so the phone can
+#: reach Dexter over Tailscale). Off by default - loopback only, as before.
+BIND_HOST = os.getenv("DEXTER_BIND", HOST).strip() or HOST
 #: A wish, not a fact. `DEXTER_PORT` names the port Dexter would *like*.
 PREFERRED_PORT = int(os.getenv("DEXTER_PORT") or 8098)
 #: Where `npm run dev` serves the UI from (vite.config.ts reads the same var).
 VITE_PORT = int(os.getenv("VITE_DEXTER_UI_PORT") or 3006)
+
+
+def _tailnet_hosts() -> list:
+    """Hostnames a remote (phone) request is allowed to arrive under.
+
+    A DNS-rebinding page still can't forge the Host header, so the allowlist
+    (below) has to name every legitimate one. `DEXTER_TAILNET_HOST` is a
+    comma-separated list (MagicDNS name and/or 100.x IP); we also make a
+    best-effort `tailscale ip -4` probe so the common case needs no config.
+    """
+    hosts = []
+    for raw in (os.getenv("DEXTER_TAILNET_HOST") or "").split(","):
+        h = raw.strip().lower()
+        if h:
+            hosts.append(h)
+    if BIND_HOST not in ("127.0.0.1", "localhost", "::1"):
+        try:
+            import subprocess as _sp
+
+            out = _sp.run(
+                ["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0),
+            )
+            for line in (out.stdout or "").splitlines():
+                ip = line.strip().lower()
+                if ip and ip not in hosts:
+                    hosts.append(ip)
+        except Exception:
+            pass
+    return hosts
+
+
+TAILNET_HOSTS = _tailnet_hosts()
 
 
 def _bind_port() -> int:
@@ -196,6 +246,12 @@ async def lifespan(app: FastAPI):
     """Warm every index in the background so the first request is not the slow one."""
     bus.bind_loop(asyncio.get_running_loop())
 
+    # First, before anything can get stuck: the watchdog. Dexter has frozen twice
+    # with the log simply ending mid-turn, which rules nothing out; this writes a
+    # heartbeat outside the logging system and dumps every thread's stack when a
+    # turn overruns, so the next time there is an answer instead of a theory.
+    watchdog.start()
+
     removed = macros.purge_invalid()
     if removed:
         print(f"[Startup] Removed {len(removed)} auto-generated junk skill(s).")
@@ -268,6 +324,15 @@ async def lifespan(app: FastAPI):
                 )
         except Exception as exc:
             print(f"[Startup] Knowledge pass skipped: {exc}")
+        # Self-awareness: track what code and features changed since the last run
+        try:
+            import changelog_tracker
+
+            ch = changelog_tracker.record_session()
+            if ch.get("has_changes"):
+                print(f"[Startup] Changelog: {len(ch.get('items', []))} recent update(s) tracked.")
+        except Exception as exc:
+            print(f"[Startup] Changelog recording skipped: {exc}")
 
     threading.Thread(target=_warm_health, name="dexter-health-warm", daemon=True).start()
 
@@ -394,10 +459,38 @@ except Exception as _exc:
     print(f"[Auth] Could not persist session token: {_exc}")
 
 # Reachable without the token: the health probe, the token bootstrap itself,
-# and generated speech clips - those are played through Audio(), which cannot
-# attach headers, and contain only Dexter's own words.
-_TOKEN_EXEMPT = ("/api/dexter/health", "/api/dexter/auth/token", "/api/dexter/audio/")
-_ALLOWED_HOSTNAMES = {"127.0.0.1", "localhost", "::1", os.getenv("DEXTER_HOST", "127.0.0.1")}
+# generated speech clips, the local single-instance activate signal, and the
+# pairing redemption (a not-yet-paired phone has no token to send, but must
+# supply a valid one-time code).
+_TOKEN_EXEMPT = (
+    "/api/dexter/health",
+    "/api/dexter/auth/token",
+    "/api/dexter/audio/",
+    "/api/dexter/show",
+    "/api/dexter/pair/redeem",
+)
+#: Only these hostnames count as "this machine". Minting a pairing code and
+#: fetching the shared session token are restricted to them.
+_LOOPBACK_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
+_ALLOWED_HOSTNAMES = _LOOPBACK_HOSTNAMES | {os.getenv("DEXTER_HOST", "127.0.0.1")} | set(TAILNET_HOSTS)
+
+
+def _is_loopback(request: Request) -> bool:
+    """True when the request arrived under a loopback host - i.e. from this PC.
+
+    A phone reaches Dexter under its tailnet name/IP, so its Host header is never
+    loopback; that is exactly how we keep code-minting and the token bootstrap
+    on-box only.
+    """
+    return (request.url.hostname or "").lower() in _LOOPBACK_HOSTNAMES
+
+
+_SHOW_WINDOW_CALLBACK = None
+
+
+def register_show_window_callback(callback):
+    global _SHOW_WINDOW_CALLBACK
+    _SHOW_WINDOW_CALLBACK = callback
 
 
 @app.middleware("http")
@@ -409,13 +502,24 @@ async def require_local_token(request: Request, call_next):
         return JSONResponse({"detail": "Forbidden host"}, status_code=403)
 
     path = request.url.path
+    # One dict write, so the watchdog can tell a frozen front end from a frozen
+    # backend: the microphone lives in the WebView2 page, so when either one stops
+    # Dexter goes quiet in exactly the same way.
+    watchdog.note_request(path)
     if (
         request.method != "OPTIONS"  # CORS preflight cannot carry custom headers
         and path.startswith("/api/")
         and not path.startswith(_TOKEN_EXEMPT)
     ):
         supplied = request.headers.get("x-dexter-token") or request.query_params.get("token")
-        if not supplied or not secrets.compare_digest(supplied, SESSION_TOKEN):
+        # Either the on-box session token (local shells) or a paired device
+        # token (the phone). The device store hashes what it holds, so this is a
+        # hash-compare, not a plaintext one.
+        ok = bool(supplied) and (
+            secrets.compare_digest(supplied, SESSION_TOKEN)
+            or devices.verify(supplied) is not None
+        )
+        if not ok:
             return JSONResponse(
                 {"detail": "Missing or invalid X-Dexter-Token"}, status_code=401
             )
@@ -428,19 +532,27 @@ async def require_local_token(request: Request, call_next):
 # file:// URL, just the literal "file://" or "null" markers.
 # Added after the auth middleware so CORS runs first and error responses
 # still carry the headers the browser needs to surface them.
+_CORS_ORIGINS = [
+    # The Vite dev server, and the backend's own origin on whatever port it
+    # actually took. Nothing here is a literal: a hardcoded 8098 stopped
+    # working the first time something else held it.
+    f"http://localhost:{VITE_PORT}",
+    f"http://127.0.0.1:{VITE_PORT}",
+    f"http://localhost:{SERVER_PORT}",
+    f"http://127.0.0.1:{SERVER_PORT}",
+    "null",
+    "file://",
+]
+# The PWA on the phone is served from the backend's own static mount, so its
+# calls are same-origin and CORS never applies - but naming the tailnet origins
+# keeps the Vite-dev-on-phone case and any explicit cross-origin call working.
+for _h in TAILNET_HOSTS:
+    _CORS_ORIGINS.append(f"http://{_h}:{SERVER_PORT}")
+    _CORS_ORIGINS.append(f"http://{_h}:{VITE_PORT}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        # The Vite dev server, and the backend's own origin on whatever port it
-        # actually took. Nothing here is a literal: a hardcoded 8098 stopped
-        # working the first time something else held it.
-        f"http://localhost:{VITE_PORT}",
-        f"http://127.0.0.1:{VITE_PORT}",
-        f"http://localhost:{SERVER_PORT}",
-        f"http://127.0.0.1:{SERVER_PORT}",
-        "null",
-        "file://",
-    ],
+    allow_origins=_CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -449,6 +561,17 @@ app.add_middleware(
 @app.get("/api/dexter/health")
 async def health():
     return {"ok": True}
+
+
+@app.post("/api/dexter/show")
+async def show_window():
+    if _SHOW_WINDOW_CALLBACK:
+        try:
+            _SHOW_WINDOW_CALLBACK()
+            return {"ok": True, "action": "window_shown"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+    return {"ok": True, "action": "no_callback"}
 
 
 @app.get("/health")
@@ -470,9 +593,66 @@ async def identity_health():
 
 
 @app.get("/api/dexter/auth/token")
-async def get_session_token():
-    """Token bootstrap for the local UI shells (guarded by the Host check)."""
+async def get_session_token(request: Request):
+    """Token bootstrap for the on-box UI shells only.
+
+    Once the bind opens up for the phone (Tailscale), handing the shared session
+    token to any caller would defeat the point, so this now refuses anything that
+    did not arrive under a loopback host. Remote devices pair instead.
+    """
+    if not _is_loopback(request):
+        raise HTTPException(status_code=403, detail="Pair this device instead.")
     return {"token": SESSION_TOKEN}
+
+
+# ───────────────────────── device pairing (mobile access) ─────────────────────────
+
+
+class PairRedeemRequest(BaseModel):
+    code: str
+    name: Optional[str] = "phone"
+
+
+def _tailnet_base_url() -> Optional[str]:
+    """The URL a phone should open, if we know a tailnet host. QR/UI use this."""
+    host = TAILNET_HOSTS[0] if TAILNET_HOSTS else None
+    return f"http://{host}:{SERVER_PORT}" if host else None
+
+
+@app.post("/api/dexter/pair/code")
+async def mint_pairing_code(request: Request):
+    """Mint a one-time pairing code (on-box only) to show as a QR on the PC."""
+    if not _is_loopback(request):
+        raise HTTPException(status_code=403, detail="Pairing codes are minted on the PC.")
+    code, ttl = devices.new_pairing_code()
+    base = _tailnet_base_url()
+    return {
+        "code": code,
+        "expiresIn": ttl,
+        "url": base,
+        # What the phone scans: the base URL plus the code, so the PWA can
+        # redeem automatically after loading.
+        "pairUrl": f"{base}/?pair={code}" if base else None,
+    }
+
+
+@app.post("/api/dexter/pair/redeem")
+async def redeem_pairing_code(req: PairRedeemRequest):
+    """Redeem a pairing code (from the phone) for a long-lived device token."""
+    result = await run_in_threadpool(devices.redeem_pairing, req.code, req.name or "phone")
+    if not result:
+        raise HTTPException(status_code=400, detail="That code is invalid or expired.")
+    return result
+
+
+@app.get("/api/dexter/devices")
+async def list_paired_devices():
+    return {"devices": devices.list_devices()}
+
+
+@app.delete("/api/dexter/devices/{device_id}")
+async def revoke_device(device_id: str):
+    return {"success": devices.revoke(device_id)}
 
 
 # ───────────────────────── models ─────────────────────────
@@ -488,6 +668,9 @@ class ChatRequest(BaseModel):
     voiceKey: Optional[str] = None
     # The message was spoken, so the reply will be heard, not read.
     voiceInput: Optional[bool] = False
+    # Which page/tab sent this turn, so the SSE `chat_turn` mirror can skip
+    # the device that originated it (it already rendered the reply).
+    origin: Optional[str] = None
 
 
 class TTSRequest(BaseModel):
@@ -499,6 +682,16 @@ class TTSRequest(BaseModel):
 
 class InterruptRequest(BaseModel):
     session: Optional[str] = "default"
+
+
+class MicRequest(BaseModel):
+    muted: bool = True
+    session: Optional[str] = "default"
+
+
+class VoiceBusRequest(BaseModel):
+    state: str
+    samples: Optional[List[float]] = None
 
 
 class AddTaskRequest(BaseModel):
@@ -582,6 +775,7 @@ async def get_status():
     )
     tiers = await run_in_threadpool(_tier_status)
     sentinel = await run_in_threadpool(runtime_health.sentinel_state)
+    hand_state = await run_in_threadpool(_hand_mouse_summary)
 
     return {
         "status": "online",
@@ -615,12 +809,33 @@ async def get_status():
             "ttsReady": voice_engine.ready() or voice_engine.kokoro_available(),
             "debug": _voice_debug,
         },
+        # The hand mouse, in the shape the header chip needs. The panel asks
+        # /handmouse for the whole picture (the gesture map, the catalogues);
+        # this is the glanceable half, on a poll that already happens.
+        "handMouse": hand_state,
+        # Turns completed, whether one is in flight and for how long (v13.7).
+        "watchdog": watchdog.status(),
         "buzzcafAI": {
             "online": buzzcaf_status.get("online", False),
             "activeProjects": buzzcaf_status.get("in_progress", 0),
             "totalProjects": buzzcaf_status.get("total_projects", 0),
         },
     }
+
+
+def _hand_mouse_summary() -> Dict[str, Any]:
+    """Enough to show a live chip: is it tracking, what is it seeing, is it ready."""
+    try:
+        import handmouse
+
+        state = handmouse.live_status()
+    except Exception as exc:  # pragma: no cover - opencv/numpy absent
+        return {"running": False, "ready": False, "why": str(exc)}
+    keep = ("running", "pose", "action", "gesture", "fps", "ready", "why", "error",
+            "palmScore", "palmNeeded", "seeingHand", "camera", "minutes", "dryRun")
+    summary = {key: state.get(key) for key in keep}
+    summary["previewOpen"] = bool((state.get("preview") or {}).get("open"))
+    return summary
 
 
 def _tier_status() -> Dict[str, Any]:
@@ -643,6 +858,18 @@ async def get_llm_models():
     return await run_in_threadpool(llm_router.list_models)
 
 
+@app.get("/api/dexter/llm/usage")
+async def get_llm_usage():
+    """Tokens used by every model call: all-time and this session, per provider and model."""
+    return token_ledger.summary()
+
+
+@app.post("/api/dexter/llm/usage/reset")
+async def reset_llm_usage():
+    """Zero the all-time token counters (the session bucket keeps counting)."""
+    return token_ledger.reset()
+
+
 @app.get("/api/dexter/tools")
 async def list_registered_tools():
     return [
@@ -656,6 +883,15 @@ async def list_registered_tools():
         }
         for spec in all_tools()
     ]
+
+
+@app.get("/api/dexter/changes")
+async def get_dexter_changes():
+    """What changed in Dexter since the last run or in recent updates."""
+    import changelog_tracker
+
+    return await run_in_threadpool(changelog_tracker.get_changes_since_last_run)
+
 
 
 # ───────────────────────── chat ─────────────────────────
@@ -689,6 +925,14 @@ def _take_mood_tag(text: str):
 
 def _run_route(req: ChatRequest, on_event=None) -> Dict[str, Any]:
     """Route one message, with conversation history and stored facts as context."""
+    token = watchdog.turn_started(req.message, source="voice" if req.voiceInput else "chat")
+    try:
+        return _route_turn(req, on_event)
+    finally:
+        watchdog.turn_finished(token)
+
+
+def _route_turn(req: ChatRequest, on_event=None) -> Dict[str, Any]:
     session = req.session or "default"
 
     # A spoken yes/no can answer a background task waiting at a checkpoint,
@@ -714,6 +958,9 @@ def _run_route(req: ChatRequest, on_event=None) -> Dict[str, Any]:
     active = windows_tools.get_active_window_title()
     if active:
         context_parts.append(f"The user currently has this window in focus: {active}")
+    focus_note = intent_router.focus_context_note(session=session)
+    if focus_note:
+        context_parts.append(focus_note)
     # What they have been doing: app + project + minutes, files just saved, today's shape (v7).
     try:
         context_parts.extend(activity.context_lines())
@@ -781,6 +1028,18 @@ async def process_chat(req: ChatRequest):
 _SENTENCE_END = re.compile(r"[.!?][\"'\)\]]*\s")
 _MIN_STREAM_SENTENCE = 12
 
+#: How long a turn will wait for the speech thread before finishing without it
+#: (v13.7). Generous - a long reply is several Kokoro calls - but finite, which is
+#: the part that matters.
+TTS_JOIN_TIMEOUT = float(os.getenv("DEXTER_TTS_JOIN_TIMEOUT", "25") or 25)
+
+#: Edge-tts carries emotion per sentence (rate/pitch/volume), so a long reply
+#: no longer has to pick one mood at the first sentence and keep it. On by
+#: default; off restores the old locked-register behaviour.
+PER_SENTENCE_EMOTION = os.getenv("DEXTER_VOICE_PER_SENTENCE_EMOTION", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
 
 @app.post("/api/dexter/chat/stream")
 async def process_chat_stream(req: ChatRequest):
@@ -804,9 +1063,19 @@ async def process_chat_stream(req: ChatRequest):
     session_id = req.session or "default"
     speak = bool(req.voiceEnabled) and VOICE_ENABLED
     voice_key = req.voiceKey or default_voice_key()
+    # Say why a reply is silent. "There is no voice any more" has four possible
+    # causes on the page - muted, the speaker muted separately (v13.2), voice off,
+    # or this window not holding the microphone - and none of them was visible from
+    # the backend, which made it a guessing game.
+    if not speak:
+        print(f"[Stream] No audio for this turn: the page sent voiceEnabled="
+              f"{bool(req.voiceEnabled)}"
+              + ("" if VOICE_ENABLED else " and DEXTER_VOICE is off")
+              + ". Nothing will be spoken.")
 
     # Synthesis runs on its own thread so a 300 ms Kokoro call never stalls
-    # the token stream. Sentences go in; audio events come out.
+    # the token stream. Sentences go in; audio events come out - and the turn waits
+    # no longer than TTS_JOIN_TIMEOUT for it to finish.
     tts_queue: "sync_queue.Queue[Optional[str]]" = sync_queue.Queue()
     state = {"pending": "", "spoke_stream": False, "emotion": None}
 
@@ -820,10 +1089,14 @@ async def process_chat_stream(req: ChatRequest):
             if cancellation.is_cancelled(session_id):
                 continue
             try:
-                delivery, chunks = voice_engine.plan_speech(sentence, "", None, False, False, state["emotion"])
-                if state["emotion"] is None:
-                    # Lock the register decided for the first sentence so the
-                    # reply does not change mood halfway through.
+                # DEXTER_VOICE_PER_SENTENCE_EMOTION (default on): each sentence is
+                # inferred and delivered in its own mood, since edge-tts's
+                # per-sentence rate/pitch/volume can actually carry that. Off
+                # reproduces the old behaviour - the register decided for the
+                # first sentence locked for the rest of the reply.
+                requested_emotion = None if PER_SENTENCE_EMOTION else state["emotion"]
+                delivery, chunks = voice_engine.plan_speech(sentence, "", None, False, False, requested_emotion)
+                if state["emotion"] is None or PER_SENTENCE_EMOTION:
                     state["emotion"] = delivery.emotion
                     emit("delivery", {"emotion": delivery.emotion, "speed": delivery.speed})
                 for chunk in chunks:
@@ -868,6 +1141,19 @@ async def process_chat_stream(req: ChatRequest):
                 return
             emit("reply", result)
 
+            # Mirror this turn to the other devices on the same session (phone ↔
+            # PC). The originating page rendered it over its own /chat/stream
+            # response and is excluded by `origin`; every other open shell picks
+            # it up on the always-on SSE bus, whatever its voice state.
+            bus.publish("chat_turn", {
+                "session": session_id,
+                "origin": req.origin,
+                "user": req.message,
+                "reply": result.get("reply", ""),
+                "action": result.get("action"),
+                "quickReplies": (result.get("details") or {}).get("quickReplies"),
+            })
+
             if speak:
                 if state["spoke_stream"]:
                     # Streamed sentences are already voiced; finish the tail.
@@ -903,7 +1189,22 @@ async def process_chat_stream(req: ChatRequest):
             emit("error", {"message": str(exc)})
         finally:
             tts_queue.put(None)
-            await run_in_threadpool(tts_thread.join)
+            # **With a deadline.** This join had none, and it is the last thing
+            # standing between a turn and the "done" the page waits for: if the
+            # synthesis thread ever sticks - in Kokoro, in onnxruntime, anywhere -
+            # the stream never ends, the page never stops thinking, and because the
+            # microphone lives in that page, Dexter goes deaf as well. Which is
+            # exactly what "dexter is hanging" looked like, twice, with the log
+            # ending mid-turn and nothing else to go on.
+            #
+            # Losing the tail of a spoken sentence is a small cost. Losing the
+            # assistant is not.
+            await run_in_threadpool(tts_thread.join, TTS_JOIN_TIMEOUT)
+            if tts_thread.is_alive():
+                print(f"[Stream] The speech thread did not finish within "
+                      f"{TTS_JOIN_TIMEOUT:.0f}s; answering anyway and leaving it to "
+                      f"drain. Stacks in data/stacks.log.")
+                watchdog.dump_stacks("the TTS thread outlived its turn")
             cancellation.clear(session_id)
             emit("done", {})
 
@@ -979,6 +1280,7 @@ _voice_debug: Dict[str, Any] = {
     "peak": 0,          # loudest sample seen this run (int16, 0-32767)
     "lastPeak": 0,      # loudest sample in the most recent frame
     "lastHeard": "",    # the last transcript, for the status page
+    "muted": False,     # mic off for the whole session (v13.11)
 }
 
 
@@ -1025,7 +1327,8 @@ async def voice_socket(ws: WebSocket):
     _voice_debug["connections"] = _voice_hub.connections()
     caps = voice_pipeline.capabilities()
     print(f"[Voice WS] {label} connected (session={session_id}, active={active}): {caps}")
-    await ws.send_json({"type": "status", "enabled": True, "active": active, **caps})
+    await ws.send_json({"type": "status", "enabled": True, "active": active,
+                        "muted": _voice_hub.is_muted(session_id), **caps})
     if active:
         _voice_debug["active"] = label
 
@@ -1069,6 +1372,19 @@ async def voice_socket(ws: WebSocket):
                     vsession.reset()
                 await ws.send_json({"type": "active"})
                 continue
+            if kind == "mute":
+                # Mic off/on for the whole session, honoured from either window
+                # (a standby window may be the one you clicked). Tell every window
+                # so both reflect it and release the mic device.
+                muted = bool(ctrl.get("on"))
+                socks = _voice_hub.set_muted(session_id, muted)
+                _voice_debug["muted"] = muted
+                for sock in socks:
+                    try:
+                        await sock.send_json({"type": "mic_muted", "muted": muted})
+                    except Exception:
+                        pass
+                continue
             if not _voice_hub.is_active(session_id, ws):
                 continue
             if kind == "speaking":
@@ -1107,11 +1423,75 @@ async def voice_socket(ws: WebSocket):
 
 
 @app.post("/api/dexter/voice/interrupt")
+@app.post("/api/dexter/chat/cancel")
 async def voice_interrupt(req: InterruptRequest = InterruptRequest()):
-    """Manual stop (the stop button / Esc) - cancels the session's stream."""
+    """Manual stop (the stop button / Esc) - cancels the session's stream and audio."""
     session = req.session or "default"
     cancellation.request_cancel(session)
+    try:
+        vsession = _voice_hub.session(session)
+        if vsession:
+            vsession.stop()
+    except Exception:
+        pass
     return {"ok": True, "session": session}
+
+
+@app.post("/api/dexter/voice/mic")
+async def voice_mic(req: MicRequest = MicRequest()):
+    """Mic off/on for the whole session (the pop-up's "Mic off").
+
+    Deliberately independent of the audio socket: muting a window closes that
+    window's socket, and the backend then hands the mic to the *other* window -
+    which is exactly how "I turned the mic off and Dexter still heard me"
+    happened. Setting it here, on the session, is honoured no matter which
+    window ends up holding the mic. Every window is told so both show it and
+    let go of the microphone device."""
+    session = req.session or "default"
+    socks = _voice_hub.set_muted(session, bool(req.muted))
+    _voice_debug["muted"] = bool(req.muted)
+    for sock in socks:
+        try:
+            await sock.send_json({"type": "mic_muted", "muted": bool(req.muted)})
+        except Exception:
+            pass
+    return {"ok": True, "session": session, "muted": bool(req.muted)}
+
+
+_VOICE_BUS_STATES = {"idle", "listening", "thinking", "speaking"}
+# Same folder Dexter already writes its own runtime files to (data/.session_token,
+# data/audio, data/settings.json) - the ai-visualizer sidecar polls the tiny
+# .voice_* files it drops here. Bus-only: we never touch jaredRepo/ai-visualizer
+# itself (AGPL isolation), only these plain-text/JSON signal files.
+VOICE_BUS_DIR = os.path.join(ROOT_DIR, "data")
+
+
+def _write_bus_file(path: str, text: str) -> None:
+    temp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    with open(temp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+@app.post("/api/dexter/voice-bus")
+async def voice_bus(req: VoiceBusRequest):
+    """Publish the voice state (and optional waveform) for the ai-visualizer
+    face to read. Anything outside the four known states is ignored rather
+    than raising, so a stray value from the UI can never break the face."""
+    state = (req.state or "").strip().lower()
+    if state not in _VOICE_BUS_STATES:
+        return {"ok": False, "ignored": True}
+    try:
+        os.makedirs(VOICE_BUS_DIR, exist_ok=True)
+        _write_bus_file(os.path.join(VOICE_BUS_DIR, ".voice_state"), state)
+        if req.samples:
+            payload = json.dumps({"ts": time.time(), "samples": [float(s) for s in req.samples[:64]]})
+            _write_bus_file(os.path.join(VOICE_BUS_DIR, ".voice_waveform"), payload)
+    except Exception:
+        pass
+    return {"ok": True, "state": state}
 
 
 @app.post("/api/dexter/tts/generate")
@@ -1443,6 +1823,99 @@ async def get_scheduled_tasks():
     return await run_in_threadpool(tasks.list_scheduled)
 
 
+# ───────────────────────── unified scheduler (reminders + actions) ─────────────────────────
+
+
+class ScheduleCreateRequest(BaseModel):
+    # action.type is one of: reminder | goal | command | app | workflow | code_task.
+    # A reminder routes to the reminder store; everything else to scheduled actions.
+    action: Dict[str, Any]
+    when: str
+
+
+class ScheduleUpdateRequest(BaseModel):
+    action: Optional[Dict[str, Any]] = None
+    when: Optional[str] = None
+
+
+def _schedule_snapshot() -> Dict[str, Any]:
+    """One normalized list of everything on the calendar, for the mobile UI."""
+    items: List[Dict[str, Any]] = []
+    for rem in scheduler.list_reminders(include_fired=False):
+        items.append({
+            "id": rem.get("id"),
+            "kind": "reminder",
+            "actionType": "reminder",
+            "label": rem.get("text", ""),
+            "whenText": rem.get("whenText"),
+            "at": rem.get("at"),
+            "cron": rem.get("cron"),
+            "channels": rem.get("channels"),
+        })
+    for entry in tasks.list_scheduled():
+        action = tasks._entry_action(entry)
+        items.append({
+            "id": entry.get("id"),
+            "kind": "action",
+            "actionType": action.get("type", "goal"),
+            "label": tasks.action_summary(action),
+            "action": action,
+            "whenText": entry.get("whenText"),
+            "at": entry.get("at"),
+            "cron": entry.get("cron"),
+            "lastRun": entry.get("lastRun"),
+        })
+    # Undated (recurring) items last; dated ones soonest-first.
+    items.sort(key=lambda i: i.get("at") or "9999")
+    return {"items": items, "scheduler": scheduler.status()}
+
+
+@app.get("/api/dexter/schedule")
+async def get_schedule():
+    return await run_in_threadpool(_schedule_snapshot)
+
+
+@app.post("/api/dexter/schedule")
+async def create_schedule(req: ScheduleCreateRequest):
+    action = req.action or {}
+    if action.get("type") == "reminder":
+        result = await run_in_threadpool(
+            scheduler.create_reminder, action.get("text", ""), req.when, action.get("channels"),
+        )
+    else:
+        result = await run_in_threadpool(tasks.create_scheduled, action, req.when)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Invalid schedule"))
+    return result
+
+
+@app.put("/api/dexter/schedule/{item_id}")
+async def update_schedule(item_id: str, req: ScheduleUpdateRequest):
+    result = await run_in_threadpool(tasks.update_scheduled, item_id, req.action, req.when)
+    if result is None:
+        raise HTTPException(status_code=404, detail="No such scheduled action (reminders can't be edited; delete and re-add).")
+    if isinstance(result, dict) and result.get("ok") is False:
+        raise HTTPException(status_code=400, detail=result.get("error", "Invalid schedule"))
+    return result
+
+
+@app.delete("/api/dexter/schedule/{item_id}")
+async def delete_schedule(item_id: str):
+    # An id is either a reminder or a scheduled action; try both.
+    removed = await run_in_threadpool(scheduler.cancel_reminder, item_id)
+    if not removed:
+        removed = await run_in_threadpool(tasks.cancel_scheduled_by_id, item_id)
+    return {"success": removed}
+
+
+@app.post("/api/dexter/schedule/{item_id}/run")
+async def run_schedule_now(item_id: str):
+    ran = await run_in_threadpool(tasks.run_now, item_id)
+    if not ran:
+        raise HTTPException(status_code=404, detail="No such scheduled action.")
+    return {"success": True}
+
+
 @app.get("/api/dexter/tasks")
 async def get_tasks():
     return await run_in_threadpool(tasks.task_queue.list)
@@ -1768,6 +2241,67 @@ async def stop_app_endpoint(app_id: str, confirm: bool = False):
     return result.to_dict()
 
 
+@app.post("/api/dexter/debug/stacks")
+async def dump_stacks_endpoint():
+    """Write every thread's stack to data/stacks.log, now.
+
+    For the case where Dexter has gone quiet but the backend is still answering -
+    which is itself the useful half of the diagnosis, because the microphone lives
+    in the WebView2 page and a frozen front end looks exactly the same from
+    outside.
+    """
+    ok = await run_in_threadpool(watchdog.dump_stacks, "asked for")
+    return {"ok": ok, **watchdog.status()}
+
+
+@app.get("/api/dexter/handmouse")
+async def get_hand_mouse():
+    """The hand mouse in full: what it is seeing, and which pose does what.
+
+    The panel polls this rather than /status because it needs the gesture map and
+    the catalogues behind it, and because when tracking is on it wants a faster
+    tick than the status poll gives.
+    """
+    import handmouse
+
+    return await run_in_threadpool(handmouse.live_status)
+
+
+class HandMouseStart(BaseModel):
+    camera: Optional[int] = None
+    #: Rehearse the gestures with the real pointer untouched.
+    dryRun: bool = False
+    preview: Optional[bool] = None
+
+
+@app.post("/api/dexter/handmouse/start")
+async def start_hand_mouse_endpoint(req: HandMouseStart):
+    result = await run_in_threadpool(
+        execute, "start_hand_mouse",
+        {"dry_run": bool(req.dryRun), **({"camera": req.camera} if req.camera is not None else {})},
+    )
+    return result.to_dict()
+
+
+@app.post("/api/dexter/handmouse/stop")
+async def stop_hand_mouse_endpoint():
+    result = await run_in_threadpool(execute, "stop_hand_mouse", {})
+    return result.to_dict()
+
+
+class HandBinding(BaseModel):
+    pose: str
+    action: str
+
+
+@app.post("/api/dexter/handmouse/bind")
+async def bind_hand_gesture(req: HandBinding):
+    """Change what one pose does. Live, even while tracking."""
+    result = await run_in_threadpool(execute, "set_hand_gesture",
+                                     {"pose": req.pose, "action": req.action})
+    return result.to_dict()
+
+
 class NudgeRequest(BaseModel):
     text: str
     kind: Optional[str] = "nudge"
@@ -1809,11 +2343,11 @@ if __name__ == "__main__":
     # keep it off untrusted networks.
     # The port was chosen at import time (`_bind_port`), so everything that
     # names it - CORS, /health, the ledger entry - already agrees.
-    print(f"Starting Dexter Engine on http://{HOST}:{SERVER_PORT}")
+    print(f"Starting Dexter Engine on http://{HOST}:{SERVER_PORT} (bind {BIND_HOST})")
     # A line a launcher can read without guessing (GUARDIAN_PLAN §11, rule 6).
     print(f"READY port={SERVER_PORT}", flush=True)
     publish_when_ready(SERVER_PORT)
     try:
-        uvicorn.run(app, host=HOST, port=SERVER_PORT)
+        uvicorn.run(app, host=BIND_HOST, port=SERVER_PORT)
     finally:
         withdraw_port()

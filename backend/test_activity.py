@@ -5,6 +5,7 @@ answers read like a colleague who was looking over your shoulder.
 """
 
 import os
+import re
 import time
 from datetime import datetime
 
@@ -79,11 +80,14 @@ def test_narratives_and_context(log):
     now = activity.narrative("now")
     assert now.startswith("You're in Premiere Pro on beyond3baje") and "router.py in dexter (3 min ago)" in now
     today = activity.narrative("today")
-    assert today.startswith("Today:") and "Premiere Pro 30 min" in today and "beyond3baje 30 min" in today
+    # 29 or 30: the samples are a minute apart and the clock can tick mid-test.
+    assert today.startswith("Today:")
+    assert re.search(r"Premiere Pro (29|30) min", today), today
+    assert re.search(r"beyond3baje (29|30) min", today), today
     assert activity.narrative("yesterday").startswith("Yesterday: I don't have any activity")
     lines = activity.context_lines()
     assert lines[0].startswith("In focus now: Premiere Pro on beyond3baje") and "Recently saved: router.py" in lines[1]
-    assert "Premiere Pro on beyond3baje · 30 min" in activity.now_line()
+    assert re.search(r"Premiere Pro on beyond3baje · (29|30) min", activity.now_line())
 
 
 def test_activity_phrases_route_without_the_model():

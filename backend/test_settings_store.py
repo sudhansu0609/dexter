@@ -91,7 +91,7 @@ def test_a_bad_value_is_rejected_without_breaking_the_rest():
 
 def test_choices_outside_the_list_fall_back_to_the_default():
     settings_store.update({"llmProvider": "openrouter"})
-    assert settings_store.current()["llmProvider"] == "auto"
+    assert settings_store.current()["llmProvider"] == "lmstudio"
 
 
 @pytest.mark.parametrize("truthy", [True, "1", "true", "on", "yes"])
@@ -132,6 +132,28 @@ def test_the_ollama_model_can_be_changed_without_editing_env(monkeypatch):
     assert os.environ["DEXTER_SMART_MODEL"] == "gemma4:12b"
 
 
+def test_the_fallback_rung_is_a_setting_of_its_own(monkeypatch):
+    """v12: the ladder is two rows in Settings → Model, not an .env edit."""
+    monkeypatch.setattr(router, "SMART_MODEL", "qwen2.5:7b", raising=False)
+    monkeypatch.setattr(router, "SMART_MODEL_FALLBACK", "qwen2.5:7b", raising=False)
+
+    result = settings_store.update({"smartModel": "gemma-4-12b",
+                                    "smartModelFallback": "qwen2.5:7b"})
+
+    assert router.SMART_MODEL == "gemma-4-12b"
+    assert router.SMART_MODEL_FALLBACK == "qwen2.5:7b"
+    assert {"smartModel", "smartModelFallback"} <= set(result["applied"])
+    assert os.environ["DEXTER_SMART_MODEL_FALLBACK"] == "qwen2.5:7b"
+
+    schema = {row["key"]: row for row in settings_store.describe()}
+    assert schema["smartModelFallback"]["kind"] == "model"
+    assert schema["smartModelFallback"]["liveReload"] is True
+
+    # Blank is a real answer: one rung, as before v12.
+    settings_store.update({"smartModelFallback": ""})
+    assert router.SMART_MODEL_FALLBACK == ""
+
+
 def test_model_ids_keep_their_case_and_need_not_be_in_the_list(monkeypatch):
     monkeypatch.setattr(router, "SMART_MODEL", "", raising=False)
     settings_store.update({"smartModel": "google/Gemma-4-12B"})
@@ -154,3 +176,45 @@ def test_model_settings_list_what_the_servers_have(monkeypatch):
     assert row["options"][0] == "qwen2.5:7b"  # the current value leads
     assert "gemma4:12b" in row["options"] and "google/gemma-4-12b" in row["options"]
     assert row["liveReload"] is True
+
+
+# ── v13: the fast tier is a model that acts ─────────────────────────────────
+
+
+def test_the_fast_tier_defaults_to_the_model_that_measured_best(monkeypatch):
+    """qwen3.5:4b: 27 of 30 tool choices right, 111 tok/s, 3.0 GB on this card.
+
+    The default matters because it is what a machine with nothing in its .env
+    gets, and because the Settings row and the router must not disagree about
+    what "unset" means - one of them showing qwen2.5:3b while the other ran
+    something else is how a measured decision quietly stops applying.
+    """
+    monkeypatch.delenv("DEXTER_FAST_MODEL", raising=False)
+    schema = {row["key"]: row for row in settings_store.describe()}
+    assert schema["fastModel"]["default"] == "qwen3.5:4b"
+    assert schema["fastModel"]["value"] == "qwen3.5:4b"
+
+    source = open(os.path.join(os.path.dirname(os.path.abspath(router.__file__)),
+                               "router.py"), encoding="utf-8").read()
+    assert 'os.getenv("DEXTER_FAST_MODEL", "qwen3.5:4b")' in source
+    # ...and blank is still "no fast tier at all" - the owner's off switch, not
+    # a value to be helpfully replaced by a default.
+    assert '.strip()' in source.split('os.getenv("DEXTER_FAST_MODEL"')[1][:40]
+
+
+def test_letting_the_fast_model_act_is_a_switch_not_an_env_edit(monkeypatch):
+    monkeypatch.setattr(router, "FAST_ACT_ENABLED", True, raising=False)
+
+    result = settings_store.update({"fastAct": False})
+
+    assert router.FAST_ACT_ENABLED is False
+    assert "fastAct" in result["applied"]
+    assert os.environ["DEXTER_FAST_ACT"] == "0"
+
+    schema = {row["key"]: row for row in settings_store.describe()}
+    assert schema["fastAct"]["kind"] == "bool"
+    assert schema["fastAct"]["liveReload"] is True
+    assert schema["fastAct"]["group"] == "model"
+
+    settings_store.update({"fastAct": True})
+    assert router.FAST_ACT_ENABLED is True

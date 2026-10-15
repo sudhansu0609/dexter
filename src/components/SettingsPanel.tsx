@@ -27,6 +27,7 @@ function VoiceSection({ voice }: { voice: VoiceApi }) {
   }, [voice.state === 'idle']);
 
   const live = voice.state !== 'off' && voice.state !== 'unavailable';
+  const brioMic = voice.mics.find((m) => /brio/i.test(m.label));
 
   return (
     <div className="dexter-voice-settings">
@@ -38,7 +39,9 @@ function VoiceSection({ voice }: { voice: VoiceApi }) {
               ? 'This one is delivering silence. Pick another.'
               : voice.micLabel
                 ? `Using: ${voice.micLabel}`
-                : 'The system default, unless it looks virtual.'}
+                : brioMic
+                  ? `Defaulting to Brio (${brioMic.label})`
+                  : 'The system default, unless it looks virtual.'}
           </small>
         </label>
         <select
@@ -47,7 +50,7 @@ function VoiceSection({ voice }: { voice: VoiceApi }) {
           disabled={!live}
           aria-label="Microphone"
         >
-          <option value="">Automatic</option>
+          <option value="">{brioMic ? `Automatic (${brioMic.label})` : 'Automatic'}</option>
           {voice.mics.map((m) => (
             <option key={m.deviceId} value={m.deviceId}>
               {m.label}
@@ -118,6 +121,8 @@ const GROUP_LABELS: Record<string, string> = {
   knowledge: 'Knowledge',
   // v9: what Dexter asks Sentinel for, and what it is allowed to unload.
   machine: 'Machine',
+  // v13.6: the webcam hand mouse, including which pose does what.
+  hand: 'Hand mouse',
   general: 'General',
 };
 
@@ -337,7 +342,15 @@ export function SettingsPanel({ onClose, voice }: { onClose: () => void; voice?:
                       padding: '3px 5px',
                     }}
                   >
-                    {row.kind === 'model' && <option value="">{row.key === 'fastModel' ? 'Off' : 'Backend default'}</option>}
+                    {row.kind === 'model' && (
+                      <option value="">
+                        {row.key === 'fastModel'
+                          ? 'Off'
+                          : row.key === 'smartModelFallback'
+                            ? 'No second rung'
+                            : 'Backend default'}
+                      </option>
+                    )}
                     {row.options.map((option) => (
                       <option key={option} value={option}>
                         {option}

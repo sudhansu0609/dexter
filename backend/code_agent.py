@@ -1,8 +1,8 @@
 """
 Coding delegated to buzzcode (roadmap v6, C1; own window and memory release, v8).
 
-buzzcode (B:\\youtubeProjects\\Buzzcaf_Media\\codeBuzz, installed as
-~/.cargo/bin/buzzcode.exe) is the owner's local coding agent: it manages the
+buzzcode (B:\\youtubeProjects\\Buzzcaf_Media\\BuzzCode, installed from
+crates/buzzcode as ~/.cargo/bin/buzzcode.exe) is the owner's local coding agent: it manages the
 llama-server on port 8089 and edits a repository from a one-shot prompt,
 emitting JSON-lines events. Dexter opens it in its own terminal window
 (code_console.py renders the events live and mirrors them into a job log),

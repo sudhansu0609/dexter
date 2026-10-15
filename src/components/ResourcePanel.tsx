@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Cpu, HardDrive, Gauge, Snowflake, RefreshCw } from 'lucide-react';
 import { getResources, runPhrase } from '../api';
-import type { ResourceSnapshot } from '../types';
+import type { LadderInfo, ResourceSnapshot } from '../types';
 
 const POLL_MS = 15_000;
 
@@ -11,6 +11,30 @@ interface Props {
 }
 
 const gb = (mib?: number | null) => (mib == null ? null : mib / 1024);
+
+/** Who pushed Dexter down a rung, if anybody was named (v12, P3.3). */
+function ladderBlocker(ladder?: LadderInfo): string {
+  const b = (ladder?.blockers || [])[0];
+  if (!b) return '';
+  return b.client || b.process || b.label || b.name || '';
+}
+
+/**
+ * "qwen3.5:4b 3.0 GB (GPU)" (v13, P3.5).
+ *
+ * A model can now be on the card, in system memory, or split across both, and
+ * the difference is about five times the speed. A list that showed only names
+ * and gigabytes could not tell the owner why an answer was crawling — and the
+ * size to show is the one that is actually being used in each place.
+ */
+export function modelLine(m: {
+  name: string; sizeMb: number; vramMb: number; onGpu: boolean; place?: string;
+}): string {
+  const place = m.place || (m.onGpu ? 'gpu' : 'cpu');
+  const label = place === 'gpu' ? 'GPU' : place === 'cpu' ? 'CPU' : 'split';
+  const mib = place === 'cpu' ? m.sizeMb : m.vramMb;
+  return `${m.name} ${(mib / 1024).toFixed(1)} GB (${label})`;
+}
 
 function zoneColour(zone?: string): string {
   const z = (zone || '').toLowerCase();
@@ -198,6 +222,20 @@ export function ResourcePanel({ tick = 0 }: Props) {
         </div>
       )}
 
+      {snap.ladder?.model && (
+        <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '8px', lineHeight: 1.4 }}>
+          Thinking on <strong style={{ color: 'var(--text)' }}>{snap.ladder.model}</strong>
+          {snap.ladder.place && snap.ladder.place !== 'gpu'
+            ? ` in ${snap.ladder.place === 'cpu' ? 'system memory' : 'a split'}`
+            : ''}
+          {snap.ladder.steppedDownFrom
+            ? ` — stepped down from ${snap.ladder.steppedDownFrom}${
+                ladderBlocker(snap.ladder) ? ` (${ladderBlocker(snap.ladder)} has the card)` : ''
+              }`
+            : ' — the rung I asked for'}
+        </div>
+      )}
+
       {snap.lastShed?.steps && snap.lastShed.steps.length > 0 && (
         <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '8px', lineHeight: 1.4 }}>
           Last gave back {((snap.lastShed.freedMib ?? 0) / 1024).toFixed(1)} GB:{' '}
@@ -227,7 +265,7 @@ export function ResourcePanel({ tick = 0 }: Props) {
       {snap.models.loaded.length > 0 && (
         <div style={{ fontSize: '10px', color: 'var(--muted)', marginTop: '4px' }}>
           <HardDrive size={9} style={{ verticalAlign: 'middle' }} /> Loaded:{' '}
-          {snap.models.loaded.map((m) => `${m.name} ${(m.vramMb / 1024).toFixed(1)} GB`).join(', ')}
+          {snap.models.loaded.map(modelLine).join(', ')}
         </div>
       )}
     </div>

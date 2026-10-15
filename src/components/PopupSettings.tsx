@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { ExternalLink, X } from 'lucide-react';
+import { ExternalLink, Mic, MicOff, Volume2, VolumeX, X } from 'lucide-react';
 import type { VoiceApi } from '../hooks/useVoice';
 import { useLlmChoice } from '../hooks/useLlmChoice';
 
@@ -17,6 +17,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   auto: 'Auto',
   lmstudio: 'LM Studio',
   ollama: 'Ollama',
+  claude: 'Claude',
 };
 
 interface Props {
@@ -42,6 +43,7 @@ export default function PopupSettings({ voice, onClose, onOpenFull }: Props) {
       ? PROVIDER_LABELS[llm.data.preferred] ?? llm.data.preferred
       : '';
   const voiceOff = voice.state === 'off' || voice.state === 'unavailable';
+  const brioMic = voice.mics.find((m) => /brio/i.test(m.label));
 
   return (
     <div className="dexter-popup-settings" role="dialog" aria-label="Quick settings">
@@ -60,7 +62,7 @@ export default function PopupSettings({ voice, onClose, onOpenFull }: Props) {
           aria-label="Microphone"
           title={voice.state === 'unavailable' ? voice.unavailableReason || 'Voice unavailable' : 'Which microphone Dexter listens on'}
         >
-          <option value="">Automatic</option>
+          <option value="">{brioMic ? `Automatic (${brioMic.label})` : 'Automatic'}</option>
           {voice.mics.map((m) => (
             <option key={m.deviceId} value={m.deviceId}>
               {m.label}
@@ -85,12 +87,44 @@ export default function PopupSettings({ voice, onClose, onOpenFull }: Props) {
                   : 'The system default, unless it looks virtual.'}
       </div>
 
+      {/* v13: the two ways to quieten Dexter, said plainly, because "mute" means
+          both of them to different people on different days. */}
+      <label className="field">
+        <span className="name">Dexter's voice</span>
+        <button
+          type="button"
+          className="mini"
+          aria-pressed={voice.silent}
+          onClick={() => voice.toggleSilent()}
+          title={voice.silent ? 'Let Dexter speak again' : 'Stop Dexter speaking; it keeps listening'}
+        >
+          {voice.silent ? <VolumeX size={12} /> : <Volume2 size={12} />}
+          {voice.silent ? ' Muted' : ' Speaking'}
+        </button>
+        <button
+          type="button"
+          className="mini"
+          aria-pressed={voice.muted}
+          onClick={() => voice.toggleMuted()}
+          title={voice.muted ? 'Turn the microphone back on' : 'Turn the microphone off entirely'}
+        >
+          {voice.muted ? <MicOff size={12} /> : <Mic size={12} />}
+          {voice.muted ? ' Mic off' : ' Mic on'}
+        </button>
+      </label>
+      <div className="note">
+        {voice.silent
+          ? 'Muted: Dexter answers in writing and still hears you.'
+          : 'Dexter speaks its replies. Mute silences the voice without closing the mic.'}
+      </div>
+
       <label className="field">
         <span className="name">Model</span>
         <select value={llm.provider} onChange={(e) => llm.setProvider(e.target.value)} aria-label="LLM provider" title="Which backend answers">
           <option value="auto">{autoTarget ? `Auto (${autoTarget})` : 'Auto'}</option>
           <option value="lmstudio">LM Studio{llm.data && !llm.data.providers?.lmstudio?.online ? ' - offline' : ''}</option>
           <option value="ollama">Ollama{llm.data && !llm.data.providers?.ollama?.online ? ' - offline' : ''}</option>
+          <option value="claude">Claude{llm.data && !llm.data.providers?.claude?.online ? ' - offline' : ''}</option>
         </select>
         <select
           value={llm.model ?? ''}

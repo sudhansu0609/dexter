@@ -14,9 +14,13 @@ silero-vad       # voice-activity detection (uses the torch already pulled in by
 kokoro-onnx      # local neural voice
 soundfile
 edge-tts         # online fallback voice when Kokoro's model files are missing
-# Who is talking: `pip install --no-deps resemblyzer` (its webrtcvad dependency has
-# no wheel for Python 3.14 and speaker_id.py never calls the one helper that uses it).
-# resemblyzer
+# Who is talking (v14.1): ECAPA-TDNN speaker embeddings via SpeechBrain. Runs on
+# CPU (~0 VRAM), needs no webrtcvad, and separates the owner from others cleanly
+# (measured cosine ~0.83 same-speaker vs ~0.02 different) where resemblyzer's
+# d-vectors overlapped. Model auto-downloads once to models/ecapa. Replaces the
+# resemblyzer path, which could not even import on Python 3.14 (missing webrtcvad
+# wheel) and so silently disabled all speaker gating.
+speechbrain      # ECAPA-TDNN voice embeddings (torch is already pulled in above)
 
 # ── Scheduling & reminders ──
 apscheduler
@@ -74,3 +78,12 @@ pystray
 pillow
 keyboard
 playwright>=1.50        # Dexter's browser (uses the installed Chrome; no bundled browser needed)
+
+# ── Hand mouse (v13.1): the webcam as a pointer ──
+# MediaPipe has no wheels for Python 3.13+, so its palm-detection and
+# hand-landmark models are run directly through onnxruntime. Install mediapipe
+# instead (or as well) on a Python it supports and Dexter prefers it.
+# The two model files are not vendored: "set up hand tracking" downloads them
+# into data/models/hand (7.6 MB, once).
+opencv-python    # frames from the webcam, the rotated crop, the resize
+onnxruntime      # runs the two MediaPipe models on the CPU

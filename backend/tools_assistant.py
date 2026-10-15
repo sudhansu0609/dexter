@@ -487,3 +487,40 @@ def _narrate_notes() -> str:
         if text:
             lines.append(f"Note {i + 1}. {text}.")
     return f"You have {len(entries)} note{'s' if len(entries) != 1 else ''}. " + " ".join(lines)
+
+
+# ───────────────────────── changelog / self-awareness ─────────────────────────
+
+
+@tool(
+    name="what_changed",
+    description=(
+        "Tell the user what changes, updates, or new features were added to Dexter "
+        "since the last time it ran or in recent updates."
+    ),
+    params={},
+    examples=[
+        "what changes were done in you from last time",
+        "what changes were done in you",
+        "what changed in dexter",
+        "what's new in dexter",
+        "what's new with you",
+        "tell me what updates were made to you recently",
+        "what changed since last time",
+        "what can you do now that is new",
+        "what features were added to you",
+    ],
+    category="general",
+)
+def what_changed() -> ToolResult:
+    """Report recent changes and features added to Dexter."""
+    import changelog_tracker
+
+    changes = changelog_tracker.get_changes_since_last_run()
+    summary = changes.get("summary", "Dexter is up to date.")
+    return ToolResult(
+        ok=True,
+        summary=summary,
+        data=changes,
+    )
+

@@ -60,7 +60,7 @@ class Setting:
 
 SETTINGS: List[Setting] = [
     Setting(
-        "llmProvider", "DEXTER_LLM_PROVIDER", "choice", "auto",
+        "llmProvider", "DEXTER_LLM_PROVIDER", "choice", "lmstudio",
         "Preferred model backend",
         "Which local server to prefer for 'auto' requests.",
         module="hybrid_llm", attr=None, options=["auto", "llamacpp", "ollama", "lmstudio"], group="model",
@@ -76,18 +76,51 @@ SETTINGS: List[Setting] = [
     # actually have (pulled Ollama tags, LM Studio ids). The owner asked to be
     # able to change the Ollama model without editing .env.
     Setting(
-        "fastModel", "DEXTER_FAST_MODEL", "model", "qwen2.5:3b",
-        "Fast model (chat)",
-        "The small model that answers simple turns instantly. Blank turns the "
+        "fastModel", "DEXTER_FAST_MODEL", "model", "qwen3.5:4b",
+        "Fast model (chat and quick actions)",
+        "The small model that answers simple turns instantly and, since v13, "
+        "takes single actions itself before anything escalates. Blank turns the "
         "fast tier off. Takes effect on the next message.",
         module="router", attr="FAST_MODEL", group="model",
     ),
+    # v13, D1: the fast model is allowed one tool call of its own. Off restores
+    # v12 behaviour, where every instruction went to the big model.
     Setting(
-        "smartModel", "DEXTER_SMART_MODEL", "model", "qwen2.5:7b",
+        "fastAct", "DEXTER_FAST_ACT", "bool", True,
+        "Let the fast model act",
+        "One tool call on the small model before escalating, so most commands "
+        "finish in about a second without loading the big one. Off sends every "
+        "instruction to the smart model, as before.",
+        module="router", attr="FAST_ACT_ENABLED", group="model",
+    ),
+    Setting(
+        "smartModel", "DEXTER_SMART_MODEL", "model", "gemma-4-12b",
         "Smart model (actions)",
         "The model that gets the tools. Blank means the backend's own default. "
         "Takes effect on the next message.",
         module="router", attr="SMART_MODEL", group="model",
+    ),
+    # v12: the second rung. Dexter asks Sentinel for the smart model first and
+    # takes this one when the card is too full for it.
+    Setting(
+        "smartModelFallback", "DEXTER_SMART_MODEL_FALLBACK", "model", "gemma-4-12b",
+        "Smart model (fallback)",
+        "The smaller model an escalated turn falls back to when Sentinel won't "
+        "give the smart model room — so a busy GPU costs you a rung, not the "
+        "answer. Blank means no second rung.",
+        module="router", attr="SMART_MODEL_FALLBACK", group="model",
+    ),
+    # v13.2: what happens to the model Dexter is no longer using.
+    Setting(
+        "offloadPrevious", "DEXTER_OFFLOAD_PREVIOUS", "choice", "rungs",
+        "Offload the model you switched away from",
+        "'rungs' (default): a model that has been replaced - a superseded ladder "
+        "rung, or a tier you changed here - is unloaded at once, and the big model "
+        "goes immediately when memory is tight. The small fast model stays, because "
+        "every chat turn needs it. 'always': only the model that just answered is "
+        "kept in memory, which saves the most and makes the next switch pay for a "
+        "reload. 'off': models leave only when their keep-alive expires, as in v13.",
+        module=None, attr=None, options=["rungs", "always", "off"], group="model",
     ),
     # ── voice (v10) ──
     Setting(
@@ -99,13 +132,38 @@ SETTINGS: List[Setting] = [
         module="voice_pipeline", attr="BARGE_IN_ENABLED", group="voice",
     ),
     Setting(
-        "followUpWindow", "DEXTER_FOLLOWUP_WINDOW", "float", 9.0,
+        "followUpWindow", "DEXTER_FOLLOWUP_WINDOW", "float", 6.0,
         "Follow-up window (seconds)",
-        "How long after Dexter speaks you can reply without the wake word.",
+        "How long after Dexter speaks you can reply without the wake word. Longer "
+        "means more of the room's conversation lands in it; since v13 an "
+        "unaddressed sentence in the window still has to look like a command.",
         module="voice_pipeline", attr="FOLLOWUP_WINDOW", group="voice",
     ),
+    # ── v13: what it takes for an unaddressed sentence to count ──
     Setting(
-        "echoGuardMs", "DEXTER_ECHO_GUARD_MS", "float", 800.0,
+        "voiceMinWords", "DEXTER_VOICE_MIN_WORDS", "int", 2,
+        "Shortest unaddressed command (words)",
+        "Inside the follow-up window (or open mic), a sentence that does not start "
+        "with Dexter's name needs at least this many words. Answers like 'yes' and "
+        "'go ahead' are always allowed.",
+        module="voice_pipeline", attr="MIN_WORDS_UNADDRESSED", group="voice",
+    ),
+    Setting(
+        "voiceMinConfidence", "DEXTER_VOICE_MIN_CONFIDENCE", "float", 0.45,
+        "Confidence for an unaddressed command",
+        "How sure the recogniser has to be about a sentence nobody addressed to "
+        "Dexter. Raise it if the television keeps getting through.",
+        module="voice_pipeline", attr="MIN_CONFIDENCE_UNADDRESSED", group="voice",
+    ),
+    Setting(
+        "followupMisses", "DEXTER_VOICE_FOLLOWUP_MISSES", "int", 2,
+        "Give up after this many empty windows",
+        "After this many follow-up windows that caught nothing meant for Dexter, it "
+        "stops re-opening them by itself until you say its name again.",
+        module="voice_pipeline", attr="FOLLOWUP_MISSES_MAX", group="voice",
+    ),
+    Setting(
+        "echoGuardMs", "DEXTER_ECHO_GUARD_MS", "float", 600.0,
         "Echo guard (ms)",
         "How long the mic stays deaf after Dexter finishes speaking, so the "
         "room's echo of its last words is not taken as your reply.",
@@ -143,6 +201,17 @@ SETTINGS: List[Setting] = [
         "A little under the bar still counts when you start with Dexter's name, and "
         "every confident match teaches Dexter your voice on this mic.",
         module="speaker_id", attr="THRESHOLD", group="voice",
+    ),
+    Setting(
+        "speakerHard", "DEXTER_SPEAKER_HARD", "bool", False,
+        "Never answer a stranger who says my name",
+        "Strict 'only me': a voice that is not a confident match for yours is "
+        "ignored even when it says Dexter's name or trips the wake word. Turn "
+        "this on when other people set Dexter off. The cost is that a borderline "
+        "match of your own voice may be ignored until you start with the name "
+        "again - raise it back by lowering 'Voice match strictness'. Needs "
+        "'Only answer to my voice' on, and your voice learned.",
+        module="voice_pipeline", attr="HARD_ONLY_ME", group="voice",
     ),
     Setting(
         "wakeName", "DEXTER_WAKE_NAME", "string", "dexter",
@@ -224,6 +293,88 @@ SETTINGS: List[Setting] = [
         "(or you) owns LM Studio.",
         module="model_steward", attr="MANAGE_LMSTUDIO", group="machine",
     ),
+    # ── v13: how far into the disk Dexter may reach, and where dictation goes ──
+    Setting(
+        "fsScope", "DEXTER_FS_SCOPE", "choice", "machine",
+        "Folders Dexter may open",
+        "'machine': every drive and folder you can open yourself - which is what "
+        "makes \"open the C drive\" and \"list that folder\" work. 'user': only your "
+        "Desktop, Documents, Downloads, Pictures, Videos, Music and the Dexter "
+        "folder. Writing inside Windows itself is refused either way.",
+        module=None, attr=None, options=["machine", "user"], group="machine",
+    ),
+    Setting(
+        "dictationTarget", "DEXTER_DICTATION_TARGET", "choice", "notes",
+        "Where \"take notes\" writes",
+        "The default sink for continuous note-taking when you do not name one: a "
+        "Markdown note in Dexter's notes folder, Notepad, Sticky Notes, Notion, or "
+        "the clipboard. Saying \"take notes in Notion\" overrides it for that note.",
+        module=None, attr=None,
+        options=["notes", "notepad", "sticky", "notion", "clipboard"], group="machine",
+    ),
+    # ── the hand mouse (v13.6). Its own group: eight of these are the gesture
+    # map, and they belong next to each other rather than scattered through
+    # "Machine", where the first one lived alone since v13.
+    Setting(
+        "interruptWords", "DEXTER_VOICE_INTERRUPT_WORDS", "bool", True,
+        "Let me interrupt mid-sentence",
+        "Keeps the microphone open while Dexter is speaking, listening for one thing "
+        "only: \"stop\", \"quiet\", \"never mind\". Anything else it hears in that "
+        "moment is dropped, so its own voice coming back through the speakers can "
+        "never be read as an instruction. Off makes it properly deaf while talking.",
+        module="voice_pipeline", attr="INTERRUPT_WORDS_ENABLED", group="voice",
+    ),
+    Setting(
+        "handSmoothing", "DEXTER_HAND_SMOOTHING", "float", 0.6,
+        "Pointer steadiness",
+        "How much the hand-tracked pointer is smoothed: 0 follows your fingertip "
+        "exactly and shakes with it, 0.9 is slow and very steady. Takes effect the "
+        "next time hand tracking starts.",
+        module=None, attr=None, group="hand",
+    ),
+    Setting(
+        "handSpeed", "DEXTER_HAND_SPEED", "float", 1.0,
+        "Pointer speed",
+        "How far the pointer travels for a given hand movement. The pointer is "
+        "absolute - a rectangle in the camera image maps onto the whole screen - so "
+        "this is the size of that rectangle: above 1 is faster and twitchier, below "
+        "1 is slower and much easier to aim with. 0.5 to 2.5.",
+        module=None, attr=None, group="hand",
+    ),
+    Setting(
+        "handDragThreshold", "DEXTER_HAND_DRAG_THRESHOLD", "int", 120,
+        "Drag distance (pixels)",
+        "The pointer holds still while you make a click, so the press lands where "
+        "you aimed. Move further than this - and hold for a moment - and it becomes "
+        "a drag instead. Lower it if drags are hard to start, raise it if clicks "
+        "slide.",
+        module=None, attr=None, group="hand",
+    ),
+    Setting(
+        "handConfirmFrames", "DEXTER_HAND_CONFIRM_FRAMES", "int", 2,
+        "Frames a click must hold",
+        "A button goes down only after the pose has been seen this many frames in a "
+        "row, and comes up only once it has been gone that many - so one noisy frame "
+        "cannot fire a click or drop one. 1 is instant and jittery; 3 is very "
+        "deliberate.",
+        module=None, attr=None, group="hand",
+    ),
+    Setting(
+        "handPinchOn", "DEXTER_HAND_PINCH_ON", "float", 0.45,
+        "How close a pinch has to be",
+        "The gap between your thumb and fingertip that counts as a pinch, measured "
+        "in hand-widths so your distance from the camera does not matter. Raise it "
+        "if pinches are missed, lower it if they fire on their own.",
+        module=None, attr=None, group="hand",
+    ),
+    Setting(
+        "handPreview", "DEXTER_HAND_PREVIEW", "bool", True,
+        "Show the tracking window",
+        "The small camera window that draws what the tracker sees, the pose it read "
+        "and the palm score. Worth keeping on: without it, \"the camera can't see "
+        "my hand\" and \"my hand is in a pose bound to do nothing\" look identical.",
+        module=None, attr=None, group="hand",
+    ),
     Setting(
         "autoClean", "DEXTER_AUTO_CLEAN", "choice", "safe",
         "Disk cleanup",
@@ -260,6 +411,32 @@ SETTINGS: List[Setting] = [
         module=None, attr=None, group="machine",
     ),
 ]
+
+def _add_gesture_settings() -> None:
+    """One choice per hand pose: what that shape of hand does (v13.6).
+
+    Generated from `handmouse`'s own catalogue rather than typed out here, so a
+    pose the detector knows about can never be missing from the settings - the
+    failure mode would be a gesture nobody can change.
+    """
+    try:
+        import handmouse
+    except Exception as exc:  # pragma: no cover - numpy/opencv absent
+        print(f"[Settings] Hand gesture settings unavailable: {exc}")
+        return
+    actions = list(handmouse.ACTIONS)
+    for pose, description in handmouse.POSES.items():
+        key = "handPose" + "".join(part.capitalize() for part in pose.split("-"))
+        SETTINGS.append(Setting(
+            key, handmouse.pose_env(pose), "choice", handmouse.POSE_DEFAULTS[pose],
+            f"Gesture: {description}",
+            "What this hand shape does. Changing it takes effect immediately, "
+            "even while hand tracking is running.",
+            module=None, attr=None, options=actions, group="hand",
+        ))
+
+
+_add_gesture_settings()
 
 _BY_KEY = {setting.key: setting for setting in SETTINGS}
 
@@ -377,9 +554,66 @@ def _apply(setting: Setting, value: Any) -> bool:
         return False
 
 
+#: Changing one of these means a model is no longer wanted. The one being
+#: replaced is offloaded rather than left holding memory until its keep-alive
+#: expires - two hours, for the fast tier (v13.2, the owner's ask).
+_MODEL_KEYS = ("fastModel", "smartModel", "smartModelFallback")
+
+
+def _offload_replaced(before: Dict[str, Any], after: Dict[str, Any]) -> List[str]:
+    """Unload the models the owner has just switched away from."""
+    dropped: List[str] = []
+    try:
+        import model_steward
+    except Exception:
+        return dropped
+    for key in _MODEL_KEYS:
+        old_value, new_value = before.get(key), after.get(key)
+        if not old_value or old_value == new_value:
+            continue
+        try:
+            # The steward decides: it refuses when the old tag is still another
+            # tier, and it never touches a model Dexter did not load.
+            if model_steward.replaced(str(old_value), str(new_value or "")):
+                dropped.append(str(old_value))
+        except Exception as exc:
+            print(f"[Settings] Could not offload {old_value}: {exc}")
+    return dropped
+
+
+#: Hand-mouse settings the tracker can pick up without being restarted. The
+#: preview window is not one of them: it is opened once, by the camera thread.
+_HAND_NUMBERS = ("handSmoothing", "handPinchOn", "handSpeed", "handDragThreshold",
+                 "handConfirmFrames")
+
+
+def _is_live_hand_key(key: str) -> bool:
+    return key.startswith("handPose") or key in _HAND_NUMBERS
+
+
+def _rebind_hand(keys: List[str]) -> bool:
+    """Re-read the hand mouse's gesture map, now, while it is tracking.
+
+    Changing a gesture is something you do *because* the current one is not
+    working, so "takes effect the next time you start hand tracking" would be the
+    wrong answer - you would have to stop the thing you are trying to fix.
+    """
+    if not any(_is_live_hand_key(key) for key in keys):
+        return False
+    try:
+        import handmouse
+
+        handmouse.hand_mouse.rebind()
+        return True
+    except Exception as exc:
+        print(f"[Settings] Could not re-read the hand gestures: {exc}")
+        return False
+
+
 def update(changes: Dict[str, Any]) -> Dict[str, Any]:
     """Persist and apply a set of changes. Unknown keys are ignored."""
     stored = _stored()
+    before = current()
     applied, needs_restart, rejected = [], [], []
 
     for key, raw in (changes or {}).items():
@@ -400,11 +634,22 @@ def update(changes: Dict[str, Any]) -> Dict[str, Any]:
             needs_restart.append(key)
 
     jsonstore.save_json(SETTINGS_PATH, stored)
+    # Applied first, then the tidy-up: `replaced` reads the router's *new* tiers
+    # to decide whether the old tag is still wanted anywhere.
+    offloaded = _offload_replaced(before, current())
+    # The hand mouse has no module constant to patch - it reads the environment
+    # when it builds its Settings - so these would be reported as
+    # "needs a restart" when in fact they can be live. Tell the running tracker.
+    if _rebind_hand(applied + needs_restart):
+        moved = [key for key in needs_restart if _is_live_hand_key(key)]
+        needs_restart = [key for key in needs_restart if key not in moved]
+        applied += moved
     return {
         "ok": True,
         "applied": applied,
         "needsRestart": needs_restart,
         "rejected": rejected,
+        "offloaded": offloaded,
         "settings": describe(),
     }
 

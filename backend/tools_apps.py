@@ -186,17 +186,34 @@ def open_app(app: str) -> ToolResult:
 
     # ── D4: Sentinel decides, Dexter asks. `Query` books nothing. ──
     vram, ram = row["vramMib"], row["ramMib"]
+    gave_back = ""
     if row["class"] == "batch" or vram > 0:
         decision = model_steward.query(f"open:{row['id']}", vram, ram)
         if not decision.granted:
-            return ToolResult(
-                ok=False,
-                summary=(
-                    f"Not enough room for {row['label']} right now ({_gb(vram):.1f} GB "
-                    f"of video memory, {_gb(ram):.1f} GB of RAM). " + decision.message()
-                ),
-                data={**row, "sentinel": decision.to_dict()},
+            # v12, D3: the owner asked for this app. If the only thing standing
+            # in its way is Dexter's own model, Dexter steps aside — sheds,
+            # hands the booking back and asks again. Anyone else's work is
+            # Sentinel's call by priority, never Dexter's, so the refusal
+            # stands exactly as it did before.
+            room = model_steward.make_room(
+                f"open:{row['id']}", row["label"], vram, ram,
+                blockers=decision.blockers,
             )
+            if room["tried"] and room["granted"]:
+                decision = room["decision"]
+                gave_back = (room["note"] + " ") if room["note"] else ""
+            else:
+                if room["tried"] and room["decision"] is not None:
+                    decision = room["decision"]
+                return ToolResult(
+                    ok=False,
+                    summary=(
+                        f"Not enough room for {row['label']} right now ({_gb(vram):.1f} GB "
+                        f"of video memory, {_gb(ram):.1f} GB of RAM). " + decision.message()
+                    ),
+                    data={**row, "sentinel": decision.to_dict(),
+                          "madeRoom": room["tried"]},
+                )
         zone = str(((model_steward.snapshot().get("ram") or {}).get("zone") or "")).lower()
         if zone == "red":
             return ToolResult(
@@ -224,13 +241,13 @@ def open_app(app: str) -> ToolResult:
     if up:
         return ToolResult(
             ok=True,
-            summary=f"{warn_prefix}{row['label']} is up.{note}",
-            data={**apps_registry.status(record), "launched": True},
+            summary=f"{gave_back}{warn_prefix}{row['label']} is up.{note}",
+            data={**apps_registry.status(record), "launched": True, "gaveBack": gave_back},
         )
     return ToolResult(
         ok=True,
         summary=(
-            f"{warn_prefix}Started {row['label']}, but it hasn't answered its health check "
+            f"{gave_back}{warn_prefix}Started {row['label']}, but it hasn't answered its health check "
             f"in {apps_registry.LAUNCH_WAIT_SECONDS}s yet — it may still be warming up.{note}"
         ),
         data={**apps_registry.status(record), "launched": True, "confirmed": False},
@@ -238,6 +255,34 @@ def open_app(app: str) -> ToolResult:
 
 
 # ───────────────────────── stopping ─────────────────────────
+
+
+def _close_windows_of(record: Dict[str, Any]) -> Optional[ToolResult]:
+    """Politely close any window belonging to this app, or None if it has none."""
+    label = record.get("label") or record.get("id") or ""
+    try:
+        import desktop_control as dc
+
+        for hint in [record.get("id"), label] + list(record.get("names") or []):
+            if not hint:
+                continue
+            found = [w for w in dc.find_windows(str(hint)) if not dc.is_self(w)]
+            if not found:
+                continue
+            info = dc.close_app(str(hint))
+            if info.get("windowless"):
+                continue
+            return ToolResult(
+                ok=True,
+                summary=(
+                    f"{label} wasn't answering its usual checks, but it had "
+                    f"{info['asked']} window(s) open - I've asked those to close."
+                ),
+                data={"id": record.get("id"), "closedWindows": info},
+            )
+    except Exception:
+        return None
+    return None
 
 
 def _stop_needs_confirmation(args: Dict[str, Any]) -> bool:
@@ -278,6 +323,13 @@ def stop_app(app: str) -> ToolResult:
         return _unknown(app)
     row = apps_registry.status(record)
     if not row["running"]:
+        # The probes say no, but is there a window with its name on it? A record
+        # can be wrong (BuzzAnimate's named the wrong binary for a version), and
+        # "it is not running" about an app the owner is looking at is the worst
+        # possible answer. Close what is actually there.
+        closed = _close_windows_of(record)
+        if closed is not None:
+            return closed
         return ToolResult(ok=True, summary=f"{row['label']} is not running.", data=row)
     if not row["canStop"]:
         why = (record.get("stop") or {}).get("why") or "it has no stop route I know of"

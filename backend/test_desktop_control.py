@@ -457,3 +457,34 @@ def test_a_known_app_never_matches_a_lookalike_title(desk):
     # name still falls back to the title.
     assert [w.hwnd for w in dc.find_windows("notepad++")] == [7]
     assert [w.hwnd for w in dc.find_windows("settings.yaml")] == [7]
+
+
+def test_type_text_with_into(desk, monkeypatch):
+    clicked_targets = []
+    monkeypatch.setattr(dc, "click_text", lambda text, window=None: clicked_targets.append(text) or {"clicked": text})
+    desk["front"] = NOTEPAD.hwnd
+    res = tools_desktop.type_text("hello world", into="search box", submit=True)
+    assert res.ok
+    assert "into search box" in res.summary
+    assert clicked_targets == ["search box"]
+    assert desk["typed"] == ["hello world"]
+    assert "enter" in desk["sent"]
+
+
+def test_new_app_aliases_resolve(desk):
+    calc = W(20, "Calculator", 21, "calculatorapp.exe")
+    slack = W(22, "Slack - Workspace", 23, "slack.exe")
+    studio = W(24, "Buzzcaf Studio", 25, "electron.exe")
+    desk["windows"] = [calc, slack, studio, DEXTER]
+
+    assert [w.hwnd for w in dc.find_windows("calculator")] == [20]
+    assert [w.hwnd for w in dc.find_windows("calc")] == [20]
+    assert [w.hwnd for w in dc.find_windows("slack")] == [22]
+    assert [w.hwnd for w in dc.find_windows("studio")] == [24]
+    assert [w.hwnd for w in dc.find_windows("buzzcafai")] == [24]
+
+
+def test_generic_recipe_has_new_tab(desk):
+    keys, source = dc.recipe("new tab", "some_random_tabbed_app.exe")
+    assert keys == "ctrl+t"
+    assert source == "generic"

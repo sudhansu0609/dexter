@@ -31,7 +31,9 @@ import model_steward
 import runtime_health
 import sentinel_client
 from hybrid_llm import extract_json, llm_router
-from tool_registry import ToolResult, all_tools, execute, get_tool, schemas_for
+from tool_registry import (
+    ToolResult, all_tools, execute, get_tool, schemas_for, validate_args,
+)
 
 log = logging.getLogger("dexter.router")
 import companion
@@ -67,14 +69,21 @@ _URLISH = re.compile(
     re.IGNORECASE,
 )
 
+# Spoken sentences arrive with the politeness attached, and Whisper puts a comma
+# after it: "Okay, open Chrome for me please." v13.2 - the comma was not allowed
+# for, so that exact sentence fell past the whole fast path and reached the model,
+# which dutifully asked the launcher for an app called "okay open chrome for me".
 _FILLER = re.compile(
-    r"^\s*(?:please|hey|ok|okay|can you|could you|would you|i want you to|"
-    r"i need you to|for me|go ahead and)\s+",
+    r"^\s*(?:please|hey|hi|yo|so|um|uh|well|alright|all right|ok|okay|kay|"
+    r"can you|could you|would you|will you|i want you to|i need you to|i'd like you to|"
+    r"let's|lets|for me|go ahead and|now)\b[\s,]*",
     re.IGNORECASE,
 )
 
 _TRAILING = re.compile(
-    r"\s*(?:please|for me|right now|now|on my pc|on my computer|thanks|thank you)\s*[.!?]*$",
+    r"[\s,]*(?:please|for me|for us|right now|now|quickly|real quick|"
+    r"on my pc|on my computer|on this pc|if you can|if you could|"
+    r"would you|will you|thanks|thank you|ta|cheers)\s*[.!?]*$",
     re.IGNORECASE,
 )
 
@@ -197,7 +206,7 @@ def _a_site(name: str) -> Optional[str]:
 def _site_args(name: str) -> Optional[Dict[str, Any]]:
     """'open youtube' is a tab in your Chrome; 'open chrome' is an application."""
     target = (name or "").strip(" .!?,'\"")
-    if not target:
+    if not target or _NOT_A_DESTINATION.match(target):
         return None
     if _a_site(target) or _URLISH.search(target):
         return {"target": target}
@@ -208,7 +217,10 @@ def _site_args(name: str) -> Optional[Dict[str, Any]]:
 # both used to be opened as websites by the "go to …" rule (v11, P3.3).
 _NOT_A_DESTINATION = re.compile(
     r"^(?:the\s+)?(?:top|bottom|start|end|beginning)(?:\s+of\s+(?:the\s+)?(?:page|document|file|window|list|tab))?$"
-    r"|^tab\s+\d+$|^(?:the\s+)?(?:next|previous|last|first)\s+tab$|^(?:bed|sleep|lunch)$",
+    r"|^tab\s+\d+$|^(?:the\s+)?(?:next|previous|last|first)\s+tab(?:\s+(?:in|on)\s+.*)?$"
+    r"|^.+?\s+tabs?(?:\s+(?:in|on)\s+.*)?$"
+    r"|^tabs?(?:\s+(?:in|on)\s+.*)?$"
+    r"|^(?:bed|sleep|lunch)$",
     re.I,
 )
 
@@ -307,6 +319,497 @@ def _snap_args(what: str, side: str) -> Optional[Dict[str, Any]]:
     return {"action": action, "window": target}
 
 
+# ── drives and folders. "open the c drive" used to reach launch_app and come
+# back with "I don't have 'the c drive' as an app". A folder command is only a
+# folder command when the words say so - a drive letter, a path separator, the
+# word folder/directory/drive, or one of the user's own folders by name - so
+# "open buzzanimate" still opens the app and "open the buzzanimate folder" does
+# not.
+_FOLDERISH = re.compile(
+    r"\b(?:folder|directory|drive|disk|explorer)\b|[\\/]|^[a-z]:\s*$|^[a-z]\s*:\s*[\\/]",
+    re.I,
+)
+
+
+def _folder_target(text: str) -> Optional[str]:
+    """The folder a phrase names, when it is unmistakably about a folder."""
+    raw = (text or "").strip().strip(" .!?,'\"")
+    if not raw:
+        return None
+    try:
+        import folders
+    except Exception:
+        return None
+    if folders.is_this_pc(raw):
+        return None  # that is the drive list, not a folder
+    bare = re.sub(r"^(?:the|my)\s+", "", raw.lower())
+    bare = re.sub(r"\s+(?:folder|directory|dir)$", "", bare).strip()
+    if bare in ("explorer", "file explorer", "windows explorer", "files"):
+        return None  # that is the application, which launch_app owns
+    if not _FOLDERISH.search(raw) and bare not in folders.USER_FOLDERS:
+        return None
+    path = folders.spoken_path(raw)
+    if path and os.path.isdir(path):
+        return path
+    # A written-out path that does not exist is still a folder command: the tool
+    # says "there's nothing at D:\films", which is the answer. Only *names* have
+    # to resolve, because a name that resolves to nothing might be an app.
+    if path and re.match(r"^(?:[a-zA-Z]:[\\/]|\\\\[^\\])", raw):
+        return path
+    return None
+
+
+def _folder_args(text: str) -> Optional[Dict[str, Any]]:
+    target = _folder_target(text)
+    return {"path": target} if target else None
+
+
+def _this_pc_args(text: str) -> Optional[Dict[str, Any]]:
+    try:
+        import folders
+
+        return {} if folders.is_this_pc(text) else None
+    except Exception:
+        return None
+
+
+# "write this down in Notion" is a *place* to write, not a note whose content is
+# the words "in Notion". Without this the note tool won a sentence that means
+# dictation, and saved two words (v13).
+_SINK_ONLY = re.compile(
+    r"^(?:in|into|on|to|using|with)\s+(?:my\s+|the\s+|a\s+)?"
+    r"(?:notion|notepad|note\s*pad|sticky\s*notes?|clipboard|notes?|word|"
+    r"one\s*note|onenote|obsidian|a\s+file|[a-z]:[\\/].*)\s*$",
+    re.I,
+)
+
+
+# Anything that would be a *reminder* (a ping) rather than a *task* (Dexter doing
+# it) stays with create_reminder; anything whose "when" does not parse is not a
+# schedule at all.
+_NOT_A_SCHEDULE = re.compile(
+    r"^(?:remind|ping|nudge|wake|tell|text|email)\s+(?:me|us)\b|^(?:i|we|you)\s+(?:am|are|will|should|have)\b",
+    re.I,
+)
+
+
+#: "every time I save a file" is a trigger, not a clock, and Dexter has no such
+#: thing. Saying so is better than scheduling it for 9am.
+_NOT_A_CLOCK = re.compile(r"^(?:every|each)\s+(?:time|other\s+time|now\s+and\s+then|so\s+often)\b", re.I)
+#: "every morning" + "at 8 review my missions": the clock belongs to the when.
+_LEADING_TIME = re.compile(
+    r"^(?:at|@)\s+(\d{1,2}(?::\d{2})?\s*(?:am|pm|o'?clock)?|noon|midnight|midday)\s+", re.I
+)
+
+
+def _schedule_args(goal: str, when: str) -> Optional[Dict[str, Any]]:
+    """`{"goal", "when"}` only when the time is real and the goal is an action."""
+    task = (goal or "").strip(" .!?,")
+    moment = (when or "").strip(" .!?,")
+    if not task or not moment:
+        return None
+    if _NOT_A_CLOCK.match(moment):
+        return None
+    # "every morning | at 8 review my missions" -> when "every morning at 8".
+    lead = _LEADING_TIME.match(task)
+    if lead and not re.search(r"\bat\b|\d", moment):
+        moment = f"{moment} at {lead.group(1)}"
+        task = task[lead.end():].strip()
+    if not task or len(task.split()) < 2:
+        return None
+    if _NOT_A_SCHEDULE.search(task):
+        return None
+    try:
+        from timeparse import parse_recurrence, parse_when
+
+        if not (parse_recurrence(moment) or parse_when(moment)):
+            return None
+    except Exception:
+        return None
+    return {"goal": task, "when": moment}
+
+
+def _block_args(name: str, start: Optional[str], mins: Optional[str]) -> Optional[Dict[str, Any]]:
+    """'add a block called deep work at 9am for 50 minutes' -> the app's fields."""
+    title = (name or "").strip(" .!?,'\"")
+    title = re.sub(r"^(?:in\s+mission\s+reminder\s+)?", "", title, flags=re.I).strip()
+    if not title:
+        return None
+    args: Dict[str, Any] = {"name": title}
+    if start:
+        args["start"] = start.strip()
+    if mins:
+        try:
+            args["minutes"] = int(mins)
+        except ValueError:
+            pass
+    return args
+
+
+def _note_args(content: str) -> Optional[Dict[str, Any]]:
+    body = (content or "").strip(" .!?,")
+    if not body or _SINK_ONLY.match(body):
+        return None
+    return {"content": body}
+
+
+def _dictation_args(rest: str) -> Optional[Dict[str, Any]]:
+    """'take notes in notepad about the video plan' -> into/title."""
+    tail = (rest or "").strip(" .!?,")
+    args: Dict[str, Any] = {}
+    if not tail:
+        return args
+    tail = re.sub(r"^(?:from\s+me\s+)?(?:continuously|continuous|please)\s*", "", tail, flags=re.I)
+    about = re.search(r"\babout\s+(.+)$", tail, re.I)
+    if about:
+        args["title"] = about.group(1).strip(" .!?,")
+        tail = tail[: about.start()].strip()
+    where = re.search(r"\b(?:in|into|on|to|using|with)\s+(.+)$", tail, re.I)
+    if where:
+        args["into"] = where.group(1).strip(" .!?,")
+    return args
+
+
+# ── "play the third one": which one, and what to do to it (v13).
+_ORDINALS = {
+    "first": 1, "1st": 1, "top": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
+    "fourth": 4, "4th": 4, "fifth": 5, "5th": 5, "sixth": 6, "6th": 6,
+    "seventh": 7, "7th": 7, "eighth": 8, "8th": 8, "ninth": 9, "9th": 9,
+    "tenth": 10, "10th": 10,
+}
+
+
+def _is_site_args(name: Optional[str]) -> Optional[Dict[str, Any]]:
+    """A site goes to the tab check; anything else is somebody's application."""
+    wanted = (name or "").strip().strip(" .!?,'\"")
+    if not wanted:
+        return None
+    return {"site": wanted} if (_is_known_site(wanted) or "." in wanted) else None
+
+
+def _is_app_args(name: Optional[str]) -> Optional[Dict[str, Any]]:
+    wanted = (name or "").strip().strip(" .!?,'\"")
+    return {"app": wanted} if wanted else None
+
+
+#: Things that follow "click" but are not words on the screen - they belong to the
+#: tools that already own them, and a rule this broad has to give way.
+_NOT_SCREEN_TEXT = re.compile(
+    r"^(?:it|that|this|there|here|them|ok|okay|yes|no|"
+    r"(?:the\s+)?(?:first|second|third|fourth|fifth|last|next|previous)\b|"
+    r"(?:the\s+)?(?:play|pause|like|dislike|subscribe|comment|share|save)\s*(?:button)?$|"
+    r"(?:the\s+)?\w+\s+(?:video|result|profile|tab|row|option|item)s?\b)",
+    re.IGNORECASE,
+)
+
+
+def _project_args(name: str) -> Optional[Dict[str, Any]]:
+    """{"project": X} when X really is one of the owner's project folders.
+
+    None otherwise, so "open chrome" and "open youtube" carry on to the rules that own
+    them. The folder scan is the authority here rather than a list of names, because the
+    point of the feature is that a project added tomorrow works without being registered.
+    """
+    wanted = (name or "").strip().strip(" .!?,'\"")
+    if not wanted or len(wanted) < 3 or _NOT_AN_APP.match(wanted):
+        return None
+    try:
+        import project_launcher
+
+        project = project_launcher.find(wanted)
+    except Exception:
+        return None
+    if project is None:
+        return None
+    # Only when it could actually be started: a folder of build scripts is not an answer
+    # to "open it", and letting it through here would hide the real failure.
+    best = project.best
+    if best is None or best.score <= 0:
+        return None
+    return {"project": wanted}
+
+
+def _click_text_args(text: str) -> Optional[Dict[str, Any]]:
+    """The words to click, or None when another tool owns the phrase.
+
+    "click the first video" is `youtube_play`, "click the second result" is
+    `open_result`, "click it" needs the focus memory - none of them are text on screen.
+    """
+    wanted = _clean_tail(text or "")
+    if not wanted or len(wanted) < 2 or _NOT_SCREEN_TEXT.match(wanted):
+        return None
+    if len(wanted.split()) > 8:
+        return None          # a sentence, not a label
+    return {"text": wanted}
+
+
+def _on_page_args(kind: str, text: str) -> Optional[Dict[str, Any]]:
+    """"is there a video called lofi hip hop" -> {kind: video, text: lofi hip hop}.
+
+    None when no title was actually named, because "is there a video" on its own is a
+    question about the page, not a search for one thing - `page_results` answers that
+    better, and a rule that claims it would make the list unreachable.
+    """
+    wanted = _clean_tail(text or "")
+    if not wanted or len(wanted) < 2:
+        return None
+    return {"text": wanted, "kind": (kind or "").strip().lower()}
+
+
+def _clean_tail(text: str) -> str:
+    """Trim the words people put on the end of a question about the page."""
+    trimmed = (text or "").strip().strip(" .!?,'\"")
+    trimmed = re.sub(
+        r"\s+(?:on|in)\s+(?:this|the)\s+(?:page|screen|tab|list|window|youtube)$", "",
+        trimmed, flags=re.I,
+    )
+    trimmed = re.sub(r"^(?:called|named|titled|about|for|with)\s+", "", trimmed, flags=re.I)
+    return trimmed.strip(" .!?,'\"")
+
+
+def _hand_bind_args(pose: str, action: str) -> Optional[Dict[str, Any]]:
+    """"make a fist the right click" -> {pose: fist, action: right-pinch}.
+
+    None unless **both** halves name something real, because this rule's phrasing
+    ("make X the Y") is far too common to claim on a partial match - "make the
+    window bigger" has to keep going.
+    """
+    try:
+        import handmouse
+    except Exception:
+        return None
+    which = handmouse.normalize_pose(pose or "")
+    what = handmouse.normalize_action(action or "")
+    if not which or not what:
+        return None
+    return {"pose": which, "action": what}
+
+
+def _ordinal_args(word: str) -> Optional[Dict[str, Any]]:
+    key = (word or "").strip().lower()
+    position = _ORDINALS.get(key)
+    if position is None:
+        digits = re.match(r"^(\d{1,2})", key)
+        position = int(digits.group(1)) if digits else None
+    return {"position": position} if position else None
+
+
+# "The first <thing>" means three different things, and sending all of them to one
+# tool is why "click the first link" tried to play a YouTube video (v13.2).
+#
+#   video / one / thumbnail   -> the video list      (youtube_play)
+#   result / link             -> the page's results  (open_result, YouTube-aware)
+#   profile / option / row …  -> anything on screen   (select_nth)
+_VIDEO_NOUNS = {"video", "one", "thumbnail"}
+_RESULT_NOUNS = {"result", "link"}
+
+
+def _nth_args(which: str, what: str, tool: str) -> Optional[Dict[str, Any]]:
+    """The arguments for whichever of the three rules owns this noun."""
+    ordinal = _ordinal_args(which)
+    if not ordinal:
+        return None
+    noun = (what or "").strip().lower().rstrip("s")
+    position = ordinal["position"]
+    if tool == "youtube_play":
+        return {"position": position} if noun in _VIDEO_NOUNS else None
+    if tool == "open_result":
+        return {"position": position} if noun in _RESULT_NOUNS else None
+    if noun in _VIDEO_NOUNS or noun in _RESULT_NOUNS:
+        return None
+    return {"what": noun, "position": position}
+
+
+def _grid_video_args(row_word: str, col_word: str) -> Optional[Dict[str, Any]]:
+    r = _ordinal_args(row_word)
+    c = _ordinal_args(col_word)
+    if not r or not c:
+        return None
+    return {"row": r["position"], "col": c["position"]}
+
+
+_SITE_LEAD = re.compile(
+    r"^(?P<site>youtube|google\s+images|google|images|maps|wikipedia|github|bing)\b"
+    r"(?:\s+for)?\s+", re.I)
+
+
+def _search_here_args(query: Optional[str], site: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    text = (query or "").strip(" .!?,'\"")
+    if not text or len(text) < 2:
+        return None
+    # "search youtube for rust tutorials in this tab": the site is inside the
+    # query group, and leaving it there searched for the word "youtube".
+    lead = _SITE_LEAD.match(text)
+    if lead and not site:
+        site = lead.group("site")
+        text = text[lead.end():].strip(" .!?,'\"")
+    text = re.sub(r"^for\s+", "", text, flags=re.I).strip()
+    if not text:
+        return None
+    args: Dict[str, Any] = {"query": text}
+    where = (site or "").strip().lower()
+    if where:
+        args["site"] = "images" if where in ("images", "google images") else where
+    return args
+
+
+def _search_open_args(query: Optional[str], which: Optional[str],
+                      whole: str) -> Optional[Dict[str, Any]]:
+    text = (query or "").strip(" .!?,'\"")
+    if not text:
+        return None
+    args: Dict[str, Any] = {}
+    ordinal = _ordinal_args(which or "first")
+    args["position"] = ordinal["position"] if ordinal else 1
+    if re.search(r"\byoutube\b", whole, re.I):
+        args["site"] = "youtube"
+        text = re.sub(r"\b(?:on\s+)?youtube\b", "", text, flags=re.I).strip(" .,")
+    # The filler goes *after* the site word is removed: "youtube for lofi" leaves
+    # "for lofi" otherwise, and Dexter searches for the word "for".
+    text = re.sub(r"^(?:for|on|up|about)\s+", "", text, flags=re.I).strip(" .,")
+    if not text:
+        return None
+    args["query"] = text
+    return args
+
+
+_NOT_APP_NOUNS = re.compile(
+    r"^(?:this|that|the|current)?\s*(?:page|screen|window|tab|browser|website|site|dialog|menu)$", re.I
+)
+_FIELD_NOUNS = re.compile(
+    r"\b(?:field|box|bar|input|search|text\s*box|address|comment|form|document|page|tab)\b", re.I
+)
+
+
+def _nth_result_args(pos: str, text: str) -> Optional[Dict[str, Any]]:
+    ordinal = _ordinal_args(pos)
+    if not ordinal:
+        return None
+    kind = "result"
+    for word in ("video", "link", "item", "option", "profile", "button"):
+        if word in text.lower():
+            kind = word
+            break
+    return {"position": ordinal["position"], "kind": kind}
+
+
+def _click_in_app_args(text: str, app: str) -> Optional[Dict[str, Any]]:
+    target = (text or "").strip(" .!?,'\"")
+    app_name = (app or "").strip(" .!?,'\"")
+    if not target or not app_name:
+        return None
+    app_lower = app_name.lower()
+    if app_lower in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser") or _is_known_site(app_lower):
+        return None
+    if _NOT_APP_NOUNS.match(app_lower):
+        return None
+    return {"text": target, "app": app_name}
+
+
+def _type_in_app_args(text: str, app: str) -> Optional[Dict[str, Any]]:
+    text_clean = (text or "").strip(" .!?,'\"")
+    app_name = (app or "").strip(" .!?,'\"")
+    if not text_clean or not app_name:
+        return None
+    app_lower = app_name.lower()
+    if _FIELD_NOUNS.search(app_lower):
+        return None
+    if app_lower in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser") or _is_known_site(app_lower):
+        return None
+    try:
+        import desktop_control as dc
+        if dc._alias_of(app_lower) or not re.search(r"\s+", app_lower):
+            return {"text": text_clean, "window": app_name}
+    except Exception:
+        pass
+    return None
+
+
+def _type_into_in_app_args(text: str, into: str, app: str) -> Optional[Dict[str, Any]]:
+    text_clean = (text or "").strip(" .!?,'\"")
+    into_clean = (into or "").strip(" .!?,'\"")
+    app_name = (app or "").strip(" .!?,'\"")
+    if not text_clean or not into_clean or not app_name:
+        return None
+    app_lower = app_name.lower()
+    if app_lower in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser") or _is_known_site(app_lower):
+        return None
+    return {"text": text_clean, "into": into_clean, "window": app_name}
+
+
+def _yt_page_args(phrase: str) -> Optional[Dict[str, Any]]:
+    """The YouTube button a whole sentence asks for, via youtube_control's map."""
+    try:
+        import youtube_control
+
+        action = youtube_control.normalize_page_action(phrase)
+        return {"action": action} if action in youtube_control.PAGE_ACTIONS else None
+    except Exception:
+        return None
+
+
+def _page_results_args(phrase: str) -> Dict[str, Any]:
+    text = (phrase or "").lower()
+    for word in ("video", "link", "option", "profile"):
+        if word in text:
+            return {"kind": word}
+    return {"kind": "result"}
+
+
+def _copy_args(what: Optional[str]) -> Dict[str, Any]:
+    word = (what or "").strip().lower()
+    if word in ("everything", "page", "all of this", "all of it"):
+        return {"what": "all"}
+    return {"what": "selection"}
+
+
+def _paste_args(field: Optional[str], tab: Optional[str],
+                send: Optional[str]) -> Optional[Dict[str, Any]]:
+    args: Dict[str, Any] = {}
+    name = (field or "").strip(" .!?,'\"")
+    # "paste it in the gemini tab" puts the tab in the field slot; the tab group
+    # only matches when the word "tab" follows something else.
+    if name.lower().endswith(" tab"):
+        args["tab"] = name[: -len(" tab")].strip()
+    elif name and name.lower() not in ("here", "there", "it", "this", "that"):
+        args["field"] = name
+    if tab:
+        args["tab"] = tab.strip()
+    if send:
+        args["submit"] = True
+    return args
+
+
+def _video_action(phrase: str) -> str:
+    """The player action a whole sentence asks for ('skip the ad' -> 'skip ad')."""
+    text = (phrase or "").strip().lower()
+    if re.search(r"\bads?\b", text):
+        return "skip ad"
+    if re.search(r"captions|subtitles|\bcc\b", text):
+        return "captions"
+    if re.search(r"^next\b|\bnext video\b", text):
+        return "next"
+    if re.search(r"^(?:previous|prev)\b", text):
+        return "previous"
+    if "faster" in text:
+        return "faster"
+    if "slower" in text:
+        return "slower"
+    if re.search(r"skip ahead|fast forward", text):
+        return "forward"
+    if "rewind" in text:
+        return "back"
+    if re.search(r"\bunmute\b", text):
+        return "unmute"
+    if re.search(r"\bmute\b", text):
+        return "mute"
+    if re.search(r"full\s*screen", text):
+        return "fullscreen"
+    if re.search(r"\bpause\b", text):
+        return "pause"
+    return "play"
+
+
 _TYPE_TAIL = re.compile(r"\s+and\s+(?:press|hit)\s+(?:enter|return)\s*$", re.I)
 
 
@@ -320,7 +823,65 @@ def _type_args(text: str) -> Optional[Dict[str, Any]]:
     return {"text": body, "submit": submit}
 
 
+# ── MastGaane music (tools_music). A wish goes over as said; MastGaane resolves it.
+_MUSIC_VERB = r"(?:play|put\s+on|chalao|sunao|bajao|lagao)"
+_MUSIC_PROGRAMME = (r"(?:hawa\s*mahal|chhaya\s*geet|jai\s*mala|bhoole\s*bisre\s*geet|sangeet\s*sarita|"
+                    r"(?:binaca\s+)?geet\s*mala|inse\s*miliye|triveni|vividh\s*bharati)")
+_MUSIC_NOUN = re.compile(r"\b(?:ghazals?|geet|gaane|gane|gaana|songs|music|bhajans?|qawwali|sufi|folk)\b", re.I)
+# What MastGaane holds: Hindi/Urdu film songs, ghazals, Hindi-belt folk, old radio. "lofi music" and
+# "jazz" stay YouTube's (play_on_youtube); bare "some music" is the owner's own jockey.
+_MASTGAANE_WISH = re.compile(
+    r"\b(?:ghazals?|geet|gaane|gane|gaana|bhajans?|qawwali|sufi|folk|lok|hindi|urdu|bhojpuri|awadhi|maithili|"
+    r"magahi|bollywood|filmi|film|purane|purana|old|retro|classic|[5-9]0s|(?:19|20)[0-9]0s)\b|\bsongs\s+(?:by|of)\s+\w|"
+    r"\bke\s+gaane\b", re.I)
+_NOT_MASTGAANE = re.compile(r"\b(?:youtube|video|videos|spotify|playlist|this|that|it|next|previous|last|"
+                            r"first|second|third|\d+(?:st|nd|rd|th)?)\b", re.I)
+
+
+def _music_args(focus: Optional[str]) -> Optional[Dict[str, Any]]:
+    """'play some ghazals' → MastGaane; 'play the next song' / 'play lofi music' → not ours."""
+    wish = re.sub(r"^(?:some|a\s+few|me\s+some|me|my)\s+", "", (focus or "").strip(), flags=re.I)
+    if _NOT_MASTGAANE.search(wish):
+        return None
+    if re.fullmatch(r"(?:some\s+)?music", wish, re.I):
+        return {"focus": ""}
+    return {"focus": wish} if _MASTGAANE_WISH.search(wish) else None
+
+
 _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str, Any]]]]] = [
+    # ── MastGaane: named outright, a radio programme, or a music word ("ghazals", "gaane", "songs").
+    (
+        re.compile(rf"^{_MUSIC_VERB}\s+(?:(?P<focus>.+?)\s+(?:on|from|in)\s+)?mastgaane(?:\s+fm)?$", re.I),
+        "mastgaane_play",
+        lambda m: {"focus": (m.group("focus") or "").strip()},
+    ),
+    (
+        re.compile(r"^(?:start|open|turn\s+on)\s+mastgaane\s+fm$", re.I),
+        "mastgaane_play",
+        lambda m: {"focus": ""},
+    ),
+    (
+        re.compile(rf"^{_MUSIC_VERB}\s+(?:the\s+)?(?P<focus>{_MUSIC_PROGRAMME})(?:\s+program(?:me)?)?$", re.I),
+        "mastgaane_play",
+        lambda m: {"focus": m.group("focus")},
+    ),
+    (
+        re.compile(rf"^{_MUSIC_VERB}\s+(?P<focus>.*{_MUSIC_NOUN.pattern}.*)$", re.I),
+        "mastgaane_play",
+        lambda m: _music_args(m.group("focus")),
+    ),
+    (
+        re.compile(r"^(?:i\s+)?(?:really\s+)?(?:like|love)\s+(?:this|that)\s+(?:song|ghazal|gaana|track)$"
+                   r"|^more\s+(?:songs\s+)?like\s+this(?:\s+one)?$", re.I),
+        "mastgaane_feedback",
+        lambda m: {"verdict": "like"},
+    ),
+    (
+        re.compile(r"^(?:i\s+)?(?:don'?t|do\s+not|hate)\s+(?:like\s+)?(?:this|that)\s+(?:song|ghazal|gaana|track)$"
+                   r"|^never\s+play\s+(?:this|that)(?:\s+(?:song|ghazal|one))?\s+again$", re.I),
+        "mastgaane_feedback",
+        lambda m: {"verdict": "dislike"},
+    ),
     # ── v11.1: power. These sit first so "restart my pc" is never mistaken for
     # restart_app's "restart <app>" (which yielded nothing) and "shut down the
     # computer" never lands on sleep_pc by embedding distance. Every one of the
@@ -380,6 +941,142 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         "empty_recycle_bin",
         lambda m: {},
     ),
+    # ── v13: drives and folders. Ahead of everything that opens things, because
+    # "open the c drive" was reaching launch_app ("I don't have 'the c drive' as
+    # an app on this PC"). Each builder yields None unless the words genuinely
+    # name a folder, so "open chrome" and "open buzzedit" are untouched.
+    (
+        re.compile(
+            r"^(?:what|which)\s+(?:drives|disks)\s+(?:do\s+i\s+have|are\s+(?:there|on\s+(?:this|my)\s+(?:pc|machine|computer)))\s*[.?!]*$"
+            r"|^(?:list|show)\s+(?:me\s+)?(?:my\s+|all\s+(?:my\s+)?|the\s+)?(?:drives|disks)\s*[.?!]*$"
+            r"|^how\s+(?:much\s+space|full)\s+(?:is\s+)?(?:left\s+)?on\s+(?:my|the)\s+drives?\s*[.?!]*$",
+            re.I,
+        ),
+        "list_drives",
+        lambda m: {},
+    ),
+    (
+        re.compile(
+            r"^(?:open|show(?:\s+me)?|go\s+to)\s+(?:this\s+pc|my\s+computer|my\s+pc|the\s+drives?\s+list|drives)\s*[.?!]*$",
+            re.I,
+        ),
+        "open_folder",
+        lambda m: {"path": "this pc"},
+    ),
+    (
+        re.compile(
+            r"^(?:what(?:'s| is)\s+(?:in|inside|on)|what\s+(?:files|folders)\s+are\s+(?:in|inside|on)|"
+            r"list\s+(?:the\s+)?(?:files|folders|contents|everything)\s+(?:in|inside|of|on|under)|"
+            r"show\s+me\s+(?:what(?:'s| is)\s+(?:in|inside|on)|the\s+contents\s+of))"
+            r"\s+(?:the\s+|my\s+)?(.+?)\s*[.?!]*$",
+            re.I,
+        ),
+        "list_folder",
+        lambda m: _folder_args(m.group(1)),
+    ),
+    (
+        re.compile(r"^(?:list|ls|dir)\s+(?:the\s+|my\s+)?(.+?)\s*[.?!]*$", re.I),
+        "list_folder",
+        lambda m: _folder_args(m.group(1)),
+    ),
+    (
+        re.compile(
+            r"^(?:open|show(?:\s+me)?|go\s+to|take\s+me\s+to|bring\s+up|pull\s+up)\s+(?:the\s+|my\s+)?"
+            r"(.+?)(?:\s+in\s+(?:file\s+)?explorer)?\s*[.?!]*$",
+            re.I,
+        ),
+        "open_folder",
+        lambda m: _folder_args(m.group(1)),
+    ),
+    (
+        re.compile(r"^where(?:'s| is|\s+are)\s+(?:my\s+|the\s+)?(.+?)\s+folders?\s*[.?!]*$", re.I),
+        "find_folder",
+        lambda m: {"name": m.group(1).strip()} if m.group(1).strip() else None,
+    ),
+    # ── v13.6: the hand mouse, before the app launcher.
+    #
+    # "can you open the hand tracking?" reached `launch_app`, which searched the
+    # installed-app index for "hand tracking" and started Git's `tr.exe`. The index
+    # bug is fixed in app_index, but the deeper point is that this is a *feature of
+    # Dexter's*, not an application on the disk, and it should never have been
+    # looked for out there.
+    (
+        re.compile(
+            r"^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?"
+            r"(?:open|show(?:\s+me)?|start|turn\s+on|enable|use|launch|bring\s+up|give\s+me)\s+"
+            r"(?:up\s+)?(?:the\s+|my\s+)?(?:webcam\s+)?"
+            r"(?:hand|gesture)\s*(?:mouse|tracking|tracker|control|cursor|pointer)"
+            r"(?:\s+(?:window|preview|panel|on|please))?\s*[.!?]*$",
+            re.I,
+        ),
+        "start_hand_mouse",
+        lambda m: {},
+    ),
+    (
+        re.compile(
+            r"^(?:(?:can|could|would)\s+you\s+)?(?:please\s+)?"
+            r"(?:stop|turn\s+off|close|quit|end|disable|kill)\s+(?:the\s+|my\s+)?"
+            r"(?:hand|gesture)\s*(?:mouse|tracking|tracker|control|cursor|pointer)\s*[.!?]*$",
+            re.I,
+        ),
+        "stop_hand_mouse",
+        lambda m: {},
+    ),
+    (
+        re.compile(
+            r"^(?:is\s+(?:the\s+|my\s+)?(?:hand|gesture)\s*(?:mouse|tracking|tracker|control)\s+"
+            r"(?:on|running|working|active)|"
+            r"(?:hand|gesture)\s*(?:mouse|tracking)\s+status|"
+            r"what\s+(?:pose|gesture)\s+(?:do\s+you\s+|can\s+you\s+)?see)\b",
+            re.I,
+        ),
+        "hand_mouse_status",
+        lambda m: {},
+    ),
+    (
+        re.compile(
+            r"^(?:what|which|list|show(?:\s+me)?|tell\s+me)\b.*\bhand\s+(?:mouse\s+)?gestures?\b",
+            re.I,
+        ),
+        "hand_gestures",
+        lambda m: {},
+    ),
+    # v13.8: the speed of the pointer, out loud - which matters more than it looks,
+    # because when the pointer is too fast, reaching the slider that fixes it is
+    # precisely the thing you cannot do.
+    (
+        re.compile(
+            r"^(?:(?:make|set)\s+)?(?:the\s+)?hand\s*"
+            r"(?:mouse|pointer|cursor|tracking)?\s*(?:speed\s*)?(?:to\s+)?"
+            r"(faster|slower|quicker|less\s+sensitive|more\s+sensitive|more\s+precise|"
+            r"\d*\.?\d+)\s*[.!?]*$",
+            re.I,
+        ),
+        "set_hand_speed",
+        lambda m: {"speed": " ".join(m.group(1).split())},
+    ),
+    (
+        re.compile(
+            r"^(?:the\s+)?hand\s*(?:mouse|pointer|cursor|tracking)\s+is\s+(?:too\s+)?"
+            r"(fast|slow|sensitive|twitchy|jumpy|sluggish)\b",
+            re.I,
+        ),
+        "set_hand_speed",
+        lambda m: {"speed": "faster" if m.group(1).lower() in ("slow", "sluggish")
+                   else "slower"},
+    ),
+    # "make a fist the right click" - the builder returns None unless both halves
+    # name something real, so an unrelated "make the window bigger" falls through
+    # to the rules and tiers that own it.
+    (
+        re.compile(
+            r"^(?:make|set|bind|change|map|turn)\s+(?:the\s+|a\s+|an\s+|my\s+)?(.+?)\s+"
+            r"(?:to|into|as|the|do|mean|means)\s+(?:be\s+)?(?:the\s+|a\s+|an\s+)?(.+?)\s*[.!?]*$",
+            re.I,
+        ),
+        "set_hand_gesture",
+        lambda m: _hand_bind_args(m.group(1), m.group(2)),
+    ),
     # ── v9: the owner's own projects. These come first so "stop vrdeep" is an
     # app command rather than close_window's guess at a window title, and they
     # yield (args=None) for anything not in the registry so the older rules
@@ -400,10 +1097,98 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         "app_status",
         lambda m: _app_args(m.group(1)),
     ),
+    # v13.8: "click on the text X". Chrome publishes no page content to Windows
+    # accessibility at all, so the words on screen are the only thing left that works
+    # in any browser without a debug port - and it is what was asked for.
+    (
+        re.compile(
+            # Deliberately only the *explicit* ask. Plain "click sign in" belongs to
+            # `browser_click`, which tries the accessible name first - instant, and right
+            # for the browser's own furniture - and falls back to reading the screen
+            # itself (v13.8). Going straight to OCR there would be slower and no better.
+            r"^(?:click|press|tap|hit)\s+(?:on\s+)?(?:the\s+)?"
+            r"(?:(?:text|word|words)\s*(?:that\s+says|saying|labelled|labeled|called|named|"
+            r"which\s+says)?|(?:link|button|option|item)\s*(?:that\s+says|saying|labelled|"
+            r"labeled|called|named|which\s+says))\s*"
+            r"[\"'“]?(.+?)[\"'”]?\s*"
+            r"(?:\s+(?:on|in)\s+(?:the\s+)?(?:screen|page|browser|window|chrome))?\s*[.!?]*$",
+            re.I,
+        ),
+        "click_on_screen",
+        lambda m: _click_text_args(m.group(1)),
+    ),
+    (
+        re.compile(
+            # Not "what's on my screen" - that is `get_active_window`, which answers
+            # with the window's name and has owned the phrase since v5. This is the
+            # stronger ask: read the words.
+            # "read this page" is `browser_read_page`, which reads the document rather
+            # than a photograph of it - better text, when it can. This is the screen.
+            r"^(?:what\s+does\s+(?:the\s+)?screen\s+say|"
+            r"read\s+(?:me\s+)?(?:the\s+|my\s+)?screen(?:\s+to\s+me)?|"
+            r"read\s+(?:out\s+)?what(?:'s| is)\s+on\s+(?:the\s+|my\s+)?screen)\s*[.!?]*$",
+            re.I,
+        ),
+        "read_screen",
+        lambda m: {},
+    ),
+    # "is there a video called X on this page", "can you see a link to the docs"
+    (
+        re.compile(
+            r"^(?:please\s+)?"
+            # A bare "see" and "spot" are in here because `_clean` has already taken
+            # the politeness off the front: by the time a rule sees it, "can you see a
+            # video about X" is "see a video about X".
+            r"(?:is\s+there|are\s+there|do\s+you\s+see|(?:can|could)\s+you\s+(?:see|find|spot)|"
+            r"check\s+(?:if|for)|see|spot|find|look\s+for)\s+(?:a\s+|an\s+|any\s+|the\s+)?"
+            r"(video|link|button|result|tab|item|post|song|playlist|thing)s?\s*"
+            r"(?:called|named|titled|about|for|with|that\s+says|matching)?\s*(.+?)"
+            r"(?:\s+(?:on|in)\s+(?:this|the)\s+(?:page|screen|tab|list|window|youtube))?"
+            r"\s*[.!?]*$",
+            re.I,
+        ),
+        "is_on_page",
+        lambda m: _on_page_args(m.group(1), m.group(2)),
+    ),
+    (
+        re.compile(
+            r"^(?:what|which)\s+(?:page|site|website|url|tab)\s+(?:is\s+this|am\s+i\s+on|"
+            r"is\s+(?:that|it)|is\s+open|do\s+i\s+have\s+open)\s*[.!?]*$",
+            re.I,
+        ),
+        "what_page_is_this",
+        lambda m: {},
+    ),
     (
         re.compile(r"^(?:open|start|launch|run|fire up|boot up|bring up)\s+(?:the\s+|my\s+)?(.+?)\s*$", re.I),
         "open_app",
         lambda m: _app_args(m.group(1)),
+    ),
+    # v13.8: the owner's other projects. `open_app` above owns the twelve in the
+    # registry (it knows their ports and asks Sentinel for memory first); this catches
+    # every other folder next to Dexter that has a launcher of its own, and yields for
+    # anything that is not one - so "open chrome" still reaches the app launcher.
+    (
+        re.compile(
+            # Longest alternatives first, or "start" matches inside "start up" and the
+            # "up" ends up in the project's name.
+            r"^(?:start\s+up|boot\s+up|fire\s+up|bring\s+up|open|start|launch|run)\s+"
+            r"(?:the\s+|my\s+)?(.+?)(?:\s+project)?\s*[.!?]*$",
+            re.I,
+        ),
+        "launch_project",
+        lambda m: _project_args(m.group(1)),
+    ),
+    (
+        re.compile(
+            r"^(?:what|which)\s+(?:of\s+my\s+)?(?:projects|apps)\s+"
+            r"(?:do\s+i\s+have|are\s+there|can\s+you\s+(?:start|launch|open)|exist)"
+            r"|^list\s+(?:my\s+)?projects"
+            r"|^what\s+can\s+you\s+(?:start|launch)\b",
+            re.I,
+        ),
+        "list_projects",
+        lambda m: {},
     ),
     (
         re.compile(
@@ -487,7 +1272,7 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
             re.I,
         ),
         "create_note",
-        lambda m: {"content": (m.group(1) or m.group(2) or "").strip(" .!?,")} if (m.group(1) or m.group(2) or "").strip(" .!?,") else None,
+        lambda m: _note_args(m.group(1) or m.group(2) or ""),
     ),
     (
         re.compile(r"^(?:drop|scrap|ditch|abandon|remove|delete)\s+(?:the\s+|my\s+|that\s+)?(.+?)\s+(?:commitment|task|todo|to-do)\b\s*(?:[,.-]\s*(.*))?$", re.I),
@@ -511,6 +1296,138 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         ),
         "get_current_time",
         lambda m: {"place": m.group(1).strip()},
+    ),
+    (
+        re.compile(
+            r"^(?:(?:please\s+)?(?:can\s+you\s+)?(?:tell\s+me\s+)?(?:do\s+you\s+know\s+)?)*"
+            r"(?:what(?:'?s|\s+is)\s+new(?:\s+in\s+dexter|\s+with\s+you)?|"
+            r"what\s+changes?\s+(?:were\s+done|were\s+made|happened|did\s+you\s+get|have\s+been\s+made)(?:\s+in\s+you|\s+to\s+you)?(?:\s+from\s+last\s+time|\s+since\s+last\s+time)?|"
+            r"what\s+changed(?:\s+in\s+you|\s+to\s+you|\s+in\s+dexter)?(?:\s+from\s+last\s+time|\s+since\s+last\s+time|\s+recently)?)\s*[.!?]*$",
+            re.I,
+        ),
+        "what_changed",
+        lambda m: {},
+    ),
+    # ── v13: continuous note-taking. After create_note on purpose: "write this
+    # down: buy milk" is one note with content, and only a bare "write this down"
+    # (create_note yields None) means "keep writing down what I say".
+    (
+        re.compile(
+            r"^(?:please\s+)?(?:can\s+you\s+)?(?:start\s+|begin\s+|keep\s+)?"
+            r"(?:taking|take|writing|write|jot(?:ting)?|noting)\s+(?:down\s+)?"
+            r"(?:my\s+|some\s+|these\s+|the\s+)?(?:notes?|dictation|everything\s+i\s+say|"
+            r"what\s+i\s+say|this\s+down|it\s+down)\b(?P<rest>.*)$",
+            re.I,
+        ),
+        "start_dictation",
+        lambda m: _dictation_args(m.group("rest")),
+    ),
+    (
+        re.compile(r"^(?:start|begin|open)\s+dictation\b(?P<rest>.*)$", re.I),
+        "start_dictation",
+        lambda m: _dictation_args(m.group("rest")),
+    ),
+    (
+        re.compile(
+            r"^(?:stop|end|finish|that'?s\s+(?:it|all|the\s+end)\s+(?:for|of))\s*"
+            r"(?:the\s+)?(?:taking\s+)?(?:notes?|dictation|dictating|writing\s+(?:this|that)\s+down)\s*[.!]*$",
+            re.I,
+        ),
+        "stop_dictation",
+        lambda m: {},
+    ),
+    (
+        re.compile(
+            r"^(?:are\s+you\s+(?:still\s+)?taking\s+notes|dictation\s+status|"
+            r"where\s+are\s+(?:my|the)\s+notes\s+going|how\s+much\s+have\s+you\s+written\s+down)\s*[.?!]*$",
+            re.I,
+        ),
+        "dictation_status",
+        lambda m: {},
+    ),
+    # ── v13: schedule anything. "Every morning at 8 review my missions" used to
+    # reach the model, which promised to do it and scheduled nothing. These three
+    # shapes cover how it is actually said; `_schedule_args` refuses unless the
+    # time really parses, so "in the downloads folder find the invoice" is not
+    # mistaken for a schedule.
+    (
+        re.compile(
+            r"^(?P<when>(?:every|each)\s+[^,]{2,40}?)\s*,?\s+(?:please\s+)?(?P<goal>[a-z][^,]{3,}.*)$",
+            re.I,
+        ),
+        "schedule_task",
+        lambda m: _schedule_args(m.group("goal"), m.group("when")),
+    ),
+    (
+        re.compile(
+            r"^(?P<goal>.{5,}?)\s+(?P<when>(?:every|each)\s+[a-z][^,]{2,30}|daily|hourly|weekly)\s*[.!]*$",
+            re.I,
+        ),
+        "schedule_task",
+        lambda m: _schedule_args(m.group("goal"), m.group("when")),
+    ),
+    (
+        re.compile(
+            r"^(?:please\s+)?schedule\s+(?:a\s+task\s+)?(?P<goal>.+?)\s+"
+            r"(?:for|at|on|every)\s+(?P<when>[^,]+?)\s*[.!]*$",
+            re.I,
+        ),
+        "schedule_task",
+        lambda m: _schedule_args(m.group("goal"), m.group("when")),
+    ),
+    (
+        re.compile(
+            r"^(?P<when>(?:at|on|in)\s+[^,]{2,28}|tomorrow(?:\s+(?:morning|afternoon|evening|at\s+[^,]{1,12}))?|"
+            r"tonight|later\s+today)\s*,\s*(?:please\s+)?(?P<goal>[a-z].{3,})$",
+            re.I,
+        ),
+        "schedule_task",
+        lambda m: _schedule_args(m.group("goal"), m.group("when")),
+    ),
+    # ── v13: the Mission Reminder app. After the schedule rules, so "review my
+    # missions every evening" is a schedule and "review my missions" is the
+    # review itself.
+    (
+        re.compile(
+            r"^(?:review|read)\s+(?:me\s+)?(?:my|the)\s+missions?(?:\s+(?:again|now))?\s*[.!?]*$"
+            r"|^(?:what|how)\s+(?:are|about)\s+my\s+(?:mission\s+)?blocks(?:\s+today)?\s*[.?!]*$"
+            r"|^what(?:'s| is)\s+my\s+next\s+(?:mission\s+)?block\s*[.?!]*$"
+            r"|^(?:am\s+i\s+on\s+track\s+(?:with|on)\s+my\s+(?:time\s+)?blocks|"
+            r"how\s+am\s+i\s+doing\s+on\s+my\s+blocks)\s*[.?!]*$"
+            r"|^what\s+does\s+mission\s+reminder\s+say\s*[.?!]*$",
+            re.I,
+        ),
+        "mission_review",
+        lambda m: {},
+    ),
+    (
+        re.compile(
+            r"^(?:start|begin)\s+(?:my\s+|the\s+)?(?:next\s+)?(?:time\s+)?"
+            r"(?:block|mission\s+block|focus\s+session)\s*[.!]*$",
+            re.I,
+        ),
+        "mission_start_block",
+        lambda m: {"action": "start"},
+    ),
+    (
+        re.compile(
+            r"^(?:pause|resume|unpause)\s+(?:my\s+|the\s+)?(?:current\s+)?"
+            r"(?:block|session|focus\s+session)\s*[.!]*$",
+            re.I,
+        ),
+        "mission_start_block",
+        lambda m: {"action": "pause"},
+    ),
+    (
+        re.compile(
+            r"^(?:add|save|create|put|schedule)\s+(?:a\s+|another\s+)?(?:time\s+|mission\s+)?block\s+"
+            r"(?:called\s+|named\s+|for\s+|to\s+)?(?P<name>.+?)"
+            r"(?:\s+at\s+(?P<start>\d{1,2}(?::\d{2})?\s*(?:am|pm)?))?"
+            r"(?:\s+for\s+(?P<mins>\d{1,3})\s*(?:min|mins|minutes)?)?\s*[.!]*$",
+            re.I,
+        ),
+        "mission_save_block",
+        lambda m: _block_args(m.group("name"), m.group("start"), m.group("mins")),
     ),
     # v11: "close notepad" closes the *application* - every window of it, with
     # WM_CLOSE so it can ask about unsaved work. It used to call close_window,
@@ -715,6 +1632,238 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         "check_in",
         lambda m: {},
     ),
+    # ── v13.2: search in the tab you are in. Ahead of the generic browser rules,
+    # which all open a *new* tab - "search a video by its name in current tab"
+    # had no implementation at all and fell through to the model.
+    (
+        re.compile(
+            r"^(?:search|look\s+up|find)\s+(?:for\s+)?(?P<query>.+?)\s+"
+            r"(?:in|on)\s+(?:the\s+)?(?:this|current|same)\s+(?:tab|page)\s*[.!?]*$"
+            r"|^search\s+(?:this|the\s+current)\s+(?:tab|page)\s+for\s+(?P<query2>.+?)\s*[.!?]*$",
+            re.I,
+        ),
+        "search_here",
+        lambda m: _search_here_args(m.group("query") or m.group("query2")),
+    ),
+    (
+        re.compile(
+            r"^(?:search|look\s+up|find)\s+(?:for\s+)?(?P<query>.+?)\s+on\s+"
+            r"(?P<site>youtube|google|google\s+images|images|maps|wikipedia|github|bing)"
+            r"(?:\s+(?:in|on)\s+(?:the\s+)?(?:this|current|same)\s+(?:tab|page))?\s*[.!?]*$",
+            re.I,
+        ),
+        "search_here",
+        lambda m: _search_here_args(m.group("query"), m.group("site")),
+    ),
+    (
+        re.compile(
+            r"^(?:search(?:\s+for)?|find)\s+(?:a\s+video\s+(?:called|named|about|with|for)\s+|a\s+video\s+)?(?P<query>.+?)\s+"
+            r"(?:on|in)\s+(?:the\s+)?(?:this|current|same)\s+(?:page|tab)\s*[.!?]*$",
+            re.I,
+        ),
+        "search_here",
+        lambda m: _search_here_args(m.group("query")),
+    ),
+    # "google X and open the first link" - one sentence, two acts, and the model
+    # used to answer it by searching for the whole sentence.
+    (
+        re.compile(
+            r"^(?:google|search(?:\s+(?:for|on))?|look\s+up|find)\s+(?P<query>.+?)\s+and\s+"
+            r"(?:then\s+)?(?:open|click|play|pick|select)\s+(?:on\s+)?(?:the\s+)?"
+            r"(?P<which>first|second|third|top|1st|2nd|3rd|\d{1,2})?\s*"
+            r"(?:result|link|one|video)s?\s*[.!?]*$",
+            re.I,
+        ),
+        "search_and_open",
+        lambda m: _search_open_args(m.group("query"), m.group("which"), m.string),
+    ),
+    # ── v13: a specific video on YouTube. Ahead of the browser block because
+    # "click the second video" is not a button called "the second video", and
+    # ahead of the app launcher because "play the first one" is not an app.
+    #
+    # v13.2: "select" and "pick" joined the verbs (the owner's words were "select
+    # the first video", which matched nothing), and the nouns split in two: a
+    # video/result/link is a *page* result, while a profile/option/row/item is
+    # anything on screen and goes to select_nth - Chrome's profile picker being
+    # the case that prompted it.
+    # Grid coordinates: "play video in row 1 column 2", "row 1 col 2", "open row 2 col 1", "click row 1 column 3"
+    (
+        re.compile(
+            r"^(?:(?:play|open|start|watch|click(?:\s+on)?|pick|choose|select)\s+)?"
+            r"(?:the\s+)?(?:video\s+)?(?:in|at)?\s*"
+            r"row\s+(?P<row>\d{1,2})\s*(?:,|and|\s+)?\s*(?:column|col)\s+(?P<col>\d{1,2})"
+            r"(?:\s+(?:on|in)\s+(?:this|the)\s+(?:page|screen|tab|list|grid))?\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_play",
+        lambda m: {"row": int(m.group("row")), "col": int(m.group("col"))},
+    ),
+    # Grid words: "first row second video", "second row first video", "1st row 3rd video"
+    (
+        re.compile(
+            r"^(?:(?:play|open|start|watch|click(?:\s+on)?|pick|choose|select)\s+)?"
+            r"(?:the\s+)?"
+            r"(?P<r_word>first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|\d{1,2}(?:st|nd|rd|th)?)\s+row\s+"
+            r"(?P<c_word>first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|1st|2nd|3rd|\d{1,2}(?:st|nd|rd|th)?)\s+(?:col|column\s+)?video"
+            r"(?:\s+(?:on|in)\s+(?:this|the)\s+(?:page|screen|tab|list|grid))?\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_play",
+        lambda m: _grid_video_args(m.group("r_word"), m.group("c_word")),
+    ),
+    # Numbers with "video" or "#": "play video 1", "play video 2", "open video 3", "select video 4", "video 5"
+    (
+        re.compile(
+            r"^(?:play|open|start|watch|click(?:\s+on)?|pick|choose|select)\s+"
+            r"(?:the\s+)?(?:video\s+(?:number\s+|#\s*)?|number\s+|#\s*)(?P<num>\d{1,2})"
+            r"(?:\s+(?:on|in)\s+(?:this|the)\s+(?:page|screen|tab|list))?\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_play",
+        lambda m: {"position": int(m.group("num"))},
+    ),
+    # Direct numbers: "play 1", "play 2", "click 1", "open 3", "watch 2"
+    (
+        re.compile(
+            r"^(?:play|watch|click(?:\s+on)?)\s+(?P<num>\d{1,2})"
+            r"(?:\s+(?:on|in)\s+(?:this|the)\s+(?:page|screen|tab|list))?\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_play",
+        lambda m: {"position": int(m.group("num"))},
+    ),
+    # Short "video 1", "number 2"
+    (
+        re.compile(
+            r"^(?:video|number)\s+(?P<num>\d{1,2})\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_play",
+        lambda m: {"position": int(m.group("num"))},
+    ),
+    (
+        re.compile(
+            r"^(?:play|open|start|watch|click(?:\s+on)?|pick|choose|select|go\s+to|tap|press|hit)\s+"
+            r"(?:the\s+)?(?P<which>first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|top|last|"
+            r"1st|2nd|3rd|\d{1,2}(?:st|nd|rd|th)?)\s+"
+            r"(?P<what>video|one|result|link|item|thumbnail|profile|account|option|row|entry|"
+            r"card|suggestion|person)s?"
+            r"(?:\s+(?:on|in)\s+(?:this|the)\s+(?:page|list|screen|tab|window|picker))?\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_play",
+        lambda m: _nth_args(m.group("which"), m.group("what"), "youtube_play"),
+    ),
+    (
+        re.compile(
+            r"^(?:play|open|start|watch|click(?:\s+on)?|pick|choose|select|go\s+to|tap|press|hit)\s+"
+            r"(?:the\s+)?(?P<which>first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|top|last|"
+            r"1st|2nd|3rd|\d{1,2}(?:st|nd|rd|th)?)\s+"
+            r"(?P<what>result|link)s?"
+            r"(?:\s+(?:on|in)\s+(?:this|the)\s+(?:page|list|screen|tab|window))?\s*[.!?]*$",
+            re.I,
+        ),
+        "open_result",
+        lambda m: _nth_args(m.group("which"), m.group("what"), "open_result"),
+    ),
+    (
+        re.compile(
+            r"^(?:play|open|start|watch|click(?:\s+on)?|pick|choose|select|go\s+to|tap|press|hit)\s+"
+            r"(?:the\s+)?(?P<which>first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|top|last|"
+            r"1st|2nd|3rd|\d{1,2}(?:st|nd|rd|th)?)\s+"
+            r"(?P<what>item|profile|account|option|row|entry|card|suggestion|person)s?"
+            r"(?:\s+(?:on|in)\s+(?:this|the)\s+(?:page|list|screen|tab|window|picker))?\s*[.!?]*$",
+            re.I,
+        ),
+        "select_nth",
+        lambda m: _nth_args(m.group("which"), m.group("what"), "select_nth"),
+    ),
+    (
+        re.compile(
+            r"^(?:what(?:'s| is)\s+on\s+this\s+page|list\s+(?:the\s+)?(?:results|links|options|videos)"
+            r"|what\s+(?:results|links|options)\s+are\s+(?:there|on\s+(?:this|the)\s+page))\s*[.?!]*$",
+            re.I,
+        ),
+        "page_results",
+        lambda m: _page_results_args(m.string),
+    ),
+    # The things around a video: like, subscribe, comments, share, save.
+    (
+        re.compile(
+            r"^(?:please\s+)?(?:can\s+you\s+)?"
+            r"(?P<action>like|unlike|dislike|subscribe|unsubscribe|share|save|"
+            r"(?:open|show|read)\s+(?:me\s+)?(?:the\s+)?comments?|comments?|"
+            r"(?:show|open)\s+(?:the\s+)?description|thumbs\s+up|thumbs\s+down)"
+            r"(?:\s+(?:to|from|this|that|it|the)\b.*)?\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_page_action",
+        lambda m: _yt_page_args(m.string),
+    ),
+    # Copy here, paste there.
+    (
+        re.compile(
+            r"^copy\s+(?:this|that|the)?\s*(?P<what>selection|selected\s+text|text|paragraph|"
+            r"section(?:\s+of\s+text)?|everything|all\s+of\s+(?:this|it)|page|line)?\s*"
+            r"(?:of\s+text)?(?:\s+(?:on|from|in)\s+(?:this|the|here)\s*(?:page|tab|window|field)?)?"
+            r"\s*[.!?]*$",
+            re.I,
+        ),
+        "copy_text",
+        lambda m: _copy_args(m.group("what")),
+    ),
+    (
+        re.compile(
+            r"^paste\s+(?:it|that|this|them)?\s*"
+            r"(?:in(?:to)?\s+(?:the\s+)?(?P<field>(?:(?!\s+and\s+(?:send|submit|press|hit))[^,])+?))?"
+            r"(?:\s+(?:in|on|of)\s+(?:the\s+)?(?P<tab>[\w .-]+?)\s+tab)?"
+            r"(?P<send>\s+and\s+(?:send|submit|press\s+enter|hit\s+enter|enter)\s*(?:it)?)?\s*[.!?]*$",
+            re.I,
+        ),
+        "paste_text",
+        lambda m: _paste_args(m.group("field"), m.group("tab"), m.group("send")),
+    ),
+    (
+        re.compile(
+            r"^(?:play|open|watch|put\s+on)\s+(?:the\s+)?(?:youtube\s+)?(?:video|one|clip)\s+"
+            r"(?:called|titled|named|about|with|that\s+says)\s+(.+?)\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_play",
+        lambda m: {"title": m.group(1).strip(" .!?\"'")} if m.group(1).strip() else None,
+    ),
+    (
+        re.compile(
+            r"^(?:what|which)\s+videos?\s+(?:are\s+)?(?:on|in)\s+(?:this|the)\s+(?:page|screen|list|tab)\s*[.!?]*$"
+            r"|^(?:list|read|show)\s+(?:me\s+)?(?:the\s+)?videos?\s*(?:titles?)?\s*(?:on\s+(?:this|the)\s+(?:page|screen|tab))?\s*[.!?]*$"
+            r"|^(?:list|show)\s+(?:me\s+)?the\s+youtube\s+results\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_results",
+        lambda m: {},
+    ),
+    (
+        re.compile(
+            r"^(?:skip|dismiss|close)\s+(?:the\s+|this\s+)?ads?\s*[.!?]*$"
+            r"|^(?:turn\s+on|enable|show|put\s+on)\s+(?:the\s+)?(?:captions|subtitles|cc)\s*[.!?]*$"
+            r"|^(?:turn\s+off|disable|hide)\s+(?:the\s+)?(?:captions|subtitles|cc)\s*[.!?]*$"
+            r"|^(?:next|previous|prev)\s+video\s*[.!?]*$"
+            r"|^(?:play|make)\s+(?:it|this|the\s+video)\s+(faster|slower)\s*[.!?]*$"
+            r"|^(?:skip\s+ahead|fast\s+forward|rewind)(?:\s+the\s+video)?\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_control",
+        lambda m: {"action": _video_action(m.string)},
+    ),
+    (
+        re.compile(
+            r"^(?:pause|resume|play|mute|unmute|full\s*screen)\s+(?:the\s+)?youtube(?:\s+video)?\s*[.!?]*$"
+            r"|^(?:pause|play)\s+(?:the\s+)?video\s+on\s+youtube\s*[.!?]*$",
+            re.I,
+        ),
+        "youtube_control",
+        lambda m: {"action": _video_action(m.string)},
+    ),
     # ── v11: keystrokes. Ahead of the browser block because "click/press/hit X"
     # belongs to browser_click, and "press control s" would be read as a button
     # called "control s". The first token must be a real key for this to fire.
@@ -747,6 +1896,38 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         re.compile(r"^(?:read|summari[sz]e|what(?:'s| is| does)(?: on)?)\s+(?:this|the|that)\s+(?:page|tab|site|article|website)(?:\s+say)?\s*[.!?]*$", re.I),
         "browser_read_page",
         lambda m: {},
+    ),
+    # ── Desktop app click: "click [button/tab] in [app]" ──
+    (
+        re.compile(
+            r"^(?:click|press|hit|tap)\s+(?:on\s+)?(?:the\s+)?"
+            r"(?P<text>.+?)(?:\s+(?:button|tab|menu|item|link))?\s+"
+            r"(?:in|on|inside)\s+(?:the\s+)?(?P<app>[^,]+?)\s*[.!?]*$",
+            re.I,
+        ),
+        "click_in_app",
+        lambda m: _click_in_app_args(m.group("text"), m.group("app")),
+    ),
+    # ── Desktop app typing: "type [text] into [field] in [app]" ──
+    (
+        re.compile(
+            r"^(?:type|write|enter)\s+(?:['\"](?P<text1>.+?)['\"]|(?P<text2>.+?))\s+"
+            r"(?:in|into|inside|on)\s+(?:the\s+)?(?P<into>.+?)(?:\s+(?:field|box|bar|input))?\s+"
+            r"(?:in|on|inside)\s+(?:the\s+)?(?P<app>[^,]+?)(?:\s+(?:window|app))?\s*[.!?]*$",
+            re.I,
+        ),
+        "type_text",
+        lambda m: _type_into_in_app_args(m.group("text1") or m.group("text2"), m.group("into"), m.group("app")),
+    ),
+    # ── Desktop app typing: "type [text] in [app]" ──
+    (
+        re.compile(
+            r"^(?:type|write|enter)\s+(?:['\"](?P<text1>.+?)['\"]|(?P<text2>.+?))\s+"
+            r"(?:in|into|inside|on)\s+(?:the\s+)?(?P<app>[^,]+?)(?:\s+(?:window|app))?\s*[.!?]*$",
+            re.I,
+        ),
+        "type_text",
+        lambda m: _type_in_app_args(m.group("text1") or m.group("text2"), m.group("app")),
     ),
     (
         re.compile(r"^(?:click|press|hit|tap)\s+(?:on\s+)?(?:the\s+)?(.+?)(?:\s+(?:button|link|tab))?\s*[.!?]*$", re.I),
@@ -990,6 +2171,40 @@ _FAST_RULES: List[Tuple[re.Pattern, str, Callable[[re.Match], Optional[Dict[str,
         "buzzcaf_start_studio",
         lambda m: {},
     ),
+    # ── v13.8: the generic "is it open?", last of all ──
+    #
+    # Deliberately at the end: every specific checker above answers better than a
+    # window scan can. `local_model_status` knows the port and which model is loaded,
+    # `app_status` knows the owner's own projects and whether one is mid-job - and
+    # this rule was stealing both of them until it was moved down here.
+    (
+        re.compile(
+            # Either "is X open" or "check if X is open": people put the subject on
+            # whichever side of the verb the sentence started on.
+            r"^(?:(?:can|could)\s+you\s+)?(?:please\s+)?"
+            r"(?:(?:check|see|confirm|verify|tell\s+me)\s+(?:if|whether)\s+(?P<subject>.+?)\s+is\s+"
+            r"|(?:check\s+)?(?:if\s+|whether\s+)?(?:is\s+|are\s+|do\s+i\s+have\s+|have\s+i\s+got\s+)"
+            r"(?:the\s+|my\s+|a\s+|an\s+)?(?P<thing>.+?)\s+)(?:open|opened)"
+            r"(?:\s+(?:right\s+now|anywhere|in\s+a\s+tab|in\s+any\s+tab|somewhere|"
+            r"on\s+(?:my|this)\s+(?:pc|computer|screen)))?\s*[.!?]*$",
+            re.I,
+        ),
+        "is_site_open",
+        lambda m: _is_site_args(m.group("subject") or m.group("thing")),
+    ),
+    (
+        re.compile(
+            r"^(?:(?:can|could)\s+you\s+)?(?:please\s+)?"
+            r"(?:(?:check|see|confirm|verify|tell\s+me)\s+(?:if|whether)\s+(?P<subject>.+?)\s+is\s+"
+            r"|(?:check\s+)?(?:if\s+|whether\s+)?(?:is\s+|are\s+|do\s+i\s+have\s+|have\s+i\s+got\s+)"
+            r"(?:the\s+|my\s+|a\s+|an\s+)?(?P<thing>.+?)\s+)(?:open|opened|running)"
+            r"(?:\s+(?:right\s+now|anywhere|somewhere|on\s+(?:my|this)\s+(?:pc|computer|screen)))?"
+            r"\s*[.!?]*$",
+            re.I,
+        ),
+        "is_app_open",
+        lambda m: _is_app_args(m.group("subject") or m.group("thing")),
+    ),
     # v11 P1.3: site names are sites, and this rule sits **before** the app
     # launcher. "open youtube" used to mean a filesystem search for youtube.exe
     # and came back with "I couldn't find 'youtube' on this PC".
@@ -1050,46 +2265,195 @@ _FOCUS_SETTERS: Dict[str, Tuple[str, Optional[str]]] = {
 _FOCUS_CLEARERS = ("close_app", "kill_app", "stop_app", "browser_close_tab", "close_window")
 
 
-def remember_focus(session: str, kind: str, name: str = "") -> None:
-    _focus[session] = {"kind": kind, "name": (name or "").strip(), "ts": time.time()}
+def remember_focus(session: str, kind: str, name: str = "", extra: Optional[Dict[str, Any]] = None) -> None:
+    now = time.time()
+    entry = _focus.get(session) or {}
+    clean_name = (name or "").strip()
+    entry["kind"] = kind
+    entry["name"] = clean_name
+    entry["ts"] = now
+
+    if kind == "app" and clean_name:
+        entry["app"] = {"name": clean_name, "ts": now}
+    elif kind == "tab":
+        app_name = (extra or {}).get("app") or (entry.get("app") or {}).get("name", "")
+        tab_kind = (extra or {}).get(
+            "kind",
+            "browser" if not app_name or app_name.lower() in ("chrome", "google chrome", "edge", "firefox", "browser") else "desktop",
+        )
+        entry["tab"] = {"name": clean_name or "new tab", "app": app_name, "kind": tab_kind, "ts": now}
+
+    if extra:
+        for k, v in extra.items():
+            if k not in ("kind", "name", "ts"):
+                entry[k] = v
+    _focus[session] = entry
+
+
+def remember_app_focus(session: str, app_name: str, title: str = "") -> None:
+    now = time.time()
+    entry = _focus.get(session) or {}
+    clean_app = (app_name or "").strip()
+    entry["kind"] = "app"
+    entry["name"] = clean_app
+    entry["ts"] = now
+    entry["app"] = {"name": clean_app, "title": title, "ts": now}
+    _focus[session] = entry
+
+
+def remember_tab_focus(session: str, tab_name: str, app_name: str = "", kind: str = "desktop") -> None:
+    now = time.time()
+    entry = _focus.get(session) or {}
+    clean_tab = (tab_name or "").strip()
+    clean_app = (app_name or "").strip() or (entry.get("app") or {}).get("name", "")
+    entry["kind"] = "tab"
+    entry["name"] = clean_tab
+    entry["ts"] = now
+    entry["tab"] = {"name": clean_tab, "app": clean_app, "kind": kind, "ts": now}
+    if clean_app and not entry.get("app"):
+        entry["app"] = {"name": clean_app, "ts": now}
+    _focus[session] = entry
 
 
 def recall_focus(session: str = "default") -> Optional[Dict[str, Any]]:
     entry = _focus.get(session)
     if not entry:
         return None
-    if time.time() - entry["ts"] > FOCUS_TTL_SECONDS:
+    if time.time() - entry.get("ts", 0) > FOCUS_TTL_SECONDS:
         _focus.pop(session, None)
         return None
     return entry
+
+
+def recall_focused_app(session: str = "default") -> Optional[str]:
+    entry = recall_focus(session)
+    if not entry:
+        return None
+    app_entry = entry.get("app")
+    if app_entry and (time.time() - app_entry.get("ts", 0) <= FOCUS_TTL_SECONDS):
+        return app_entry.get("name")
+    if entry.get("kind") == "app" and entry.get("name"):
+        return entry.get("name")
+    return None
+
+
+def recall_focused_tab(session: str = "default") -> Optional[Dict[str, Any]]:
+    entry = recall_focus(session)
+    if not entry:
+        return None
+    tab_entry = entry.get("tab")
+    if tab_entry and (time.time() - tab_entry.get("ts", 0) <= FOCUS_TTL_SECONDS):
+        return tab_entry
+    if entry.get("kind") == "tab":
+        return {
+            "name": entry.get("name", "new tab"),
+            "app": (entry.get("app") or {}).get("name", ""),
+            "kind": "browser",
+        }
+    return None
 
 
 def forget_focus(session: str = "default") -> None:
     _focus.pop(session, None)
 
 
-def note_focus(session: str, tool_name: str, args: Dict[str, Any], ok: bool) -> None:
+def focus_context_note(session: str = "default") -> str:
+    """A natural briefing for the model on what app and tab Dexter recently touched."""
+    entry = recall_focus(session)
+    if not entry:
+        return ""
+    lines = []
+    app = recall_focused_app(session)
+    tab = recall_focused_tab(session)
+    if app:
+        lines.append(f"Recently active application: {app}")
+    if tab and tab.get("name"):
+        tab_app = tab.get("app") or app or "current window"
+        lines.append(f"Recently active tab: '{tab['name']}' in {tab_app}")
+    if lines:
+        lines.append(
+            "Instructions referring to 'it', 'this app', 'this tab', 'that tab', or actions like 'open a tab in it', "
+            "'in this tab', 'go to <tab> tab', or clicking/typing in the app apply to this recently opened application and tab."
+        )
+    return "\n".join(lines)
+
+
+def note_focus(session: str, tool_name: str, args: Dict[str, Any], ok: bool, data: Optional[Dict[str, Any]] = None) -> None:
     """Called after every executed tool: keep the referent up to date."""
     if not ok:
         return
     if tool_name in _FOCUS_CLEARERS:
         forget_focus(session)
         return
+
+    args = args or {}
+    if tool_name in ("launch_app", "open_app", "switch_to", "focus_window", "buzzcaf_start_studio"):
+        app = args.get("app_name") or args.get("app") or args.get("title") or ("buzzcafai" if tool_name == "buzzcaf_start_studio" else "")
+        if app:
+            remember_app_focus(session, app)
+        return
+
+    if tool_name == "click_in_app":
+        app = args.get("app", "") or recall_focused_app(session) or ""
+        text = args.get("text", "")
+        remember_tab_focus(session, text, app_name=app, kind="desktop")
+        return
+
+    if tool_name == "app_shortcut":
+        action = (args.get("action", "") or "").lower()
+        win = args.get("window", "") or recall_focused_app(session) or ""
+        if "tab" in action:
+            remember_tab_focus(session, action, app_name=win, kind="desktop")
+        return
+
+    if tool_name in ("browser_open", "open_website"):
+        target = args.get("target") or args.get("url") or ""
+        remember_tab_focus(session, target, app_name="chrome", kind="browser")
+        return
+    if tool_name == "browser_new_tab":
+        remember_tab_focus(session, "new tab", app_name="chrome", kind="browser")
+        return
+    if tool_name == "browser_switch_tab":
+        which = args.get("which", "")
+        remember_tab_focus(session, which, app_name="chrome", kind="browser")
+        return
+    if tool_name == "play_on_youtube":
+        query = args.get("query", "")
+        remember_tab_focus(session, f"youtube {query}".strip(), app_name="chrome", kind="browser")
+        return
+
+    # The v13 YouTube tools: opening/searching sets the tab, and the ones that act
+    # on the video already in front (play/pause, like, comment) keep YouTube as the
+    # referent so "like it", "pause", "post it" all keep landing there.
+    if tool_name in ("youtube_play", "youtube_results", "youtube_search_page"):
+        q = args.get("query") or args.get("title") or ""
+        remember_tab_focus(session, f"youtube {q}".strip(), app_name="chrome", kind="browser")
+        return
+    if tool_name in ("youtube_control", "youtube_page_action", "youtube_comment"):
+        tab = recall_focused_tab(session)
+        label = (tab or {}).get("name") or "youtube"
+        remember_tab_focus(session, label, app_name="chrome", kind="browser")
+        return
+    if tool_name in ("search_here", "open_result", "search_and_open", "page_results"):
+        remember_tab_focus(session, args.get("query") or "current page",
+                           app_name="chrome", kind="browser")
+        return
+
     setter = _FOCUS_SETTERS.get(tool_name)
     if not setter:
         return
     kind, key = setter
-    name = str((args or {}).get(key, "") or "") if key else ""
+    name = str(args.get(key, "") or "") if key else ""
     remember_focus(session, kind, name)
 
 
-_IT = r"(?:it|this|that|the\s+window|this\s+window|that\s+window|the\s+current\s+window|the\s+active\s+window)"
+_IT = r"(?:the\s+current\s+window|the\s+active\s+window|this\s+window|that\s+window|the\s+window|this\s+app|that\s+app|the\s+app|it|this|that)"
 _THIS_TAB = r"(?:this|that|the|the\s+current|current)?\s*tab"
 _CHAIN_WORD = re.compile(r"\b(?:and then|after that|and|then)\b", re.IGNORECASE)
 
 
 def resolve_reference(text: str, session: str = "default") -> Optional[Tuple[str, Dict[str, Any]]]:
-    """Turn "close it" / "close that tab" / "minimize this" into a real call.
+    """Turn "close it" / "close that tab" / "open a tab in it" into a real call.
 
     A tab is always a tab. A bare "it" is whatever Dexter last opened, and with
     no memory it is the window in focus - which the desktop tools resolve, and
@@ -1099,21 +2463,44 @@ def resolve_reference(text: str, session: str = "default") -> Optional[Tuple[str
     if not phrase:
         return None
     memory = recall_focus(session)
+    recent_app = recall_focused_app(session)
+    recent_tab = recall_focused_tab(session)
 
+    # 1. Closing tab or app
     if re.match(rf"^(?:close|shut)\s+{_THIS_TAB}$", phrase):
+        if recent_tab and recent_tab.get("kind") == "browser":
+            return "browser_close_tab", {}
+        if recent_app:
+            return "app_shortcut", {"action": "close tab", "window": recent_app}
         return "browser_close_tab", {}
+
     if re.match(r"^(?:close|quit|shut\s*down|shut|exit)\s+(?:the\s+)?(?:browser|web\s*browser)$", phrase):
         return "close_app", {"name": "chrome"}
-    if re.match(rf"^(?:close|quit|shut\s*down|shut|exit)\s+{_IT}$", phrase):
-        if memory and memory["kind"] == "tab":
+
+    if re.match(rf"^(?:close|shut)\s+(?:the\s+|that\s+|this\s+)?tab\s+(?:in|on)\s+{_IT}$", phrase) or re.match(
+        rf"^(?:in|on)\s+{_IT}\s*,?\s*(?:close|shut)\s+(?:the\s+|that\s+|this\s+)?tab$", phrase
+    ):
+        if recent_app and recent_app.lower() in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser"):
             return "browser_close_tab", {}
-        if memory and memory["kind"] == "app" and memory["name"]:
-            return "close_app", {"name": memory["name"]}
+        if recent_app:
+            return "app_shortcut", {"action": "close tab", "window": recent_app}
+        return "app_shortcut", {"action": "close tab"}
+
+    if re.match(rf"^(?:close|quit|shut\s*down|shut|exit)\s+{_IT}$", phrase):
+        if memory and memory.get("kind") == "tab":
+            if (recent_tab and recent_tab.get("kind") == "browser") or not recent_app:
+                return "browser_close_tab", {}
+            return "app_shortcut", {"action": "close tab", "window": recent_app}
+        if recent_app:
+            return "close_app", {"name": recent_app}
         return "arrange_window", {"action": "close"}
+
     if re.match(rf"^(?:kill|force\s*(?:quit|stop|close))\s+{_IT}$", phrase):
-        if memory and memory["kind"] == "app" and memory["name"]:
-            return "kill_app", {"name": memory["name"]}
+        if recent_app:
+            return "kill_app", {"name": recent_app}
         return None
+
+    # 2. Window arrangements
     for verb, action in (("minimi[sz]e|hide", "minimize"),
                          ("maximi[sz]e|full\\s*size", "maximize"),
                          ("restore|unmaximi[sz]e", "restore")):
@@ -1123,11 +2510,105 @@ def resolve_reference(text: str, session: str = "default") -> Optional[Tuple[str
         return "arrange_window", {"action": "snap_left"}
     if re.match(rf"^(?:snap|put|move)\s+{_IT}\s+(?:to|on)\s+the\s+right(?:\s+half|\s+side)?$", phrase):
         return "arrange_window", {"action": "snap_right"}
-    m = re.match(r"^(?:scroll|page)\s+(down|up)\s+(?:here|in\s+(?:this|that)\s+(?:window|app))$", phrase)
-    if m:
-        return "scroll_window", {"direction": m.group(1)}
-    if re.match(rf"^(?:read|what(?:'s| is) (?:on|in))\s+{_IT}$", phrase) and memory and memory["kind"] == "tab":
-        return "browser_read_page", {}
+
+    m_scroll = re.match(r"^(?:scroll|page)\s+(down|up)\s+(?:here|in\s+(?:this|that)\s+(?:window|app))$", phrase)
+    if m_scroll:
+        return "scroll_window", {"direction": m_scroll.group(1)}
+
+    if re.match(rf"^(?:read|what(?:'s| is) (?:on|in))\s+{_IT}$", phrase):
+        if (recent_tab and recent_tab.get("kind") == "browser") or (memory and memory.get("kind") == "tab"):
+            return "browser_read_page", {}
+        if recent_app:
+            return "copy_text_from", {"window": recent_app, "select_all": True}
+
+    # 3. New tab in it ("open a tab in it", "open new tab in it", "new tab in it", "in it open a tab")
+    if re.match(
+        rf"^(?:(?:open\s+)?(?:a\s+)?(?:new\s+|another\s+)?tab\s+(?:in|on)\s+{_IT}|"
+        rf"(?:in|on)\s+{_IT}\s*,?\s*(?:open\s+)?(?:a\s+)?(?:new\s+|another\s+)?tab)$",
+        phrase,
+    ):
+        if recent_app and recent_app.lower() in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser"):
+            return "browser_new_tab", {}
+        if recent_app:
+            return "app_shortcut", {"action": "new tab", "window": recent_app}
+        return "app_shortcut", {"action": "new tab"}
+
+    # 4. Go to / switch to / open specific named tab in an app or in it
+    # ("go to the projects tab in it", "open goals tab in mission reminder", "switch to goals tab in machine reminder")
+    m_app_tab = re.match(
+        r"^(?:go\s+to|switch\s+to|open|jump\s+to|navigate\s+to|show)\s+(?:the\s+)?(?P<tab>.+?)\s+tab\s+(?:in|on)\s+(?:the\s+)?(?P<app>[^,]+)$",
+        phrase,
+    )
+    if not m_app_tab:
+        m_app_tab = re.match(
+            r"^(?:in|on)\s+(?:the\s+)?(?P<app>[^,]+)\s*,?\s*(?:go\s+to|switch\s+to|open|jump\s+to|navigate\s+to|show)\s+(?:the\s+)?(?P<tab>.+?)(?:\s+tab)?$",
+            phrase,
+        )
+    if m_app_tab:
+        tab_name = m_app_tab.group("tab").strip()
+        app_raw = m_app_tab.group("app").strip()
+        if re.match(rf"^{_IT}$", app_raw, re.I):
+            target_app = recent_app
+        else:
+            target_app = app_raw
+
+        target_lower = (target_app or "").lower()
+        if target_lower in ("mission reminder", "missionreminder", "machine reminder", "missing reminder", "messenger minder"):
+            return "mission_go_to_tab", {"tab": tab_name}
+        if target_lower in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser"):
+            return "browser_switch_tab", {"which": tab_name}
+        if tab_name.lower() in ("next", "next tab"):
+            return "app_shortcut", {"action": "next tab", "window": target_app} if target_app else {"action": "next tab"}
+        if tab_name.lower() in ("previous", "prev", "previous tab", "prev tab"):
+            return "app_shortcut", {"action": "previous tab", "window": target_app} if target_app else {"action": "previous tab"}
+        return "click_in_app", {"text": tab_name, "app": target_app} if target_app else {"text": tab_name}
+
+    m_tab = re.match(
+        rf"^(?:go\s+to|switch\s+to|open|jump\s+to|navigate\s+to)\s+(?:the\s+)?(?P<tab>.+?)\s+tab\s+(?:in|on)\s+{_IT}$",
+        phrase,
+    )
+    if not m_tab:
+        m_tab = re.match(
+            rf"^(?:in|on)\s+{_IT}\s*,?\s*(?:go\s+to|switch\s+to|open|jump\s+to|navigate\s+to)\s+(?:the\s+)?(?P<tab>.+?)(?:\s+tab)?$",
+            phrase,
+        )
+    if m_tab:
+        tab_name = m_tab.group("tab").strip()
+        if recent_app and recent_app.lower() in ("mission reminder", "missionreminder", "machine reminder", "missing reminder", "messenger minder"):
+            return "mission_go_to_tab", {"tab": tab_name}
+        if recent_app and recent_app.lower() in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser"):
+            return "browser_switch_tab", {"which": tab_name}
+        if tab_name.lower() in ("next", "next tab"):
+            return "app_shortcut", {"action": "next tab", "window": recent_app} if recent_app else {"action": "next tab"}
+        if tab_name.lower() in ("previous", "prev", "previous tab", "prev tab"):
+            return "app_shortcut", {"action": "previous tab", "window": recent_app} if recent_app else {"action": "previous tab"}
+        return "click_in_app", {"text": tab_name, "app": recent_app} if recent_app else {"text": tab_name}
+
+    # 5. "go to the <name> tab" / "open <name> tab" when a desktop app is active and tab is not a known site
+    m_bare_tab = re.match(
+        r"^(?:switch|go|jump|move|open|show)\s+(?:to\s+)?(?:the\s+)?(?P<tab>.+?)\s+tab$",
+        phrase,
+    )
+    if m_bare_tab:
+        tab_name = m_bare_tab.group("tab").strip()
+        if recent_app and recent_app.lower() in ("mission reminder", "missionreminder", "machine reminder", "missing reminder", "messenger minder"):
+            return "mission_go_to_tab", {"tab": tab_name}
+        if recent_app and recent_app.lower() not in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser") and not _is_known_site(tab_name):
+            return "click_in_app", {"text": tab_name, "app": recent_app}
+
+    # 6. Listing tabs in it ("what tabs are in it", "what tabs does it have", "list tabs in it")
+    if re.match(
+        rf"^(?:(?:what|which|list|show)\s+(?:the\s+|all\s+)?tabs\s+(?:are\s+)?(?:in|on|of)\s+{_IT}|"
+        rf"what\s+tabs\s+does\s+{_IT}\s+have|"
+        rf"(?:in|on)\s+{_IT}\s*,?\s*(?:what|which|list|show)\s+(?:the\s+|all\s+)?tabs(?:\s+are\s+there)?)$",
+        phrase,
+    ):
+        if recent_app and recent_app.lower() in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser"):
+            return "browser_tabs", {}
+        if recent_app:
+            return "list_controls", {"window": recent_app, "kind": "tab"}
+        return "list_controls", {"kind": "tab"}
+
     return None
 
 
@@ -1141,25 +2622,73 @@ _PREFIX_APPS = (
 _IN_APP = re.compile(rf"^in\s+(?P<app>{_PREFIX_APPS})\s*,?\s+(?P<rest>.+)$", re.IGNORECASE)
 _IN_ANY = re.compile(r"^in\s+(?P<app>[\w .+#-]{2,24}?)\s*[,:]\s+(?P<rest>.+)$", re.IGNORECASE)
 _APP_COLON = re.compile(rf"^(?P<app>{_PREFIX_APPS})\s*:\s*(?P<rest>.+)$", re.IGNORECASE)
+_IN_PRONOUN = re.compile(
+    r"^in\s+(?:this\s+app|that\s+app|the\s+app|this\s+window|that\s+window|the\s+window|it|this|that)\b\s*[,:]?\s*(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_IN_TAB_PRONOUN = re.compile(
+    r"^(?:in|on)\s+(?:this|that|the|the\s+current|current)\s+tab\b\s*[,:]?\s*(?P<rest>.+)$",
+    re.IGNORECASE,
+)
 
 
-def split_app_prefix(text: str) -> Optional[Tuple[str, str]]:
+def split_app_prefix(text: str, session: str = "default") -> Optional[Tuple[str, str]]:
     """'in chrome, go to gmail' -> ('chrome', 'go to gmail').
-
-    Deliberately narrow: a bare "<word>: rest" only counts for a short list of
-    apps, because "code: fix the importer" is already buzzcode's phrasing and
-    "note: call the editor" is a note.
+    Also supports 'in it, click settings' -> (recall_focused_app, 'click settings').
     """
     raw = (text or "").strip()
+    m_pronoun = _IN_PRONOUN.match(raw)
+    if m_pronoun:
+        app = recall_focused_app(session)
+        rest = m_pronoun.group("rest").strip(" ,.")
+        if app and rest:
+            return app, rest
+
     for pattern in (_IN_APP, _APP_COLON, _IN_ANY):
         match = pattern.match(raw)
         if not match:
             continue
         app = re.sub(r"^the\s+", "", match.group("app").strip(" ,:"), flags=re.I)
         rest = match.group("rest").strip(" ,.")
-        if app and rest:
-            return app, rest
+        if not (app and rest):
+            continue
+        # "in youtube, like this video" is a *tab*, not a window: the loose
+        # comma form would otherwise claim it and then fail to focus a window
+        # called youtube (v13.2). A name that is both - "edge", say - stays an app.
+        if pattern is _IN_ANY and not _alias_is_app(app) and _is_known_site(app):
+            return None
+        return app, rest
     return None
+
+
+def split_tab_prefix(text: str, session: str = "default") -> Optional[Tuple[str, str, str]]:
+    """('browser' | 'desktop', target, rest) when instruction starts with 'in this tab, ...'."""
+    raw = (text or "").strip()
+    match = _IN_TAB_PRONOUN.match(raw)
+    if not match:
+        return None
+    rest = match.group("rest").strip(" ,.")
+    if not rest:
+        return None
+    tab_info = recall_focused_tab(session)
+    if not tab_info:
+        app = recall_focused_app(session)
+        if app and app.lower() not in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser"):
+            return "desktop", app, rest
+        return "browser", "", rest
+    kind = tab_info.get("kind", "desktop")
+    name = tab_info.get("name", "")
+    app = tab_info.get("app", "") or recall_focused_app(session) or ""
+    return kind, (name if kind == "browser" else app), rest
+
+
+def _is_known_site(name: str) -> bool:
+    try:
+        from browser import known_site
+
+        return bool(known_site(name))
+    except Exception:
+        return False
 
 
 def is_desktop_chain(text: str) -> bool:
@@ -1256,6 +2785,49 @@ def fast_path(message: str, session: str = "default") -> Optional[Tuple[str, Dic
                 return None
             if len(target.split()) > 3:
                 return None
+
+        # Disambiguate browser vs desktop tools when active window is NOT Chrome
+        if tool_name == "browser_click":
+            target = args.get("target", "")
+            recent_app = recall_focused_app(session)
+            if recent_app and recent_app.lower() not in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser"):
+                return "click_in_app", {"text": target, "app": recent_app}
+            try:
+                import desktop_control as dc
+                win = dc.active_window()
+                if win and win.app and win.app.lower() not in ("chrome", "edge", "firefox", "google chrome", "browser"):
+                    return "click_text", {"text": target}
+            except Exception:
+                pass
+
+        if tool_name == "browser_type":
+            text_val = args.get("text", "")
+            into_val = args.get("into", "")
+            submit_val = args.get("submit", False)
+            recent_app = recall_focused_app(session)
+            try:
+                import desktop_control as dc
+                if into_val and dc._alias_of(into_val):
+                    return "type_text", {"text": text_val, "window": into_val, "submit": submit_val}
+                if recent_app and recent_app.lower() not in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser"):
+                    return "type_text", {"text": text_val, "into": into_val, "submit": submit_val, "window": recent_app}
+                win = dc.active_window()
+                if win and win.app and win.app.lower() not in ("chrome", "edge", "firefox", "google chrome", "browser"):
+                    return "type_text", {"text": text_val, "into": into_val, "submit": submit_val}
+            except Exception:
+                pass
+
+        if tool_name == "app_shortcut" and args.get("action") == "new tab":
+            recent_app = recall_focused_app(session)
+            if recent_app and recent_app.lower() in ("chrome", "google chrome", "edge", "firefox", "browser", "the browser"):
+                return "browser_new_tab", {}
+            try:
+                import desktop_control as dc
+                win = dc.active_window()
+                if win and win.app and win.app.lower() in ("chrome", "edge", "firefox", "google chrome", "browser"):
+                    return "browser_new_tab", {}
+            except Exception:
+                pass
 
         return tool_name, args
 
@@ -1836,7 +3408,14 @@ def _run_tool(
 
     if on_event:
         on_event("tool_start", {"name": tool_name, "args": args})
-    result = execute(tool_name, args)
+    # Session-scoped tools (dictation) read this rather than taking a parameter.
+    import tool_registry as _registry
+
+    token = _registry.set_session(session)
+    try:
+        result = execute(tool_name, args)
+    finally:
+        _registry.reset_session(token)
     if on_event:
         on_event("tool_result", {"name": tool_name, "ok": result.ok, "summary": result.summary})
     # What "it" means next time (v11, P3.1). Never allowed to break a turn.
@@ -1867,14 +3446,24 @@ TOOLS_PER_CALL = 8
 # off ("escalates") to a bigger model for anything needing tools/actions. Both
 # are optional; unset DEXTER_FAST_MODEL disables the tier (single-model as
 # before). SMART model, when unset, falls back to the provider's default.
-FAST_MODEL = os.getenv("DEXTER_FAST_MODEL", "").strip()
-SMART_MODEL = os.getenv("DEXTER_SMART_MODEL", "").strip()
+#: v13, D1: `qwen3.5:4b`. Measured against six others on this card — 27 of 30
+#: tool choices right, 111 tok/s, 3.0 GB — it is the first small model good
+#: enough to be *handed the tools* rather than only asked to step aside. An
+#: explicitly blank DEXTER_FAST_MODEL still switches the whole tier off.
+FAST_MODEL = os.getenv("DEXTER_FAST_MODEL", "qwen3.5:4b").strip()
+SMART_MODEL = os.getenv("DEXTER_SMART_MODEL", "gemma-4-12b").strip()
+# v12, D1: a ladder, not one fixed model. The top rung is the better model the
+# owner would like every escalated turn to use; the fallback is the one that
+# still fits when something else has most of the card. Sentinel decides which
+# of the two Dexter actually gets — the ladder only changes what is *asked*
+# for, and in what order.
+SMART_MODEL_FALLBACK = os.getenv("DEXTER_SMART_MODEL_FALLBACK", "gemma-4-12b").strip()
 # Where each model runs. The fast model has its own home (Ollama by default,
 # whichever online server lists it) so it keeps answering instantly even while
 # the shared llama-server on 8089 holds buzzcode's big model; the smart model
 # follows the provider preference unless pinned here.
 FAST_PROVIDER = os.getenv("DEXTER_FAST_PROVIDER", "").strip().lower()
-SMART_PROVIDER = os.getenv("DEXTER_SMART_PROVIDER", "").strip().lower()
+SMART_PROVIDER = os.getenv("DEXTER_SMART_PROVIDER", "lmstudio").strip().lower()
 # Residency: keep the small model loaded for hours (an instant reply is only
 # instant when nothing has to load), let the big one go once its task is over.
 FAST_KEEP_ALIVE = os.getenv("DEXTER_FAST_KEEP_ALIVE", "2h").strip() or "2h"
@@ -1886,12 +3475,31 @@ TIERED_ENABLED = os.getenv("DEXTER_TIERED_LLM", "1").strip().lower() not in (
     "off",
     "",
 )
+# v13, D1: the fast model may *act*. One tool call on the small model, with the
+# same candidate set the big one would get, before any escalation — most
+# commands then finish in about a second without the 12B ever loading. Off with
+# DEXTER_FAST_ACT=0, which restores v12 behaviour exactly (every instruction
+# escalates).
+FAST_ACT_ENABLED = os.getenv("DEXTER_FAST_ACT", "1").strip().lower() not in (
+    "0", "false", "no", "off",
+)
 
 # The sentinel the fast model returns instead of answering when a turn needs the
 # big model. Kept short and unlikely to appear in a genuine reply.
 _ESCALATE = "<ESCALATE>"
 
 _FAST_SYSTEM = (
+    # Speed guard (v14.1): this tier runs on a small model that may be a reasoning
+    # finetune. Through LM Studio's OpenAI shim there is no `think:false`, so left
+    # alone it spends its whole budget deliberating - measured 4.2 s and 1300+
+    # characters of reasoning on a plain "how are you" once tools are attached, and
+    # when the budget runs out before an answer the turn escalates to the big model
+    # for nothing. Telling it not to think cuts that to ~0.8 s with the answer intact
+    # and does not hurt tool choice (an action still calls its tool immediately).
+    "Answer or call a tool DIRECTLY and IMMEDIATELY. Do NOT think out loud, "
+    "deliberate, plan, or output any reasoning, analysis, or <think> blocks - emit "
+    "only the final one- or two-sentence reply, the tool call, or the escalation "
+    "token below.\n\n"
     "You are only the instant-response layer of Dexter, a capable assistant that "
     "CAN take actions on the user's PC through tools (apps, files, media, email, "
     "calendar, reminders, memory, the web, and more) via its larger model. Your "
@@ -2147,9 +3755,11 @@ SENTINEL_ENABLED = os.getenv("DEXTER_SENTINEL", "1").strip().lower() not in (
 # under-asking is the failure that matters: a granted reservation that turns out
 # to be too small puts us straight back to paging.
 _RESERVE_OVERHEAD_MIB = int(os.getenv("DEXTER_RESERVE_OVERHEAD_MIB", "1024") or 1024)
-# Sentinel's own default for an assistant, stated rather than assumed so the
-# service's table and Dexter's agree even if the default changes on one side.
-DEXTER_PRIORITY = int(os.getenv("DEXTER_PRIORITY", "60") or 60)
+# Dexter is last in line for the card (owner's rule, 2026-10-15): 10 sits below
+# every other client Sentinel knows (buzzcode and unregistered apps are 20), so
+# any of them may preempt Dexter's booking. Only Sentinel's test tools (5) rank
+# lower. Sentinel never freezes an assistant, so this costs latency, not a hang.
+DEXTER_PRIORITY = int(os.getenv("DEXTER_PRIORITY", "10") or 10)
 
 _sentinel_lock = threading.Lock()
 _sentinel_started = False
@@ -2241,6 +3851,12 @@ def sentinel_reserve_for_smart(model: Optional[str]) -> Tuple[bool, Dict[str, An
     """
     if not SENTINEL_ENABLED or not model:
         return True, {"absent": True}
+    if model_steward._resident_place(model) not in ("", "cpu"):
+        # Already on the card: nothing new is consumed, so nothing is booked
+        # (as `ensure` does). Asking anyway counts its gigabytes twice, gets
+        # refused, and steps down to the fallback — which, one model at a time,
+        # then unloads the very model that was ready. Found live 2026-10-15.
+        return True, {"resident": True}
     decision = model_steward.reserve(
         "smart-model",
         model_steward.vram_estimate(model),
@@ -2249,6 +3865,24 @@ def sentinel_reserve_for_smart(model: Optional[str]) -> Tuple[bool, Dict[str, An
     details = dict(decision.details)
     details["_decision"] = decision
     return decision.granted, details
+
+
+def cpu_rung(rungs: List[Tuple[str, Optional[str]]]) -> Optional[Tuple[str, Optional[str]]]:
+    """The rung worth running in RAM when the card is refused (v13, P3.2).
+
+    The *fallback* rung only, and only when its file is small enough to be an
+    assistant off the GPU. The 12B manages 8 tok/s in system memory; waiting for
+    the card is better than that, and saying so is better than both.
+    """
+    candidates = [(prov, model) for prov, model in rungs if prov == "ollama" and model]
+    if not candidates:
+        return None
+    provider, model = candidates[-1]
+    if not model_steward.fits_on_cpu(model):
+        log.info("cpu rung: %s is too big to run in RAM (> %s MiB)",
+                 model, model_steward.CPU_RUNG_MAX_MIB)
+        return None
+    return provider, model
 
 
 def gpu_busy_reply(details: Dict[str, Any]) -> str:
@@ -2290,7 +3924,47 @@ def _keep_fast_model_warm(provider: str) -> None:
 
 
 def _release_smart_model_soon(provider: str, model: Optional[str]) -> None:
-    """Let the big model leave memory once it has been idle for SMART_KEEP_ALIVE."""
+    """Let the big model leave memory again, and take the rungs it replaced with it.
+
+    Three things happen here, and the order matters (v13.2, the owner's ask:
+    "if Dexter switches model, or I switch it, the previous one gets offloaded"):
+
+    1. **Every other rung we loaded goes now.** The ladder's rungs are
+       alternatives - the top one and the fallback are never both needed - so a
+       turn that stepped down used to leave two models resident for half an hour.
+       The fast tier is spared: it is the 3 GB one every chat turn needs.
+    2. The rung that just answered leaves on a keep-alive, so a second action in
+       the same conversation does not pay for a reload.
+    3. Unless memory is already tight, or the owner asked for `always` - then it
+       goes immediately, and so does the fast model.
+    """
+    mode = model_steward.offload_mode()
+    if mode == "off":
+        model_steward.release_soon(provider, model, SMART_KEEP_ALIVE)
+        return
+
+    keep = [model] if model else []
+    if mode == "always":
+        # Strictest: only the model that just answered is left in memory, the
+        # fast tier included. A chat turn after this pays for a reload.
+        model_steward.retire(keep, provider=provider, why="one model at a time",
+                             include_fast=True)
+        model_steward.release_soon(provider, model, SMART_KEEP_ALIVE)
+        # ...and once it has been idle a while, back to the small model, so the
+        # next quick reply is instant again.
+        model_steward.settle_to_fast(model)
+        return
+
+    # 'rungs': the superseded rungs go, the fast tier stays.
+    model_steward.retire(keep, provider=provider, why="superseded rung",
+                         include_fast=False)
+    if model and model_steward.memory_is_tight():
+        # Sentinel is already warning about memory: 7 GB held against a possible
+        # second action is the wrong trade, so hand it back now.
+        if model_steward.unload(provider, model):
+            print(f"[Router] Memory is tight; offloaded {model} rather than holding it "
+                  f"for {SMART_KEEP_ALIVE}.")
+            return
     model_steward.release_soon(provider, model, SMART_KEEP_ALIVE)
 
 
@@ -2304,19 +3978,58 @@ def fast_backend(preferred: str = "auto") -> Optional[str]:
     return llm_router.provider_for_model(FAST_MODEL, preferred=hint)
 
 
-def smart_backend(preferred: str = "auto") -> Tuple[str, Optional[str]]:
-    """(provider, model) for the tool-enabled pass. The shared llama-server serves
-    exactly one model, so SMART_MODEL only applies to Ollama / LM Studio."""
+def _rung_backend(model: str, preferred: str = "auto") -> Tuple[str, Optional[str]]:
+    """(provider, model) for one rung of the ladder, or (provider, None) when no
+    online server lists it. The shared llama-server serves exactly one model of
+    its own, so a named tag only applies to Ollama / LM Studio."""
+    # A remote provider the owner picked in the UI (Claude, OpenAI) is an
+    # explicit choice: it wins over DEXTER_SMART_PROVIDER, which only says which
+    # *local* server holds the smart rungs. Its own model default applies.
+    if preferred in ("claude", "openai", "gemini"):
+        return preferred, None
     provider = SMART_PROVIDER or llm_router.resolve_provider(preferred)
-    model = None
-    if SMART_MODEL and provider in ("ollama", "lmstudio"):
-        # Go where the model actually is: LM Studio being up must not send an
-        # Ollama tag to LM Studio (a guaranteed "model not found").
-        home = llm_router.provider_for_model(SMART_MODEL, preferred=provider)
-        if home and home != provider and not SMART_PROVIDER:
-            provider = home
-        model = SMART_MODEL if home == provider else None
-    return provider, model
+    if not model or provider not in ("ollama", "lmstudio"):
+        return provider, None
+    # Go where the model actually is: LM Studio being up must not send an
+    # Ollama tag to LM Studio (a guaranteed "model not found").
+    home = llm_router.provider_for_model(model, preferred=provider)
+    if home and home != provider and not SMART_PROVIDER:
+        provider = home
+    return provider, (model if home == provider else None)
+
+
+def smart_backend(preferred: str = "auto") -> Tuple[str, Optional[str]]:
+    """(provider, model) for the tool-enabled pass — the top rung, or the
+    provider's own default model when nobody serves it."""
+    return _rung_backend(SMART_MODEL, preferred)
+
+
+def smart_ladder(preferred: str = "auto") -> List[Tuple[str, Optional[str]]]:
+    """The rungs to ask Sentinel for, best first (v12, D1).
+
+    `DEXTER_SMART_MODEL` then `DEXTER_SMART_MODEL_FALLBACK`, deduplicated, each
+    resolved to the server that actually lists it. A rung nobody serves is
+    skipped (one log line — a silently missing model reads as "Dexter got
+    dumber", which is the thing worth saying out loud).
+
+    With no top rung configured there is no ladder: the escalation goes to the
+    provider's own default model, exactly as it did before v12.
+    """
+    if not SMART_MODEL:
+        return [smart_backend(preferred)]
+    rungs: List[Tuple[str, Optional[str]]] = []
+    seen = set()
+    for name in (SMART_MODEL, SMART_MODEL_FALLBACK):
+        name = (name or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        provider, model = _rung_backend(name, preferred)
+        if not model:
+            log.info("smart ladder: no online server lists %s — skipping that rung", name)
+            continue
+        rungs.append((provider, model))
+    return rungs or [smart_backend(preferred)]
 
 
 def _fast_reply(
@@ -2407,6 +4120,13 @@ def candidate_tools(message: str) -> List[str]:
     names = [name for name, _ in rank_tools(message, top_k=TOOLS_PER_CALL)]
     if not names:
         names = [spec.name for spec in all_tools()][:TOOLS_PER_CALL]
+    if re.search(r"\b(?:tabs?|controls?|buttons?|in it|in this|click|type|write|switch|keys?|window|app)\b", message, re.I):
+        for tool in ("click_in_app", "click_text", "type_text", "list_controls", "app_shortcut", "switch_to"):
+            if tool not in names and get_tool(tool):
+                names.append(tool)
+    if re.search(r"\b(?:mission\s+reminder|machine\s+reminder|missing\s+reminder|messenger\s+minder|goals?|blocks?|forest)\b", message, re.I):
+        if "mission_go_to_tab" not in names and get_tool("mission_go_to_tab"):
+            names.append("mission_go_to_tab")
     if not is_desktop_chain(message):
         return names
     ranked = [name for name, _ in rank_tools(message, top_k=40)]
@@ -2419,6 +4139,162 @@ def candidate_tools(message: str) -> List[str]:
         if spec and spec.category in CHAIN_CATEGORIES:
             names.append(name)
     return names
+
+
+# ───────────────────────── Tier 1.6: the fast model acts (v13, D1) ─────────────
+#
+# Until v13 the small model was only ever allowed to *decline*: any instruction
+# went straight to the big one, which meant "close notepad" paid for a 7 GB
+# load. qwen3.5:4b picks the right tool in 27 of 30 measured cases with the same
+# eight candidates Dexter hands the big model, so it gets one round with the
+# tools. One. If it produces no call, an invalid one, or a tool that was not on
+# the list — or the call fails — the turn escalates exactly as it did before,
+# because a wrong action is far worse than a slow one.
+
+_FAST_ACT_SYSTEM = (
+    "You are Dexter, a personal assistant on the user's Windows PC. The user has "
+    "asked you to DO something. Call exactly one of the provided tools, with correct "
+    "arguments taken from the user's words. Do not explain, do not ask, do not "
+    "call more than one tool. If none of the tools can do it, reply with the single "
+    f"word {_ESCALATE} and nothing else."
+)
+
+_FAST_VOICE_SYSTEM = (
+    "You are Dexter. An action just ran on the user's PC. Report it back in ONE "
+    "short, natural sentence, in the past tense, using only what the result says. "
+    "Add nothing, promise nothing, ask nothing."
+)
+#: A voiced line longer than this is the small model padding, not reporting.
+_VOICE_MAX_CHARS = 220
+
+
+def _voice_tool_result(
+    message: str, tool_name: str, summary: str, provider: str, session: str,
+) -> str:
+    """The tool's own summary, said in Dexter's voice. Falls back to the summary.
+
+    The summaries are written for correctness, not for conversation ("Opened
+    Notepad (notepad.exe)."). One 80-token pass on a model that is already
+    resident costs about a fifth of a second; anything that goes wrong with it —
+    an empty reply, padding, a model that starts inventing — falls straight back
+    to the summary, which was always a correct answer.
+    """
+    if not summary:
+        return summary
+    try:
+        response = llm_router.chat(
+            [
+                {"role": "system", "content": _FAST_VOICE_SYSTEM},
+                {"role": "user", "content": f"The user said: {message}\nResult of {tool_name}: {summary}"},
+            ],
+            provider=provider, model=FAST_MODEL, temperature=0.2, max_tokens=80,
+            tools=None, timeout=20, think=False,
+            should_cancel=lambda: cancellation.is_cancelled(session),
+        )
+    except Exception:
+        return summary
+    if response.cancelled or not response.ok:
+        return summary
+    line = " ".join((response.content or "").split()).strip()
+    if not line or len(line) > _VOICE_MAX_CHARS or "ESCALATE" in line.upper():
+        return summary
+    return line
+
+
+def _fast_act(
+    message: str,
+    provider: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    context_note: str = "",
+    on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    session: str = "default",
+) -> Optional[RouteResult]:
+    """One tool round on the fast model. `None` means "escalate, as before"."""
+    if not FAST_ACT_ENABLED or not FAST_MODEL:
+        return None
+    names = candidate_tools(message)
+    schemas = schemas_for(names)
+    if not schemas:
+        return None
+
+    focus_note = focus_context_note(session=session)
+    if focus_note and focus_note not in context_note:
+        context_note = f"{focus_note}\n\n{context_note}".strip()
+    system = _FAST_ACT_SYSTEM
+    if context_note:
+        system += f"\n\nContext you may use:\n{context_note}"
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": system}]
+    for turn in (history or [])[-4:]:
+        role, content = turn.get("role"), turn.get("content")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": message})
+
+    # No `on_token`: a tool call streamed to the UI is leaked protocol, and the
+    # reply the user sees is the tool's result, not the model's preamble.
+    response = llm_router.chat(
+        messages, provider=provider, model=FAST_MODEL, temperature=0.1,
+        max_tokens=300, tools=schemas, timeout=45, think=False,
+        should_cancel=lambda: cancellation.is_cancelled(session),
+    )
+    if response.cancelled:
+        return RouteResult(reply="", action="interrupted", tier=1)
+    if not response.ok:
+        log.info("fast act: %s could not answer (%s); escalating", FAST_MODEL, response.error)
+        return None
+
+    call: Optional[Tuple[str, Dict[str, Any]]] = None
+    if response.tool_calls:
+        first = response.tool_calls[0]
+        call = (first["name"], first["arguments"])
+    elif response.content:
+        call = _parse_text_tool_call(response.content)
+    if not call:
+        print(f"[Router] fast act: no tool call from {FAST_MODEL}; escalating.")
+        return None
+
+    tool_name, tool_args = call
+    spec = get_tool(tool_name)
+    if not spec or tool_name not in names:
+        # A tool it was never offered is a hallucinated one. The big model gets
+        # the turn rather than Dexter guessing what was meant.
+        print(f"[Router] fast act: {FAST_MODEL} asked for {tool_name!r}, which was not on offer; escalating.")
+        return None
+    ok, cleaned, why = validate_args(spec, tool_args or {})
+    if not ok:
+        print(f"[Router] fast act: invalid arguments for {tool_name} ({why}); escalating.")
+        return None
+
+    if cancellation.is_cancelled(session):
+        return RouteResult(reply="", action="interrupted", tier=1)
+    result, awaiting = _run_tool(tool_name, cleaned, on_event=on_event, session=session)
+    if cancellation.is_cancelled(session):
+        return RouteResult(reply="", action="interrupted", tier=1)
+    if awaiting:
+        # A confirm tool asks exactly as it always has; the answer is resolved
+        # at the top of the next turn, whichever model handles it.
+        return RouteResult(
+            reply=result.summary, action="confirm", tier=1,
+            data={**result.data, "fastAct": True}, needs_confirmation=True,
+        )
+    if not result.ok:
+        # One round only, and this round did not do it. The big model gets a
+        # clean try rather than the small one repairing its own mistake.
+        print(f"[Router] fast act: {tool_name} failed ({result.summary}); escalating.")
+        return None
+
+    reply = _voice_tool_result(message, tool_name, result.summary, provider, session)
+    if on_event:
+        on_event("token", {"text": reply})
+    _keep_fast_model_warm(provider)
+    print(f"[Router] fast act: {tool_name} on {FAST_MODEL} — settled without the big model.")
+    return RouteResult(
+        reply=reply, action="fast_act", tier=1,
+        tool_calls=[{"name": tool_name, "args": cleaned, "ok": result.ok,
+                     "summary": result.summary, **_speech_hint(result)}],
+        data={**result.data, "model": FAST_MODEL, "provider": provider,
+              "fastAct": True, **_speech_hint(result)},
+    )
 
 
 def agent_loop(
@@ -2446,6 +4322,9 @@ def agent_loop(
         system += "\n\n" + companion.context_block()
     except Exception as exc:
         print(f"[Router] companion context skipped: {exc}")
+    focus_note = focus_context_note(session=session)
+    if focus_note and focus_note not in context_note:
+        context_note = f"{focus_note}\n\n{context_note}".strip()
     if context_note:
         system += f"\n\nContext you may use:\n{context_note}"
 
@@ -2556,9 +4435,15 @@ def agent_loop(
                 data={"iterations": iteration + 1},
             )
 
+        if _should_cancel():
+            return RouteResult(reply="", action="interrupted", tier=2, tool_calls=executed)
+
         tool_name, tool_args = call
         result, awaiting = _run_tool(tool_name, tool_args, on_event=on_event, session=session)
         last_result = result
+
+        if _should_cancel():
+            return RouteResult(reply="", action="interrupted", tier=2, tool_calls=executed)
 
         if awaiting:
             return RouteResult(
@@ -2607,6 +4492,76 @@ def agent_loop(
 
 
 # ───────────────────────── entry point ─────────────────────────
+
+
+# "In YouTube, select the first video" (v13.2). A site is not a window - there is
+# nothing to focus - so the prefix means "switch to that tab first". Without this
+# the whole sentence reached the model, which is what "it says it is doing it but
+# it does nothing" looked like from the outside.
+_IN_SITE = re.compile(
+    r"^(?:in|on|over\s+in|back\s+in)\s+(?:the\s+|my\s+)?(?P<site>[\w.-]{3,24})"
+    r"(?:\s+tab|\s+page|\.com)?\s*,?\s+(?P<rest>.{3,})$",
+    re.IGNORECASE,
+)
+
+
+def split_site_prefix(text: str) -> Optional[Tuple[str, str]]:
+    """('youtube', 'select the first video') when the sentence opens with a site."""
+    match = _IN_SITE.match((text or "").strip())
+    if not match:
+        return None
+    site = match.group("site").strip().lower()
+    rest = match.group("rest").strip()
+    if not rest or _alias_is_app(site):
+        return None  # a window, not a tab: _route_in_app owns that
+    try:
+        from browser import known_site
+
+        if not known_site(site):
+            return None
+    except Exception:
+        return None
+    return site, rest
+
+
+def _alias_is_app(name: str) -> bool:
+    try:
+        import desktop_control
+
+        return desktop_control._alias_of(name) is not None
+    except Exception:
+        return False
+
+
+def _route_in_tab(
+    site: str,
+    rest: str,
+    history: Optional[List[Dict[str, str]]] = None,
+    provider: str = "auto",
+    model: Optional[str] = None,
+    context_note: str = "",
+    on_event: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    session: str = "default",
+) -> RouteResult:
+    """Switch to that site's tab, then run the rest of the sentence there.
+
+    The switch is a real tool call with a real result: if no tab matches, the turn
+    says so rather than acting on whatever tab happened to be in front.
+    """
+    switch, _awaiting = _run_tool("browser_switch_tab", {"which": site}, confirmed=True,
+                                  on_event=on_event, session=session)
+    call = {"name": "browser_switch_tab", "args": {"which": site},
+            "ok": switch.ok, "summary": switch.summary}
+    if not switch.ok:
+        return RouteResult(
+            reply=f"{switch.summary} Open it first, or say \"open {site}\".",
+            action="tab_not_found", tier=0, tool_calls=[call], data=switch.data,
+        )
+    inner = route(rest, history=history, provider=provider, model=model,
+                  context_note=context_note, on_event=on_event, session=session,
+                  allow_app_prefix=False)
+    inner.tool_calls = [call] + list(inner.tool_calls)
+    return inner
 
 
 def _route_in_app(
@@ -2659,10 +4614,32 @@ def route(
     # and answer once (v11, P3.2). Stripped only once, so "in chrome, in edge, …"
     # cannot recurse.
     if allow_app_prefix:
-        prefix = split_app_prefix(text)
+        prefix = split_app_prefix(text, session=session)
         if prefix:
             return _route_in_app(
                 prefix[0], prefix[1], history=history, provider=provider, model=model,
+                context_note=context_note, on_event=on_event, session=session,
+            )
+        tab_prefix = split_tab_prefix(text, session=session)
+        if tab_prefix:
+            kind, target, rest = tab_prefix
+            if kind == "browser" and target:
+                return _route_in_tab(
+                    target, rest, history=history, provider=provider, model=model,
+                    context_note=context_note, on_event=on_event, session=session,
+                )
+            if kind == "desktop" and target:
+                return _route_in_app(
+                    target, rest, history=history, provider=provider, model=model,
+                    context_note=context_note, on_event=on_event, session=session,
+                )
+        # "in youtube, select the first video": a site is a *tab*, not a window
+        # (v13.2). Checked after the app prefix, so "in chrome, ..." still focuses
+        # the browser rather than looking for a tab called chrome.
+        site = split_site_prefix(text)
+        if site:
+            return _route_in_tab(
+                site[0], site[1], history=history, provider=provider, model=model,
                 context_note=context_note, on_event=on_event, session=session,
             )
 
@@ -2730,23 +4707,86 @@ def route(
     # while the shared llama-server on 8089 holds buzzcode's big model.
     fast_prov = fast_backend(provider) if model is None else None
     if fast_prov:
+        # One model at a time (2026-10-15): with the smart model already loaded
+        # the turn stays on it. Trying the fast tier first would swap
+        # 12B -> e4b -> 12B on any question that escalates.
+        stay = model_steward.resident_smart() if model_steward.one_at_a_time() else None
         # An instruction goes straight to the model that has the tools; the
         # fast pass is for conversation and knowledge only.
-        fast = None if (looks_like_action(text) or needs_live_data(text)) else _fast_reply(
+        fast = None if (stay or looks_like_action(text) or needs_live_data(text)) else _fast_reply(
             text, history=history, provider=fast_prov,
             context_note=context_note, on_event=on_event, session=session,
         )
         if fast is not None:
             return fast
+        # ── Tier 1.6: let the fast model act (v13, D1) ──
+        # An instruction that is one act, with tools that fit it, gets one round
+        # on the small model. A chain sentence does not: it is two acts, and the
+        # agent loop is the only thing that does both and reports once.
+        # Anything that reached this point is either an instruction, a question
+        # about the present moment, or a sentence the fast chat pass declined
+        # to answer - and each of those may be one tool call. Found live: "what
+        # track is playing right now" matched neither predicate, so it went to
+        # the 12B (7.8 s) while the small model settles it in about a second.
+        # Only a chain sentence is excluded: two acts need the agent loop.
+        if not stay and not is_desktop_chain(text):
+            acted = _fast_act(
+                text, provider=fast_prov, history=history,
+                context_note=context_note, on_event=on_event, session=session,
+            )
+            if acted is not None:
+                return acted
         # Escalated: run the full tool-enabled loop on the bigger model, then
         # let it leave memory once idle so the GPU is free again.
-        smart_prov, smart_model = smart_backend(provider)
-        # Ask Sentinel before loading several GB of model. A refusal is not a
+        #
+        # v12, D1/D2: walk the ladder. Ask Sentinel for the top rung first and
+        # take the fallback when it is refused — the guardian stays the judge,
+        # the ladder only decides what is asked for. A refusal is not a
         # failure: it means someone else is using the card, and saying so is
         # better than loading anyway and making the whole machine crawl.
-        granted, reservation = sentinel_reserve_for_smart(
-            smart_model if smart_prov == "ollama" else None
-        )
+        rungs = smart_ladder(provider)
+        smart_prov, smart_model = rungs[0]
+        granted, reservation = False, {}
+        stepped_down_from: Optional[str] = None
+        place = "gpu"
+        refused: List[Dict[str, Any]] = []
+        for index, (rung_prov, rung_model) in enumerate(rungs):
+            granted, reservation = sentinel_reserve_for_smart(
+                rung_model if rung_prov == "ollama" else None
+            )
+            if granted:
+                smart_prov, smart_model = rung_prov, rung_model
+                if index:
+                    # We are answering on a lesser model because a better one
+                    # was refused. D4: the turn carries why, quietly.
+                    stepped_down_from = rungs[0][1]
+                break
+            refused.append({"model": rung_model, "reservation": reservation})
+            if index + 1 < len(rungs):
+                log.info("smart ladder: %s refused, trying %s",
+                         rung_model, rungs[index + 1][1])
+        if not granted:
+            # ── Rung 3: RAM (v13, D4/P3.2) ──
+            # Every place on the card was refused. A small rung can still run in
+            # system memory at about a fifth of the speed, which is a slower
+            # answer rather than no answer. Sentinel still decides — this is a
+            # RAM reservation, and a refusal loads nothing, exactly as before.
+            cpu = cpu_rung(rungs)
+            if cpu:
+                decision = model_steward.ensure(
+                    cpu[1], "smart-model", provider=cpu[0],
+                    keep_alive=SMART_KEEP_ALIVE, place="cpu",
+                )
+                if decision.granted and decision.loaded:
+                    granted = True
+                    smart_prov, smart_model = cpu
+                    place = "cpu"
+                    if cpu[1] != rungs[0][1]:
+                        stepped_down_from = rungs[0][1]
+                    log.info("smart ladder: running %s in RAM — the card was refused", cpu[1])
+                else:
+                    log.info("smart ladder: %s was refused RAM too (%s)",
+                             cpu[1], decision.reason or "no reason given")
         if not granted:
             # Refused. Two rules, and both matter: **nothing is loaded** (going
             # ahead anyway is how the machine ends up paging), and Dexter does
@@ -2787,13 +4827,36 @@ def route(
                 tier=1,
                 data={"sentinel": {k: v for k, v in reservation.items() if k != "_decision"}},
             )
+        ladder_info = {
+            "model": smart_model or "",
+            "provider": smart_prov,
+            "steppedDownFrom": stepped_down_from,
+            # Where the rung is running (v13). "cpu" is worth saying out loud:
+            # the answer is right but slow, and a user who knows why waits
+            # instead of assuming Dexter broke.
+            "place": place,
+            "blockers": [
+                b for step in refused
+                for b in (step["reservation"].get("blockers") or [])
+            ],
+        }
+        # The panel wants the current rung whether or not we stepped down; the
+        # reply only mentions it when we did (D4 — no apology on a good turn).
+        model_steward.note_ladder(ladder_info)
+        if place == "gpu":
+            # One model at a time: the rung is granted, so the fast model goes
+            # before this one loads (a no-op in the other offload modes).
+            model_steward.make_way(smart_model, smart_prov)
         if on_event:
-            on_event("escalated", {"provider": smart_prov, "model": smart_model or ""})
+            on_event("escalated", {"provider": smart_prov, "model": smart_model or "",
+                                   "steppedDownFrom": stepped_down_from, "place": place})
         try:
             result = agent_loop(
                 text, history=history, provider=smart_prov, model=smart_model,
                 context_note=context_note, on_event=on_event, session=session,
             )
+            if (stepped_down_from or place != "gpu") and result is not None:
+                result.data["ladder"] = ladder_info
         finally:
             # Hand the booking back. The model is resident now, so Sentinel can
             # see its real VRAM in the process table; holding the reservation on
@@ -2806,5 +4869,14 @@ def route(
         return result
 
     # ── Tier 2 ──
-    return agent_loop(text, history=history, provider=provider, model=model,
-                      context_note=context_note, on_event=on_event, session=session)
+    # A model the owner picked in the UI bypasses the tiers entirely, so the
+    # tiers are not in use while it is selected: the pinned fast model and any
+    # smart rung are dead weight on the card. Hand them back (v13.2).
+    try:
+        result = agent_loop(text, history=history, provider=provider, model=model,
+                            context_note=context_note, on_event=on_event, session=session)
+    finally:
+        if model:
+            model_steward.retire([model], provider=provider,
+                                 why=f"{model} is the model you picked", include_fast=True)
+    return result

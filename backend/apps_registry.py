@@ -359,7 +359,60 @@ def probe(app: Dict[str, Any]) -> Dict[str, Any]:
                 return {"running": True, "evidence": f"process {spec['process']}", "pids": pids,
                         "detail": ""}
             continue
+
+    # Last resort: *anything* running out of the app's own folder. A record can
+    # be wrong - BuzzAnimate's said `buzz-app.exe` and the binary is
+    # `buzzanimate.exe`, so "is BuzzAnimate running" answered no while it was on
+    # screen, and "close BuzzAnimate" answered "it is not running". A process
+    # whose executable (or command line) lives under the app's root is that app,
+    # whatever its record believes it is called.
+    rooted = root_processes(app)
+    if rooted:
+        return {
+            "running": True,
+            "evidence": f"process in {os.path.basename(root_of(app))}",
+            "pids": [p["pid"] for p in rooted],
+            "detail": f"{rooted[0].get('name') or 'a process'} (not the name its record expects)"
+            if app.get("probes") else "",
+        }
     return {"running": False, "evidence": "", "pids": [], "detail": ""}
+
+
+#: Images that are *looking at* a project rather than being it. Without this an
+#: editor with the folder open, or the terminal it was launched from, counts as
+#: the app running.
+_BYSTANDER_IMAGES = {
+    "code.exe", "devenv.exe", "notepad.exe", "notepad++.exe", "sublime_text.exe",
+    "windowsterminal.exe", "wt.exe", "powershell.exe", "pwsh.exe", "cmd.exe",
+    "conhost.exe", "explorer.exe", "git.exe", "ssh.exe", "rg.exe", "fd.exe",
+    "msbuild.exe", "searchprotocolhost.exe", "searchfilterhost.exe", "cargo.exe",
+    "rustc.exe", "link.exe", "cl.exe",
+}
+
+
+def root_processes(app: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Processes running out of this app's folder, bystanders excluded.
+
+    The generic answer to "is it running" and "stop it" for any record whose
+    named process is wrong, renamed or has not been written down yet.
+    """
+    root = root_of(app)
+    if not root or not os.path.isdir(root):
+        return []
+    needle = root.rstrip("\\/") + os.sep
+    try:
+        found = procs.find(path_contains=needle)
+    except Exception:
+        return []
+    mine = os.getpid()
+    out = []
+    for proc in found:
+        if (proc.get("name") or "").lower() in _BYSTANDER_IMAGES:
+            continue
+        if int(proc.get("pid") or 0) == mine:
+            continue
+        out.append(proc)
+    return out
 
 
 #: A file probe only counts while the app is still writing it. Long enough to
@@ -572,6 +625,19 @@ def stop(app: Dict[str, Any]) -> Dict[str, Any]:
     if not result["ok"] and isinstance(spec.get("fallback"), dict):
         alt = spec["fallback"]
         result = _stop_by(app, alt, alt.get("strategy") or "none")
+    if not result["ok"]:
+        # The record's own routes found nothing, but something *is* running out
+        # of this app's folder: stop that. Same lesson as the probe fallback -
+        # a record that names the wrong executable must not mean "I can't close
+        # your app". Still bounded to this app's own directory, and only for a
+        # record that asked to be stoppable at all.
+        rooted = root_processes(app)
+        if rooted:
+            killed = [p["pid"] for p in rooted if procs.kill_tree(p["pid"])]
+            if killed:
+                names = ", ".join(sorted({str(p.get("name") or "?") for p in rooted}))
+                return {"ok": True, "message": "", "how": f"process in folder ({names})",
+                        "pids": killed}
     return result
 
 

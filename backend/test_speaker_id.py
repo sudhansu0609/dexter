@@ -10,6 +10,7 @@ import sys
 
 import numpy as np
 import pytest
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -24,19 +25,26 @@ SR = 16000
 
 class FakeEncoder:
     """A 'voice print' that is just the mean level of the clip, so different
-    'speakers' are different amplitudes."""
+    'speakers' are different amplitudes. Mirrors the ECAPA encoder's shape:
+    encode_batch(tensor) -> (1, 1, D) tensor that speaker_id squeezes+normalises."""
 
-    def embed_utterance(self, wav):
-        level = float(np.abs(wav).mean()) * 10.0
-        return np.array([1.0, level, level * level], dtype=np.float32)
+    def encode_batch(self, wav):
+        w = np.asarray(wav).reshape(-1).astype(np.float32)
+        level = float(np.abs(w).mean()) * 10.0
+        vec = np.array([1.0, level, level * level], dtype=np.float32)
+        return torch.from_numpy(vec).reshape(1, 1, -1)
 
 
 @pytest.fixture
 def sid(tmp_path, monkeypatch):
     monkeypatch.setattr(speaker_mod, "_IMPORT_OK", True)
-    monkeypatch.setattr(speaker_mod, "normalize_volume", lambda wav, *a, **k: wav)
+    monkeypatch.setattr(speaker_mod, "EMBED_DIM", 3)  # FakeEncoder yields a 3-dim print
     monkeypatch.setattr(speaker_mod, "STRICT", True)
     monkeypatch.setattr(speaker_mod, "THRESHOLD", 0.995)
+    # The fake's cross-"speaker" cosine is ~0.7 (its vectors share a constant
+    # term); real ECAPA is ~0.02, so the shipped DEXTER_MATCH=0.50 is fine live
+    # but would false-trigger on the fake. Pin it near the fake's self-cosine.
+    monkeypatch.setattr(speaker_mod, "DEXTER_MATCH", 0.98)
     s = SpeakerId(path=str(tmp_path / "profile.json"))
     s._encoder = FakeEncoder()
     return s
@@ -317,6 +325,9 @@ def grey(monkeypatch):
 
 
 def test_borderline_owner_addressing_dexter_by_name_is_heard(monkeypatch, grey):
+    # This asserts the SOFT behaviour (a grey score rescued by the name). The
+    # hard "only me" gate deliberately closes that door, so pin it off here.
+    monkeypatch.setattr(voice_pipeline, "HARD_ONLY_ME", False)
     monkeypatch.setattr(voice_pipeline, "WAKE_MODE", "name")
     vs = make(NameStt("Dexter, close VS Code."), grey)
     ev = say(vs)
@@ -333,6 +344,7 @@ def test_borderline_stranger_in_open_mode_is_still_ignored(monkeypatch, grey):
 
 
 def test_borderline_owner_in_open_mode_saying_the_name_is_heard(monkeypatch, grey):
+    monkeypatch.setattr(voice_pipeline, "HARD_ONLY_ME", False)  # soft path (see above)
     monkeypatch.setattr(voice_pipeline, "WAKE_MODE", "open")
     vs = make(NameStt("Dexter, what's on today"), grey)
     ev = say(vs)
@@ -342,6 +354,9 @@ def test_borderline_owner_in_open_mode_saying_the_name_is_heard(monkeypatch, gre
 def test_clearly_someone_else_is_not_transcribed_at_all(monkeypatch, judge):
     """The privacy rule stands: a print well under the bar never reaches Whisper."""
     monkeypatch.setattr(voice_pipeline, "WAKE_MODE", "open")
+    # Pin the bar so the stand-in's 0.4 is clearly below THRESHOLD - GREY_ZONE
+    # (the shipped ECAPA default of 0.45 would make 0.4 count as grey).
+    monkeypatch.setattr(speaker_mod, "THRESHOLD", 0.60)
     judge.reason = "not owner"  # scores 0.4: under THRESHOLD - GREY_ZONE
     stt = NameStt("pass the salt")
     vs = make(stt, judge)

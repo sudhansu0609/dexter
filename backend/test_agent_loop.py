@@ -208,6 +208,16 @@ def test_cancelled_response_interrupts(monkeypatch, executed):
     assert result.action == "interrupted"
 
 
+def test_cancel_before_tool_execution_stops_agent_loop(monkeypatch, executed):
+    session = "t-c3"
+    cancellation.clear(session)
+    use_llm(monkeypatch, tool_call("echo_tool", {"text": "hello"}))
+    cancellation.request_cancel(session)
+    result = router.agent_loop("run echo", session=session)
+    assert result.action == "interrupted"
+    assert "echo_tool" not in executed
+
+
 # ───────────────────────── confirmation flow ─────────────────────────
 
 

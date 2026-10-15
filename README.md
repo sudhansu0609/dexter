@@ -6,6 +6,15 @@ Studio for you — with the language model kept local (a llama.cpp server,
 LM Studio, or Ollama). Type, or talk: say **"Dexter"** (or press the mic)
 and Dexter listens, answers out loud, and keeps listening for a follow-up.
 
+## Control it from your phone
+
+Dexter can be driven from your phone as an installable web app (PWA), reached
+over **Tailscale** with a real HTTPS padlock — the backend stays loopback‑only
+and Tailscale is the only way in. There's also a phone‑friendly **Scheduler**
+(reminders plus actions Dexter runs on a timer: open an app, run a command, run
+a Buzzcaf workflow, run a code task). Full setup, security model, and
+troubleshooting: **[MOBILE_ACCESS.md](MOBILE_ACCESS.md)**.
+
 ## Voice (v10)
 
 Everything runs on this machine: silero-vad to hear where a sentence ends,
@@ -21,7 +30,7 @@ openWakeWord as an optional phrase model. Nothing spoken leaves the PC.
 | **Settings → Voice → Learn my voice** | Ten seconds of you talking. From then on Dexter answers only your voice (a visitor gets "That wasn't your voice, so I left it") and never its own echo: it keeps a voice print of its current Kokoro voice and drops anything that matches it. Turn off with *Only answer to my voice*. A sentence a little under the bar still counts when it starts with "Dexter" or follows one of yours, and every confident match teaches Dexter your voice on this mic; if it keeps saying "that wasn't your voice", lower *Voice match strictness*. |
 | Nothing is heard | The line under the composer shows a live input meter, and after six seconds of digital silence says which mic is dead. **Settings → Voice → Microphone** lists the real ones; Windows defaults to virtual endpoints (Oculus, Stereo Mix, iPhone) surprisingly often, and Dexter skips those on its own. |
 | Dexter sounds flat | **Settings → Voice → Dexter's voice**, with a *Try* button. Spoken replies also open with a mood the model picks (warm, upbeat, calm, apologetic, urgent, thinking) that sets the pace and timbre of the voice - the tag never reaches the chat. |
-| Answer within ~9 s of a reply | Heard as a follow-up: **no wake word**. The window closes on its own. |
+| Answer within ~6 s of a reply | Heard as a follow-up: **no wake word**. The window closes on its own. Since v13.1 a sentence in that window has to look like it was meant for Dexter - more than one word, and a transcript the recognizer stands behind - so the television and someone else's phone call are not commands. Answers ("yes", "no", "go ahead") and "stop" always land, and after two windows that caught nothing Dexter stops re-opening them until you say its name. |
 | Press the **mic** (or **Ctrl+Space**) | Talk now, no wake word. Pressing it while Dexter speaks cuts the reply off. |
 | Say **"stop"**, **"cancel"** or **"never mind"** on their own | Dexter stops talking and the phrase never reaches the chat. **Esc** does the same. |
 | Turn voice off (title bar) | The mic is released and replies are not spoken. Remembered across launches. |
@@ -33,7 +42,9 @@ check-ins are spoken too. Only one shell window (the pop-up or the full one,
 whichever was shown last) holds the mic, so a command is never heard twice.
 
 Knobs live in **Settings → Voice** (how to wake, the name, follow-up window,
-echo guard, wake sensitivity, barge-in) and in `.env` (`DEXTER_WHISPER_MODEL`,
+echo guard, wake sensitivity, barge-in, and since v13.1 what it takes for an
+unaddressed sentence to count: shortest length, confidence, and how many empty
+windows before it gives up) and in `.env` (`DEXTER_WHISPER_MODEL`,
 `DEXTER_WAKE_MODE`, `DEXTER_VOICE=0` to turn the whole layer off). Barge-in - talking over Dexter - is **off** by
 default because through speakers the mic hears Dexter's own voice; turn it on
 with headphones. To run Whisper on the GPU, put the CUDA 12 cuBLAS/cuDNN DLLs
@@ -48,8 +59,15 @@ says which it picked.
 ```bash
 pip install -r requirements.txt      # see "Optional extras" below
 npm install && npm run build
-Dexter.vbs                           # native WebView2 window, no console
+Dexter.exe                           # native Windows launcher (.exe, no console window)
+Dexter-Setup.exe                     # full Windows setup wizard (shortcuts, Start menu, Installed Apps)
 start_dexter.bat                     # same, with a console for the log
+```
+
+To build or rebuild the Windows executables from source:
+```bash
+npm run build:exe                    # compiles Dexter.exe with native icon
+npm run build:installer              # compiles Dexter.exe and Dexter-Setup.exe
 ```
 
 `start_dexter.bat` runs a **preflight check** first and refuses to launch on a
@@ -85,6 +103,18 @@ model in LM Studio with solid **function calling** —
 **Qwen2.5-7B-Instruct** or **Qwen3-8B** are the best quality-per-VRAM locally. A
 3B model will misfire on multi-step requests. The loaded model is auto-detected
 from `/models`, so there is nothing to configure after you swap it.
+
+**Switching a model frees the old one (v13.2).** A model used to leave memory only
+when its keep-alive expired — half an hour for a smart rung, two hours for the
+pinned fast one — so switching *added* a model rather than replacing one. Now a
+model that has been replaced is unloaded at once: a superseded ladder rung, a tier
+you changed in Settings, or both tiers while you have picked a model by hand in the
+UI. The big model also goes immediately, rather than waiting out its keep-alive,
+when Sentinel says memory is tight. **Settings → Model → "Offload the model you
+switched away from"**: `rungs` (the default, which keeps the small fast model
+because every chat turn needs it), `always` (only the model that just answered
+stays — saves the most, costs a reload on the next switch), or `off` (the v13
+behaviour). Nothing another app loaded is ever unloaded, in any mode.
 
 ---
 
@@ -182,6 +212,12 @@ which model server is up (see `ECOSYSTEM.md`) and streams its reply.
 | `claude_sessions.py` / `tools_claude.py` | What you and Claude Code did, from its transcripts (read-only) (v7) |
 | `knowledge_ingest.py` | Indexes your folders (md/txt/pdf/docx/csv, Studio JSON) into `memory.documents` with citations |
 | `user_profile.py` | `data/profile.json`: who you are, your channels; injected into every prompt |
+| `pathguard.py` / `folders.py` / `tools_files.py` | How far Dexter may reach into the disk (`DEXTER_FS_SCOPE`: the whole machine, or listed roots only — writing inside Windows itself is always refused), the words for a place ("the C drive", "my downloads", "the BuzzAnimate folder"), and the tools that list, open and find folders (v13.1) |
+| `desktop_control.py` / `tools_desktop.py` | Keys, typing, scrolling, clicking by name, window arrangement, closing apps — and since v13.1 finding *any* app by its image name, its path, the folder it runs from or the description compiled into it, plus listing and pressing another app's tabs and copying its text |
+| `youtube_control.py` / `tools_youtube.py` | A specific video: click the link on the page you are looking at, or resolve the title through YouTube's results page and open it in your Chrome; pause, next, captions, full screen, skip an ad (v13.1) |
+| `dictation.py` / `tools_dictation.py` | Continuous note-taking into a Markdown note, a file, Notepad, Sticky Notes, Notion, any open window, or the clipboard. While it is on, what you say is written down, not answered (v13.1) |
+| `hand_tracker.py` / `handmouse.py` / `mouse_input.py` / `tools_handmouse.py` | The webcam as a mouse: MediaPipe's palm and landmark models through onnxruntime, eight hand poses bound to seven actions (v13.6, customisable and live), and SendInput. `Ctrl+Alt+H` stops it (v13.1) |
+| `mission_bridge.py` / `tools_mission_app.py` | The Mission Reminder *app*: review from the runtime mirror it publishes, and save a mission, goal or time block by driving its own UI. Every attempt is recorded in `data/mission_outbox.json`; its labels live in `data/mission_ui.json` (v13.1) |
 | `windows_tools.py` | Volume, brightness, clipboard, screenshots, windows, lock |
 | `media_tools.py` | System-wide playback via Windows SMTC |
 | `google_tools.py` | Gmail + Google Calendar |
@@ -357,9 +393,145 @@ default; add "and let it run the tests" to allow
 commands. "start the local model" brings up the 27B llama-server on 8089,
 which Dexter then uses for its own replies too.
 
+**Exact control, when you want it (v13.4).** *"Turn on precise browser control"* starts
+a Chrome with its debug port open and attaches Playwright to it. From then on "the
+third result" is the third `<a href>` in document order (not the third accessibility
+name that looked like a title), a field is filled by its **label**, "copy that" is the
+real selection string, every navigation is waited for rather than slept through, and
+Dexter can act **without taking your focus** — which is what makes driving the machine
+from across the room feel different. It uses its own profile
+(`data/chrome_debug_profile`), because Chrome 136+ refuses remote debugging on the
+default one: sign into Google there once and it stays signed in. Without it, everything
+below still works through Windows accessibility on your everyday Chrome — the exact
+route is an upgrade, never a dependency, and each reply says which one it took.
+
+**On the page you are looking at (v13.3).** "select the first profile", "open the
+first result", "click the first link", "search for this in the current tab", "like
+this video", "subscribe to this channel", "open the comments", "copy that", "paste
+it in the Gemini tab". The rule is that anything *visible* can be pointed at: by
+position ("the first one"), by the words on it, or by the field it sits in. A site
+prefix means a tab rather than a window - "in YouTube, select the first video"
+switches to that tab first - and a click reports whether the page actually moved,
+so "it said it did it and nothing happened" has an answer either way. On a miss,
+Dexter names the controls it *could* see.
+
+**A specific video (v13.1).** "play the first video", "open the second one on
+this page", "play the one called lofi hip hop radio", "what videos are on this
+page", then "pause the video", "next video", "turn on captions", "skip the ad".
+With YouTube already open Dexter clicks the link *you can see* (the titles come
+from the page's accessibility tree, so what it lists is what is on screen); with
+nothing open it resolves the title through YouTube's own results page and opens
+the video in your Chrome. It always says which of the two it did.
+
 **Video intelligence.** "analyse this video https://youtu.be/... for
 beyond3baje" asks the Studio why it performs and how to model your video on it;
 the full breakdown is in the Studio's Analyze tab.
+
+---
+
+## Using the machine from across the room (v13.1)
+
+**Drives and folders.** "open the C drive", "what's in my downloads", "list the
+files in `C:\Users`", "show me what's on the D drive", "open `d:\films`", "what
+drives do I have", "where is my films folder", "open the BuzzAnimate folder".
+`DEXTER_FS_SCOPE` decides how far Dexter may look: `machine` (the default — every
+drive and folder you can open yourself) or `user` (only the folders in
+`DEXTER_FS_ROOTS`). Either way, **writing, moving and deleting inside Windows
+itself is refused** — `C:\Windows`, Program Files, ProgramData and a drive root
+are readable and not writable. `DEXTER_FS_DENY` is the other direction: folders
+Dexter must not even read.
+
+**Any app, not a list of twenty.** "close BuzzAnimate", "close Teams", "quit
+OBS", "switch to premiere". An app is found by its image name, its executable
+path, the folder it runs out of, its command line, or the description its vendor
+compiled into the binary — so a spoken name that matches none of the aliases
+still lands. A project with a shutdown route of its own gets that rather than a
+kill; an app that is running with no window says so and offers a force-stop
+instead of "it doesn't have a window open".
+
+**Driving another app's interface.** "what tabs does BuzzcafAI have", "open the
+projects tab in buzzcafai", "click export in buzzedit", "copy the text from
+buzzcafai", "select everything in notepad and copy it". Windows exposes the tabs
+and buttons of most applications (web views included) by name, so this needs no
+screenshot and no vision model.
+
+**Your hand as the mouse.** Once: *"set up hand tracking"* (downloads MediaPipe's
+two models, 7.6 MB, into `data/models/hand`). Then *"can you see my hand"* to
+check the camera, and *"start hand mouse"*:
+
+| pose | what it does, unless you change it |
+|---|---|
+| open hand, or index finger out | the pointer follows your hand |
+| pinch thumb to index | left button, held — a tap is a click, hold and move is a drag |
+| pinch thumb to middle | right button |
+| index + middle out | scroll, with the hand's vertical movement |
+| index + middle + ring | the pointer, as above |
+| a fist | nothing: the pointer stops, any button is released |
+| any other shape | the pointer |
+
+**Those are defaults, not rules (v13.6).** Every pose can be bound to any of seven
+actions — move the pointer, left button held, right button held, middle button held,
+double click, scroll, or nothing. Change one in the **Hand mouse** panel on the
+dashboard, in Settings → Hand mouse, or out loud: *"make a fist the right click"*,
+*"set the open palm to scroll"*, *"what do the hand gestures do"*. It takes effect
+immediately, **while tracking is running** — you rebind a gesture because the
+current one is not working, and stopping tracking to fix tracking would be the wrong
+answer.
+
+**Where you see it.** The **Hand mouse** panel (right-hand column of the full
+dashboard) shows the live line — "Open palm → moving the pointer", or "Looking —
+best 0.31 of 0.50 needed" — the palm score against its threshold, the frame rate,
+the camera, what share of frames had a hand in them, Start / Rehearse / Stop, and the
+gesture map. While it is tracking, a **Hand chip** appears in the header and in the
+pop-up, green when it can see your hand and amber when it cannot; clicking either
+stops it. That chip is the point: tracking is something you turn on and walk away
+from, and when the pointer starts moving you want to know at a glance whether Dexter
+is the one doing it.
+
+A **small preview window** opens with it (v13.2): the skeleton it tracked, the pose
+it read and what that pose is bound to, the rectangle your hand has to stay inside to
+reach every corner of the screen, and — when it sees nothing — the palm score against
+the bar it needs to clear, which is how "it doesn't work" becomes "the room is too
+dark". Esc or Q in that window stops tracking. `DEXTER_HAND_PREVIEW=0` turns it off,
+and *"hand mouse status"* reports the same numbers without it.
+
+`Ctrl+Alt+H`, Esc in the preview, or *"stop hand mouse"* stops it; so does a hand
+leaving the frame (which always releases the buttons). A pinch only counts when the
+pinching finger is reaching out, so a closed hand is never a click. *"start hand mouse in dry run"* recognises
+the poses without moving the real pointer. Needs `opencv-python` and
+`onnxruntime`; on a Python where `mediapipe` imports, that is used instead.
+
+**Quiet.** The pop-up has a speaker button: it mutes Dexter's **voice** and leaves
+the microphone listening, which is the usual wish during a call or a recording.
+The mic button is the other kind of quiet — it closes the microphone entirely. Both
+are in the pop-up's quick settings, and the choice is shared with the full window.
+
+---
+
+## Missions, blocks and scheduling anything (v13.1)
+
+Dexter keeps its own mission (north star, this week's focus, today's win) and
+Mission Reminder keeps the blocks and the tree. They stay separate; these are the
+bridge.
+
+**Review** reads the runtime mirror the app publishes: *"review my missions"*,
+*"what are my blocks today"*, *"what's my next block"*, *"am I on track with my
+blocks"*.
+
+**Save** drives the app's own interface — its `Ctrl+1..7` tabs, its named fields
+and buttons: *"add a block called deep work at 9am for 50 minutes"*, *"add a goal
+in mission reminder to ship version two"*, *"set my mission in mission reminder to
+…"*, *"start my next block"*, *"pause my block"*. Every attempt is written to
+`data/mission_outbox.json` **before** it is tried, so a save that fails is never a
+silent one (*"did my mission block save"* reads it back). If the app is
+redesigned, put the new labels in `data/mission_ui.json` rather than editing code.
+
+**Schedule anything.** *"every morning at 8 review my missions"*, *"every friday
+at 5 curate video ideas"*, *"schedule a backup for tomorrow at 9"*, *"at 5pm,
+close buzzedit"*. The goal is run through the same tiers a typed message would be,
+so anything Dexter can do it can do on a schedule; *"what's scheduled"* lists them
+and *"cancel the … task"* removes one. A sentence whose time does not parse is
+left alone rather than scheduled for a guessed hour.
 
 ---
 
@@ -412,6 +584,15 @@ separate planner file any more.
 `notes=` entry in `DEXTER_KNOWLEDGE_ROOTS`, or `data/notes` by default) and
 indexes it immediately, so "what did I note about the render rig" works a
 second later.
+
+**Dictation (v13.1).** *"Take notes"* turns note-taking into a **mode**:
+everything you say next is written down instead of answered, until you say *"stop
+taking notes"*. Say where it goes — *"take notes in Notepad"*, *"write this down
+in Notion"*, *"start dictation into sticky notes"*, a file path, or any open
+window by name — or set a default in Settings. Spoken punctuation works ("comma",
+"question mark", "new paragraph"), *"scratch that"* drops the last line, and
+*"pause notes"* holds without ending. In `name` wake mode the name is not needed
+while dictating: nobody says "Dexter" before every sentence of a note.
 
 **Knowledge.** `DEXTER_KNOWLEDGE_ROOTS=tag=path;tag=path` names the folders
 Dexter indexes (Markdown, text, CSV, PDF, Word, and the Studio's channel

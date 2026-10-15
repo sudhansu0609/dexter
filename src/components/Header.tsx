@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import { Maximize2, Mic, MicOff, Minimize2, Settings, WifiOff, X } from 'lucide-react';
+import { Hand, Maximize2, Mic, MicOff, Minimize2, Settings, VolumeX, WifiOff, X } from 'lucide-react';
 import type { VoiceState } from '../hooks/useVoice';
 
 interface Props {
@@ -12,6 +12,18 @@ interface Props {
   voiceReason?: string;
   voiceMode?: string;
   onToggleVoice?: () => void;
+  // v13.7c: Dexter's *speaker* muted, which is a different thing from the mic being
+  // off and was only visible in the pop-up. "There is no voice any more" is a
+  // reasonable report to make about a state with no indicator in this window.
+  voiceSilent?: boolean;
+  onToggleSilent?: () => void;
+  // v13.6: the hand mouse. Shown only while it is tracking — a chip for something
+  // that is off is noise, but something that is quietly driving your pointer needs
+  // to be visible in both views, and clickable to stop.
+  handRunning?: boolean;
+  handSeeing?: boolean;
+  handLine?: string;
+  onStopHand?: () => void;
 }
 
 const VOICE_LABEL: Record<VoiceState, string> = {
@@ -39,7 +51,10 @@ const iconButton: CSSProperties = {
 };
 
 // Title bar: name, connectivity, voice switch, settings, and the compact / full toggle.
-export function Header({ isExpanded, onToggleExpand, online, onToggleSettings, voiceState, voiceReason, voiceMode, onToggleVoice }: Props) {
+export function Header({
+  isExpanded, onToggleExpand, online, onToggleSettings, voiceState, voiceReason, voiceMode,
+  onToggleVoice, voiceSilent, onToggleSilent, handRunning, handSeeing, handLine, onStopHand,
+}: Props) {
   return (
     <header
       className="dexter-header"
@@ -83,6 +98,51 @@ export function Header({ isExpanded, onToggleExpand, online, onToggleSettings, v
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: '4px', appRegion: 'no-drag' } as any}>
+        {handRunning && (
+          <button
+            type="button"
+            onClick={onStopHand}
+            title={`${handLine || 'Hand mouse on'} — click to stop`}
+            style={{
+              background: 'var(--surface-2)',
+              color: handSeeing ? 'var(--success)' : 'var(--warn)',
+              border: '1px solid var(--border)',
+              borderRadius: '9px',
+              height: '26px',
+              padding: '0 8px',
+              fontSize: '11px',
+              fontWeight: 700,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '4px',
+            }}
+          >
+            <Hand size={12} /> Hand
+          </button>
+        )}
+        {voiceSilent && onToggleSilent && (
+          <button
+            type="button"
+            onClick={onToggleSilent}
+            title="Dexter is muted - it hears you but will not speak. Click to unmute."
+            aria-label="Unmute Dexter"
+            style={{
+              background: 'var(--warn-soft)',
+              color: 'var(--warn)',
+              border: '1px solid var(--border)',
+              borderRadius: '9px',
+              height: '26px',
+              padding: '0 8px',
+              fontSize: '11px',
+              fontWeight: 700,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '4px',
+            }}
+          >
+            <VolumeX size={12} /> Muted
+          </button>
+        )}
         {voiceState && onToggleVoice && (
           <button
             type="button"

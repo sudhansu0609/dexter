@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type MutableRefObject } from 'react';
-import { audioUrl, generateTts, voiceInterrupt } from '../api';
+import { audioUrl, generateTts, postVoiceBus, voiceInterrupt, voiceMic } from '../api';
 import {
   LocalVoicePipeline,
   listMics,
@@ -31,6 +31,16 @@ export type VoiceState =
   | 'speaking'
   | 'enrolling';
 
+// v13: dictation, as the UI needs to know about it. The note's text is never
+// mirrored here - it is in the file (or the app) the owner chose.
+export interface DictationState {
+  active: boolean;
+  where: string;
+  words: number;
+  lines: number;
+  paused?: boolean;
+}
+
 export interface EnrollProgress {
   active: boolean;
   seconds: number;
@@ -53,6 +63,11 @@ interface VoiceDeps {
 }
 
 const MUTED_KEY = 'dexterVoiceMuted';
+// v13: "mute Dexter" from the pop-up. Separate from MUTED_KEY on purpose -
+// muting the *microphone* and muting the *voice* are different wishes, and the
+// common one is "stop talking, keep listening" (a call, a recording, a room with
+// someone else in it). Shared with the full window through localStorage.
+const SILENT_KEY = 'dexterVoiceSilent';
 const HINT_FLASH_MS = 3500;
 
 function prettyWakeWord(model?: string): string {
@@ -100,6 +115,13 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
       return false;
     }
   });
+  const [silent, setSilentState] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(SILENT_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
   const [phase, setPhase] = useState<'starting' | 'unavailable' | 'ready'>('starting');
   const [unavailableReason, setUnavailableReason] = useState('');
   const [active, setActive] = useState(false);
@@ -115,9 +137,17 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
   const [mics, setMics] = useState<MicDevice[]>([]);
   const [micId, setMicId] = useState<string>(() => savedMicId());
   const [enroll, setEnroll] = useState<EnrollProgress>({ active: false, seconds: 0, target: 10 });
+  // v13: what dictation is doing, for the one-line hint and the pop-up badge.
+  const [dictation, setDictation] = useState<DictationState | null>(null);
+  // What Dexter just heard, shown in the pop-up the moment it is recognised -
+  // before the chat turn resolves and the chat log catches up.
+  const [heard, setHeard] = useState<string>('');
 
   const pipelineRef = useRef<LocalVoicePipeline | null>(null);
+  // Set below, once applyMute is defined; the pipeline is built before it.
+  const applyMuteRef = useRef<(next: boolean, tellServer: boolean) => void>(() => undefined);
   const mutedRef = useRef(muted);
+  const silentRef = useRef(silent);
   const speakingRef = useRef(false);
   const listeningRef = useRef<ListenReason | null>(null);
   const lastSpokenTextRef = useRef('');
@@ -132,6 +162,9 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
   useEffect(() => {
     mutedRef.current = muted;
   }, [muted]);
+  useEffect(() => {
+    silentRef.current = silent;
+  }, [silent]);
   useEffect(() => {
     activeRef.current = active;
   }, [active]);
@@ -177,7 +210,7 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
 
   const enqueueAudio = useCallback(
     (url: string, revoke = false) => {
-      if (!url || mutedRef.current) return;
+      if (!url || mutedRef.current || silentRef.current) return;
       audioQueueRef.current.push({ url: url.startsWith('blob:') ? url : audioUrl(url), revoke });
       if (isPlayingQueueRef.current) return;
       isPlayingQueueRef.current = true;
@@ -217,7 +250,7 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
   // that owns the mic speaks, or both windows would say it at once.
   const speakText = useCallback(
     async (text: string, emotion?: string, isReminder = false) => {
-      if (!text || mutedRef.current || !activeRef.current || phase !== 'ready') return;
+      if (!text || mutedRef.current || silentRef.current || !activeRef.current || phase !== 'ready') return;
       lastSpokenTextRef.current = text;
       try {
         const blob = await generateTts(text, emotion, isReminder);
@@ -270,6 +303,7 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
           listeningRef.current = reason;
           setListening(reason);
           setFlash('');
+          setHeard('');
           if (reason === 'wake' || reason === 'manual' || reason === 'name') chime('up');
         },
         onTranscript: (text, meta) => {
@@ -289,11 +323,28 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
             return;
           }
           console.log(`[Voice] heard (${meta.after}, ${meta.confidence.toFixed(2)}): ${text}`);
+          setHeard(text);
           commandHandlerRef.current(text);
         },
         onCommand: (name) => {
           listeningRef.current = null;
           setListening(null);
+          // v13.1: "mute yourself" latches the voice off and leaves the mic open;
+          // "stop" only cuts the reply that is playing. Written out rather than
+          // calling setSilent, which is defined below this closure.
+          if (name === 'mute' || name === 'unmute') {
+            const quiet = name === 'mute';
+            silentRef.current = quiet;
+            setSilentState(quiet);
+            try {
+              localStorage.setItem(SILENT_KEY, quiet ? '1' : '0');
+            } catch {
+              // no storage - the choice lasts for this window only
+            }
+            if (quiet) stopSpeaking(false);
+            showFlash(quiet ? 'Muted - I will answer in writing.' : 'Speaking again.');
+            return;
+          }
           stopSpeaking(true);
           showFlash(name === 'stop' ? 'Stopped.' : 'Okay, never mind.');
         },
@@ -314,6 +365,15 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
         onLevel: (v) => setLevel(v),
         onMic: (label) => setMicLabel(label),
         onMicSilent: (silent) => setMicSilent(silent),
+        // The mic was turned off/on by the other window or the server. Apply it
+        // here without echoing it back, and off the socket callback stack so
+        // tearing the pipeline down is safe.
+        onMicMuted: (isMuted) => {
+          if (isMuted === mutedRef.current) return;
+          window.setTimeout(() => {
+            if (isMuted !== mutedRef.current) applyMuteRef.current(isMuted, false);
+          }, 0);
+        },
         onNotYou: () => {
           listeningRef.current = null;
           setListening(null);
@@ -321,6 +381,30 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
           if (Date.now() - lastNotYouAt.current > 15000) {
             lastNotYouAt.current = Date.now();
             showFlash("That wasn't your voice, so I left it.");
+          }
+        },
+        // v13: dictation. The words went into the note, so there is nothing to
+        // answer - the UI just shows what was written, and says where.
+        onDictation: (evt) => {
+          listeningRef.current = null;
+          setListening(null);
+          if (evt.state === 'written') {
+            setDictation({ active: true, where: evt.where, words: evt.words, lines: evt.lines });
+            showFlash(`Noted: ${evt.line.slice(0, 60)}`);
+          } else if (evt.state === 'ended') {
+            setDictation(null);
+            showFlash(`Note saved - ${evt.words} word(s) in ${evt.where}.`);
+            chime('down');
+          } else if (evt.state === 'paused') {
+            setDictation((p) => (p ? { ...p, paused: true } : p));
+            showFlash('Notes paused. Say "resume notes".');
+          } else if (evt.state === 'resumed') {
+            setDictation((p) => (p ? { ...p, paused: false } : p));
+            showFlash('Taking notes again.');
+          } else if (evt.state === 'scratched') {
+            showFlash('Dropped that line.');
+          } else if (evt.state === 'failed') {
+            showFlash(`I couldn't write that: ${evt.error.slice(0, 80)}`);
           }
         },
         onEnroll: (evt) => {
@@ -365,26 +449,84 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const setMuted = useCallback(
-    (next: boolean) => {
+  // Turn the mic off / on. `tellServer` mutes the *session* over HTTP, which is
+  // what makes "Mic off" actually stop Dexter hearing you: muting used to only
+  // close this window's socket, and the backend then handed the still-open mic
+  // to the other shell window. `tellServer` is false when we are only reacting
+  // to a mute the server (or the other window) already applied.
+  const applyMute = useCallback(
+    (next: boolean, tellServer: boolean) => {
+      mutedRef.current = next;
       setMutedState(next);
       try {
         localStorage.setItem(MUTED_KEY, next ? '1' : '0');
       } catch {
-        // no storage - the choice lasts for this window only
+        // no storage - the other window learns via the server broadcast instead
       }
       if (next) {
         stopSpeaking(true);
-        stopPipeline();
-        setPhase('ready');
+        const release = () => {
+          stopPipeline();
+          setPhase('ready');
+        };
+        if (tellServer) {
+          // Mute the session first, *then* let go of our mic - so the moment the
+          // other window is handed the mic, the session is already deaf.
+          voiceMic(true)
+            .catch(() => undefined)
+            .finally(release);
+        } else {
+          release();
+        }
       } else {
+        if (tellServer) voiceMic(false).catch(() => undefined);
         startPipeline();
       }
     },
     [startPipeline, stopPipeline, stopSpeaking],
   );
 
+  const setMuted = useCallback((next: boolean) => applyMute(next, true), [applyMute]);
+
   const toggleMuted = useCallback(() => setMuted(!mutedRef.current), [setMuted]);
+
+  // The pipeline (built before applyMute exists) reaches the latest applyMute
+  // through this ref, for the server's "mic was muted elsewhere" broadcast.
+  useEffect(() => {
+    applyMuteRef.current = applyMute;
+  }, [applyMute]);
+
+  // A second shell window shares this choice through localStorage; the write
+  // there fires a storage event here. Covers the case its socket is already
+  // closed (muted) and so cannot get the server broadcast.
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key !== MUTED_KEY) return;
+      const next = e.newValue === '1';
+      if (next !== mutedRef.current) applyMute(next, false);
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [applyMute]);
+
+  // Mute Dexter's *voice*, leaving the mic where it was (v13). Anything already
+  // queued stops at once, because "mute" that finishes the sentence it was on is
+  // not mute.
+  const setSilent = useCallback(
+    (next: boolean) => {
+      setSilentState(next);
+      silentRef.current = next;
+      try {
+        localStorage.setItem(SILENT_KEY, next ? '1' : '0');
+      } catch {
+        // no storage - the choice lasts for this window only
+      }
+      if (next) stopSpeaking(false);
+    },
+    [stopSpeaking],
+  );
+
+  const toggleSilent = useCallback(() => setSilent(!silentRef.current), [setSilent]);
 
   // Push-to-talk: the mic button / Ctrl+Space. Over a reply it is the
   // interruption; while listening it is "never mind"; muted, it unmutes.
@@ -453,7 +595,7 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
       if (e.code === 'Space' && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         talkNow();
-      } else if (e.key === 'Escape' && speakingRef.current) {
+      } else if (e.key === 'Escape' && (speakingRef.current || isThinkingRef?.current)) {
         e.preventDefault();
         stopSpeaking(true);
       }
@@ -482,6 +624,18 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
                   ? 'standby'
                   : 'idle';
 
+  // Mirror the state to the ai-visualizer face bus. The face only knows four
+  // states, so everything that is not actively listening/thinking/speaking reads
+  // as idle. Fire-and-forget, deduped, and never allowed to throw into the loop.
+  const lastBusRef = useRef<string>('');
+  useEffect(() => {
+    const face =
+      state === 'speaking' || state === 'listening' || state === 'thinking' ? state : 'idle';
+    if (face === lastBusRef.current) return;
+    lastBusRef.current = face;
+    void postVoiceBus(face).catch(() => undefined);
+  }, [state]);
+
   const wake = prettyWakeWord(caps?.wakeWord);
   const idleHint =
     wakeMode === 'open'
@@ -493,7 +647,13 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
         : `Start with “${wake}”, or press the mic${hotkeys ? ' (Ctrl+Space)' : ''}.`;
   const hint =
     flash ||
-    (state === 'starting'
+    // v13: while dictation is on, that is the only thing worth saying - every
+    // other hint ("Listening…") would suggest Dexter is about to answer.
+    (dictation?.active
+      ? dictation.paused
+        ? `Notes paused (${dictation.words} words in ${dictation.where}). Say "resume notes".`
+        : `Taking notes into ${dictation.where} - ${dictation.words} word(s). Say "stop taking notes".`
+      : state === 'starting'
       ? 'Opening the mic…'
       : state === 'unavailable'
         ? `Voice unavailable: ${unavailableReason}`
@@ -525,7 +685,9 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
     state,
     hint,
     level,
+    heard,
     muted,
+    silent,
     active,
     caps,
     wakeWord: wake,
@@ -536,6 +698,7 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
     mics,
     micId,
     enroll,
+    dictation,
     // shared with chat
     mutedRef,
     lastSpokenTextRef,
@@ -543,6 +706,8 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
     // controls
     toggleMuted,
     setMuted,
+    toggleSilent,
+    setSilent,
     talkNow,
     stopSpeaking,
     enqueueAudio,
@@ -555,7 +720,7 @@ export function useVoice({ windowName, isThinkingRef, commandHandlerRef, hotkeys
     selectMic,
     refreshMics,
     claim: () => pipelineRef.current?.claim(),
-    canSpeak: () => !mutedRef.current && phase === 'ready' && activeRef.current,
+    canSpeak: () => !mutedRef.current && !silentRef.current && phase === 'ready' && activeRef.current,
   };
 }
 

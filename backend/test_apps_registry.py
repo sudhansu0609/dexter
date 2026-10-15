@@ -565,6 +565,8 @@ HEALTH_ROUTES = {
     "buzzedit": ("/api/health", "buzzedit"),
     # Vite serves `public/health.json`; there is no server to add a route to.
     "buzzviolin": ("/health.json", "buzzviolin"),
+    # BuzzAnimate's local API (its docs/ECOSYSTEM_BRIDGE_PLAN.md step E1).
+    "buzzanimate": ("/health", "buzzanimate"),
 }
 
 

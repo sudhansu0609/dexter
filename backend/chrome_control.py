@@ -103,13 +103,65 @@ def find_chrome() -> Optional[str]:
     return None
 
 
-def chrome_windows() -> List[dc.Win]:
+def dexter_chrome_pids() -> set:
+    """The process ids of the Chrome **Dexter started for itself** (v13.8).
+
+    v13.4 gave Dexter a debuggable Chrome of its own, on its own profile - that is the
+    only way Chrome 136+ allows remote debugging. What it did not do is teach the rest
+    of the code to tell the two apart, and they are both `chrome.exe`. So "open
+    youtube" could bring *Dexter's* browser forward instead of the owner's, and
+    everything after it ("close that tab", "what am I looking at") then pointed at a
+    window they were not using and were not signed in to.
+
+    Identified by the profile on the command line, which is exactly what makes it a
+    separate browser in the first place.
+    """
+    marker = ""
+    try:
+        import browser_cdp
+
+        marker = os.path.basename(str(browser_cdp.PROFILE_DIR or "")).lower()
+    except Exception:
+        pass
+    if not marker:
+        return set()
+    pids = set()
+    try:
+        for proc in dc._process_table():
+            if (proc.get("name") or "").lower() != CHROME_IMAGE:
+                continue
+            if marker in (proc.get("cmdline") or "").lower():
+                pids.add(int(proc.get("pid") or 0))
+    except Exception:
+        return set()
+    return pids
+
+
+def is_dexter_chrome(win: Optional[dc.Win]) -> bool:
+    """Is this window Dexter's own debug browser rather than the owner's?"""
+    if win is None:
+        return False
+    return int(getattr(win, "pid", 0) or 0) in dexter_chrome_pids()
+
+
+def chrome_windows(include_dexter: bool = False) -> List[dc.Win]:
     """Every Chrome window, front-most first.
 
     Matched on the *process*, because a window called "chrome logo.png - Paint"
     is not a browser, and a Chrome app window has no " - Google Chrome" suffix.
+
+    Dexter's own debuggable Chrome is left out unless asked for: "the Chrome you use"
+    has to mean the one the owner opened.
     """
     found = [w for w in dc.windows() if (w.process or "").lower() == CHROME_IMAGE]
+    if found and not include_dexter:
+        ours = dexter_chrome_pids()
+        if ours:
+            theirs = [w for w in found if int(getattr(w, "pid", 0) or 0) not in ours]
+            # Only if that leaves something: if Dexter's is the *only* Chrome open,
+            # it is better to use it than to claim there is no browser at all.
+            if theirs:
+                found = theirs
     if found:
         return found
     # No process information available (no pywin32/psutil): fall back to the
@@ -131,9 +183,13 @@ def is_running() -> bool:
         return False
 
 
-def active_chrome() -> Optional[dc.Win]:
-    """The Chrome window the user is looking at, else the front-most one."""
-    found = chrome_windows()
+def active_chrome(include_dexter: bool = False) -> Optional[dc.Win]:
+    """The Chrome window the user is looking at, else the front-most one.
+
+    `include_dexter` is for the one caller that needs to know whether the browser in
+    front is Dexter's own: `page_control.precise()`, deciding which route applies.
+    """
+    found = chrome_windows(include_dexter=include_dexter)
     if not found:
         return None
     front = dc._foreground_hwnd()
@@ -209,6 +265,32 @@ def open_url(target: str, new_window: bool = False) -> Dict[str, Any]:
         "window": win.describe() if win else "",
         "target": target,
     }
+
+
+def open_in_current_tab(target: str) -> Dict[str, Any]:
+    """Go somewhere **in the tab that is open**, instead of a new one (v13.2).
+
+    `chrome.exe <url>` is always a new tab - there is no command line that replaces
+    the current one - so "search for this in the current tab" had no implementation
+    at all. The address bar does have one: Ctrl+L, type, Enter, which is exactly
+    what a person does. Keystrokes only ever go to a Chrome window that is verified
+    to hold the foreground, as everywhere else in this module.
+    """
+    url = normalize_target(target)
+    win = _require_window()
+    try:
+        focused = dc._focused_target(win.title)
+    except dc.DesktopError as exc:
+        raise ChromeError(str(exc)) from exc
+    dc._send_keys("ctrl+l")
+    time.sleep(0.15)
+    # Ctrl+L selects whatever is in the bar, so typing replaces it.
+    dc._write_text(url)
+    dc._send_keys("enter")
+    # Give the page a moment, then report what we actually landed on.
+    time.sleep(1.2)
+    return {"url": url, "sameTab": True, "window": focused.describe(),
+            "title": tab_title(), "launched": False}
 
 
 def search(query: str, site: Optional[str] = None) -> Dict[str, Any]:
@@ -330,14 +412,51 @@ def scroll(direction: str = "down", amount: int = 1) -> Dict[str, Any]:
 
 
 def click(name: str) -> Dict[str, Any]:
-    """Click something in the page by its accessible name (UIA), or fail saying
-    what is there. Chrome exposes link and button names to UIA, which is enough
-    for "click sign in" without a screenshot or a vision model."""
+    """Click something in the page by name - by its accessible name if Chrome has
+    published one, otherwise by reading the screen.
+
+    The comment that used to be here said Chrome exposes link and button names to UIA.
+    It does not, and that was worth measuring rather than believing: a Chrome window
+    offers its toolbar, its profile button and its window controls, and **nothing from
+    the page**. Modern Chrome keeps web content out of the accessibility tree unless it
+    was started with `--force-renderer-accessibility`, which is why "click sign in",
+    "select the first profile" and every other page-level instruction failed without
+    the debug port.
+
+    So the accessibility route is still tried first - it is instant, and it is right for
+    the browser's own furniture - and when it finds nothing the words on screen are read
+    instead (v13.8). That costs two or three seconds and works in any browser, on any
+    profile, with nothing enabled.
+    """
     win = _require_window()
     try:
         return dc.click_text(name, window=win.title)
     except dc.DesktopError as exc:
+        by_sight = _click_by_sight(name, win)
+        if by_sight is not None:
+            return by_sight
         raise ChromeError(str(exc)) from exc
+
+
+def _click_by_sight(name: str, win: dc.Win) -> Optional[Dict[str, Any]]:
+    """Read the window and click the words, when Windows will not name them."""
+    try:
+        import screen_text
+    except Exception:
+        return None
+    if not screen_text.availability()["ready"]:
+        return None
+    try:
+        result = screen_text.click(name, win=win)
+    except Exception as exc:
+        print(f"[Chrome] Could not read the window: {exc}")
+        return None
+    if not result.get("clicked"):
+        return None
+    return {"clicked": result["match"]["text"], "window": win.describe(),
+            "how": f"read the screen and clicked at {result['at'][0]},{result['at'][1]}",
+            "route": "screen text", "score": result.get("score"),
+            "seen": result.get("seen", [])[:10]}
 
 
 def type_text(text: str, submit: bool = False, allow_secret: bool = False) -> Dict[str, Any]:
